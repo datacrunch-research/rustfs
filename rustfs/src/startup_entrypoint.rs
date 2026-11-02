@@ -2001,6 +2001,7 @@ async fn run(config: Config) -> Result<()> {
         state_manager,
         s3_shutdown_tx,
         console_shutdown_tx,
+        rdma_internode_shutdown_tx,
     } = init_startup_http_servers(&config, readiness.clone(), server_ctx.clone()).await?;
 
     let StartupStorageRuntime {
@@ -2037,7 +2038,7 @@ async fn run(config: Config) -> Result<()> {
 
     let capacity_tasks = crate::capacity::capacity_integration::init_capacity_management_managed().await;
 
-    let service_runtime = init_startup_runtime_services(
+    let mut service_runtime = init_startup_runtime_services(
         &config,
         endpoint_pools,
         store.clone(),
@@ -2047,6 +2048,9 @@ async fn run(config: Config) -> Result<()> {
         server_ctx,
     )
     .await?;
+
+    // The listener is owned by the optional-runtime shutdown plan so it stops with the other fronts.
+    service_runtime.optional_runtimes.rdma_internode = rdma_internode_shutdown_tx;
 
     run_startup_runtime_lifecycle(StartupRuntimeLifecycle {
         server_address,

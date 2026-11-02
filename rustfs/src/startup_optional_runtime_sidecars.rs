@@ -26,11 +26,17 @@ const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
 
 pub(crate) struct OptionalRuntimeServices {
     pub(crate) protocols: ProtocolShutdownSenders,
+    /// Internode RDMA listener started with the HTTP listeners
+    /// (`startup_server.rs`); `None` when disabled or compiled out.
+    pub(crate) rdma_internode: Option<ShutdownHandle>,
 }
 
 impl OptionalRuntimeServices {
     pub(crate) fn new(protocols: ProtocolShutdownSenders) -> Self {
-        Self { protocols }
+        Self {
+            protocols,
+            rdma_internode: None,
+        }
     }
 }
 
@@ -77,9 +83,25 @@ fn optional_runtime_shutdown_steps(protocols: &ProtocolShutdownSenders) -> Vec<O
 }
 
 pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRuntimeServices) -> Vec<ShutdownHandle> {
-    let ProtocolShutdownSenders { ftp, ftps, webdav, sftp } = optional_runtimes.protocols;
+    let OptionalRuntimeServices {
+        protocols,
+        rdma_internode,
+    } = optional_runtimes;
+    let ProtocolShutdownSenders { ftp, ftps, webdav, sftp } = protocols;
 
     let mut protocol_shutdowns = Vec::new();
+    if let Some(handle) = rdma_internode {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_PROTOCOL_SYSTEM_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            protocol = "rdma-internode",
+            state = "stopping",
+            "Protocol runtime stopping"
+        );
+        protocol_shutdowns.push(handle);
+    }
     if let Some(handle) = ftp {
         log_protocol_stopping(OptionalRuntimeShutdownStep::Ftp);
         protocol_shutdowns.push(handle);
@@ -107,7 +129,7 @@ pub(crate) async fn shutdown_optional_runtime_services(
     for handle in protocol_shutdowns.iter() {
         handle.signal();
     }
-    // At most four configured fronts; keep each actual owner until its join is observed.
+    // At most five configured fronts; keep each actual owner until its join is observed.
     while let Some(handle) = protocol_shutdowns.first_mut() {
         let result = handle.wait_checked().await;
         protocol_shutdowns.remove(0);

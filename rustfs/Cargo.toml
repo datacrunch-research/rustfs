@@ -75,6 +75,8 @@ connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# Linux-only internode RDMA data transport; needs libibverbs and librdmacm at build and run time.
+rdma = ["rustfs-ecstore/rdma"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]

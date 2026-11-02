@@ -14,6 +14,7 @@ collection:
 - [Read-only BTF declaration inspection](operations/btf-prototype-inspection.md) — bounded prototypes and scalar member layouts, explicit void handling, and independent native references.
 
 - [Internode HTTP streaming transport](operations/internode-http-transport.md) — protocol selection, pooled connection isolation, and distributed read validation.
+- [Internode RDMA data transport](operations/internode-rdma-transport.md) — optional `rdma` backend for shard streams: settings, fallback, metrics, and single-host validation.
 
 - [Persisted config compatibility](operations/persisted-config-compatibility.md) — ignored MinIO settings, bounded diagnostics, alias retention, and safe resets.
 

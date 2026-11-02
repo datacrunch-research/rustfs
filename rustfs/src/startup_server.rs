@@ -75,6 +75,20 @@ pub(crate) struct StartupHttpServers {
     pub(crate) state_manager: Arc<ServiceStateManager>,
     pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
+    /// Internode RDMA listener. It starts with the HTTP listeners, before
+    /// storage initialization, so peers never fall back to TCP while this
+    /// node boots; its shutdown runs with the optional runtime sidecars.
+    pub(crate) rdma_internode_shutdown_tx: Option<ShutdownHandle>,
+}
+
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+async fn init_rdma_internode_listener() -> Result<Option<ShutdownHandle>> {
+    crate::storage_api::startup::rdma_internode::init_rdma_internode_service().await
+}
+
+#[cfg(not(all(feature = "rdma", target_os = "linux")))]
+async fn init_rdma_internode_listener() -> Result<Option<ShutdownHandle>> {
+    Ok(None)
 }
 
 pub(crate) async fn init_startup_listen_context(
@@ -272,10 +286,13 @@ pub(crate) async fn init_startup_http_servers(
         None => None,
     };
 
+    let rdma_internode_shutdown_tx = init_rdma_internode_listener().await?;
+
     Ok(StartupHttpServers {
         state_manager,
         s3_shutdown_tx: Some(s3_shutdown_tx),
         console_shutdown_tx,
+        rdma_internode_shutdown_tx,
     })
 }
 
