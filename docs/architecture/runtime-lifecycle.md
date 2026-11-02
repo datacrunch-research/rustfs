@@ -28,7 +28,7 @@ Each module owns one concern; orchestration order is owned by `startup_services`
 | `startup_runtime_sources.rs` | Process-local runtime source publication (port, buffer profile, KMS manager, TLS generation). |
 | `startup_fs_guard.rs` | Unsupported-filesystem policy enforcement for endpoint paths. |
 | `startup_deadlock.rs` | Deadlock detector state logging. |
-| `startup_server.rs` | HTTP listener start and `ServiceStateManager` publication. |
+| `startup_server.rs` | HTTP listener start, the optional internode RDMA listener (`rdma` feature), and `ServiceStateManager` publication. |
 | `startup_storage.rs` | Endpoints, local disks, ECStore, lock clients, global config, background replication init; `StorageReady`. |
 | `startup_bucket_metadata.rs` | Bucket metadata system init, legacy meta-bucket import (`try_migrate_bucket_metadata`, `try_migrate_iam_config`), resync intents. |
 | `startup_iam.rs` | IAM init, deferred recovery, `IamReady` publication. |

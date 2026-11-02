@@ -83,8 +83,8 @@ const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const NS_SCANNER_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 static NS_SCANNER_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
-static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
+pub(super) static PUT_FILE_CAPABILITY_SERVER_EPOCH: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::new_v4);
+pub(super) static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
@@ -410,15 +410,15 @@ fn validate_walk_dir_completion_request(query: &WalkDirQuery, body: &[u8]) -> Op
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
-struct PutFileQuery {
-    disk: String,
-    volume: String,
-    path: String,
-    append: bool,
-    size: i64,
-    put_file_auth: Option<String>,
-    put_file_nonce: Option<uuid::Uuid>,
-    put_file_server_epoch: Option<uuid::Uuid>,
+pub(super) struct PutFileQuery {
+    pub(super) disk: String,
+    pub(super) volume: String,
+    pub(super) path: String,
+    pub(super) append: bool,
+    pub(super) size: i64,
+    pub(super) put_file_auth: Option<String>,
+    pub(super) put_file_nonce: Option<uuid::Uuid>,
+    pub(super) put_file_server_epoch: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -451,7 +451,7 @@ fn put_file_server_epoch_matches(query: &PutFileQuery) -> bool {
     query.put_file_server_epoch == Some(*PUT_FILE_CAPABILITY_SERVER_EPOCH)
 }
 
-fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
+pub(super) fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
     if put_file_server_epoch_matches(query) {
         return true;
     }
@@ -1026,7 +1026,7 @@ fn legacy_meta_alias_can_retry(error: &DiskError, volume: &str) -> bool {
     matches!(error, DiskError::FileNotFound | DiskError::VolumeNotFound) && legacy_meta_bucket_alias(volume).is_some()
 }
 
-async fn read_file_stream_with_legacy_meta_fallback(
+pub(super) async fn read_file_stream_with_legacy_meta_fallback(
     disk: &DiskStore,
     volume: &str,
     path: &str,
@@ -1552,7 +1552,7 @@ async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> 
     .map_err(Into::into)
 }
 
-async fn write_authenticated_put_file<S, E>(
+pub(super) async fn write_authenticated_put_file<S, E>(
     disk: &DiskStore,
     body: S,
     query: &PutFileQuery,

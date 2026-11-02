@@ -262,6 +262,12 @@ pub(crate) mod request_context_consumer {
     };
 }
 
+/// Startup sidecar entry point for the internode RDMA listener (Linux, `rdma` feature).
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) mod rdma_internode_startup_consumer {
+    pub(crate) use super::super::rpc::rdma_service::init_rdma_internode_service;
+}
+
 pub(crate) mod rpc_consumer {
     pub(crate) use super::super::rpc::InternodeRpcService;
 
@@ -290,6 +296,21 @@ pub(crate) mod rpc_consumer {
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
             find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
             sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
+        };
+    }
+
+    /// Server side of the internode RDMA data plane (Linux, `rdma` feature).
+    #[cfg(all(feature = "rdma", target_os = "linux"))]
+    pub(crate) mod rdma_service {
+        pub(crate) use super::super::{DiskStore, FileReader, get_global_endpoints_opt, global_rustfs_port};
+        #[cfg(test)]
+        pub(crate) use rustfs_ecstore::api::rpc::rdma::{
+            InternodeDataTransport, RdmaInternodeDataTransport, RdmaSettings, RdmaStreamOp, RdmaWriteRequestWire,
+            ReadStreamRequest, RegisteredPool,
+        };
+        pub(crate) use rustfs_ecstore::api::rpc::rdma::{
+            RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer, RdmaWriteRequest,
+            default_listen_addrs, server_enabled, settings, shared_pool,
         };
     }
 

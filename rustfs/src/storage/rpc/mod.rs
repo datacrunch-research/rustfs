@@ -14,6 +14,8 @@
 
 pub mod http_service;
 pub mod node_service;
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub mod rdma_service;
 
 pub use http_service::InternodeRpcService;
 pub use node_service::{

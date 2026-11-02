@@ -30,8 +30,8 @@ use crate::storage_api_contracts::internode::{
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
-    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
-    KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_RDMA,
+    INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{
     ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
@@ -63,7 +63,7 @@ const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
 const NS_SCANNER_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
 const PUT_FILE_MAX_CAPABILITY_RESPONSE_SIZE: usize = 1024;
 const PUT_FILE_LEGACY_CAPABILITY_TTL: Duration = Duration::from_secs(30);
-const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
+pub(super) const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 const PUT_FILE_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_MSGPACK: &str = "application/msgpack";
@@ -89,7 +89,7 @@ fn unsupported_transport_message(transport: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PutFileCapabilityState {
+pub(super) enum PutFileCapabilityState {
     LegacyUntil(Instant),
     V1 { server_epoch: Uuid, revalidate_after: Instant },
 }
@@ -118,8 +118,8 @@ struct PutFileCapabilityFlight {
 }
 
 #[derive(Debug, Default)]
-struct PutFileCapabilityCacheState {
-    cached: Option<PutFileCapabilityState>,
+pub(super) struct PutFileCapabilityCacheState {
+    pub(super) cached: Option<PutFileCapabilityState>,
     generation: u64,
     in_flight: Option<PutFileCapabilityFlight>,
     rejected_server_epoch: Option<Uuid>,
@@ -128,12 +128,12 @@ struct PutFileCapabilityCacheState {
 // The registry lock is released before taking an entry lock. Entry guards cover
 // only cache transitions, never a probe or await; poll-based writers must be
 // able to reject an epoch atomically with those transitions.
-type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCapabilityCacheState>>;
+pub(super) type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCapabilityCacheState>>;
 
 static PUT_FILE_CAPABILITY_CACHE: LazyLock<parking_lot::RwLock<HashMap<String, PutFileCapabilityCacheEntry>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
 
-fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
+pub(super) fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
     if let Some(entry) = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned() {
         return entry;
     }
@@ -155,7 +155,7 @@ fn fresh_put_file_capability(state: Option<PutFileCapabilityState>, now: Instant
     }
 }
 
-fn reject_put_file_server_epoch(endpoint: &str, server_epoch: Uuid) {
+pub(super) fn reject_put_file_server_epoch(endpoint: &str, server_epoch: Uuid) {
     let entry = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned();
     if let Some(entry) = entry {
         let mut state = entry.write();
@@ -525,7 +525,7 @@ impl TcpHttpInternodeDataTransport {
         Ok(response)
     }
 
-    async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
+    pub(super) async fn put_file_auth_capability(&self, endpoint: &str) -> Result<Option<Uuid>> {
         resolve_put_file_auth_capability(endpoint, || async {
             tokio::time::timeout(PUT_FILE_CAPABILITY_PROBE_TIMEOUT, self.probe_put_file_auth(endpoint))
                 .await
@@ -705,7 +705,7 @@ fn build_put_file_capability_url(endpoint: &str, challenge: Uuid) -> String {
     )
 }
 
-struct PutFileAuthWriter<W> {
+pub(super) struct PutFileAuthWriter<W> {
     inner: W,
     url: String,
     nonce: Uuid,
@@ -718,7 +718,7 @@ struct PutFileAuthWriter<W> {
 }
 
 impl<W> PutFileAuthWriter<W> {
-    fn new(inner: W, url: String, nonce: Uuid, endpoint: String, server_epoch: Uuid) -> Self {
+    pub(super) fn new(inner: W, url: String, nonce: Uuid, endpoint: String, server_epoch: Uuid) -> Self {
         Self {
             inner,
             url,
@@ -933,8 +933,23 @@ fn build_internode_data_transport_result(
         {
             Ok(Arc::new(TcpHttpInternodeDataTransport))
         }
+        Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_RDMA) => build_rdma_transport(transport),
         Some(transport) => Err(unsupported_transport_message(transport)),
     }
+}
+
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+fn build_rdma_transport(_transport: &str) -> std::result::Result<Arc<dyn InternodeDataTransport>, String> {
+    super::rdma::build_transport()
+}
+
+/// The `rdma` value is known to the parser everywhere, but only a Linux build
+/// with the `rdma` feature can serve it; every other build fails closed.
+#[cfg(not(all(feature = "rdma", target_os = "linux")))]
+fn build_rdma_transport(transport: &str) -> std::result::Result<Arc<dyn InternodeDataTransport>, String> {
+    Err(format!(
+        "{ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?} requires a Linux RustFS build with the `rdma` Cargo feature"
+    ))
 }
 
 #[allow(
@@ -964,6 +979,23 @@ pub fn build_internode_data_transport_from_env() -> Result<Arc<dyn InternodeData
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[cfg(not(all(feature = "rdma", target_os = "linux")))]
+    #[test]
+    fn rdma_backend_fails_closed_without_the_feature() {
+        let err = build_internode_data_transport_result(Some("rdma")).expect_err("rdma needs the feature");
+        assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
+        assert!(err.contains("`rdma` Cargo feature"), "{err}");
+    }
+
+    #[cfg(all(feature = "rdma", target_os = "linux"))]
+    #[test]
+    fn rdma_backend_is_selected_with_the_feature() {
+        let transport = build_internode_data_transport_result(Some(" RDMA ")).expect("rdma backend builds");
+        assert_eq!(transport.name(), INTERNODE_DATA_TRANSPORT_RDMA);
+        assert!(transport.capabilities().fallback_supported);
+        assert!(!transport.capabilities().streaming_walk_dir);
+    }
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
 

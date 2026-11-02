@@ -22,6 +22,8 @@ pub(crate) mod internode_data_transport;
 mod network_probe;
 pub(crate) mod peer_rest_client;
 pub(crate) mod peer_s3_client;
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) mod rdma;
 pub(crate) mod remote_disk;
 pub(crate) mod remote_locker;
 pub(crate) mod runtime_sources;
