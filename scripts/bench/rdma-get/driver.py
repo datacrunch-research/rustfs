@@ -1,6 +1,9 @@
 """Direct cuObject GET check: signed GET with x-amz-rdma-token, compare buffer with HTTP GET."""
 import os, subprocess, sys, time, hashlib
 import boto3, botocore
+from botocore.config import Config
+# A bodiless RDMA reply still carries the object's checksum header; do not let boto3 compare it with the empty body.
+BOTO_CONFIG = Config(response_checksum_validation="when_required")
 S = os.path.dirname(os.path.abspath(__file__))
 endpoint, bucket, key = sys.argv[1], sys.argv[2], sys.argv[3]
 mem = sys.argv[4] if len(sys.argv) > 4 else "gpu"
@@ -8,7 +11,7 @@ rng = sys.argv[5] if len(sys.argv) > 5 else None  # "off-end" inclusive, "full" 
 bufsize = int(os.environ.get("BUFSIZE", "0"))
 verify = os.environ.get("VERIFY", "1") == "1"
 httpcmp = os.environ.get("HTTPCMP", "1") == "1"
-s3 = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id="rustfsadmin", aws_secret_access_key="rustfsadmin", region_name="us-east-1")
+s3 = boto3.client("s3", config=BOTO_CONFIG, endpoint_url=endpoint, aws_access_key_id="rustfsadmin", aws_secret_access_key="rustfsadmin", region_name="us-east-1")
 head = s3.head_object(Bucket=bucket, Key=key)
 total = head["ContentLength"]
 if rng and rng != "full":

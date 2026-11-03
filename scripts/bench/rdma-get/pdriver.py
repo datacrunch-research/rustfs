@@ -1,13 +1,16 @@
 """Parallel ranged cuObject GETs: N tokens over one GPU buffer, N requests in flight, spread over hosts."""
 import os, subprocess, sys, time, hashlib, threading
 import boto3
+from botocore.config import Config
+# A bodiless RDMA reply still carries the object's checksum header; do not let boto3 compare it with the empty body.
+BOTO_CONFIG = Config(response_checksum_validation="when_required")
 S = os.path.dirname(os.path.abspath(__file__))
 bucket, key, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 hosts = sys.argv[4].split(",")
 mem = sys.argv[5] if len(sys.argv) > 5 else "gpu"
 verify = os.environ.get("VERIFY", "1") == "1"
 def client(host):
-    return boto3.client("s3", endpoint_url=f"http://{host}:9000", aws_access_key_id="rustfsadmin", aws_secret_access_key="rustfsadmin", region_name="us-east-1")
+    return boto3.client("s3", config=BOTO_CONFIG, endpoint_url=f"http://{host}:9000", aws_access_key_id="rustfsadmin", aws_secret_access_key="rustfsadmin", region_name="us-east-1")
 c0 = client(hosts[0])
 total = c0.head_object(Bucket=bucket, Key=key)["ContentLength"]
 helper = subprocess.Popen([os.path.join(S, "phelper"), str(total), os.path.join(S, "pdump.bin"), str(n), mem], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)

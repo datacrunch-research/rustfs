@@ -225,6 +225,36 @@ summary shows is paid twice per 96 MiB part (two decode runs per part, about
 6.5 ms per 48 MiB, one core). The HTTP path shows the same decode-side
 gains only partially because its body copy stays serial.
 
+## Phase 4: object data cache, KV-chunk latency
+
+Cache on every node (`RUSTFS_OBJECT_DATA_CACHE_ENABLE=true`,
+`RUSTFS_OBJECT_DATA_CACHE_MODE=fill_materialize_enabled`,
+`RUSTFS_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES=67108864`,
+`RUSTFS_OBJECT_DATA_CACHE_MAX_BYTES=34359738368`), fill on GET. 32 objects of
+48 MiB on 4 MiB shards (one stripe each), one RDMA GET at a time into GPU
+memory from tray17, cold = first GET of each object, warm = five more rounds
+(`scripts/bench/rdma-get/kvlat.py`):
+
+| Cache | cold p50 | cold p99 | warm p50 | warm p99 | warm per-GET rate |
+| --- | --- | --- | --- | --- | --- |
+| off | 23.0 ms | 53.1 ms | 21.4 ms | 29.3 ms | 2.35 GB/s |
+| on, first pass | 36.4 ms (fill) | 119.0 ms | 11.9 ms | 19.9 ms | 4.22 GB/s |
+| on, second pass | 12.6 ms | 22.5 ms | 11.7 ms | 19.7 ms | 4.31 GB/s |
+
+A hit skips the shard reads, bitrot and decode, but the body still goes
+through the cuObject staging copy (48 MiB into 16 MiB chunks, then the RDMA
+write), which is what the 11.8 ms is: the cold < 15 ms / warm < 5 ms targets
+need the fill-on-PUT and the registered cache arena of Phase 6 (RDMA write
+straight from the cache entry), not more cache. Filling on GET costs the
+first reader about 13 ms extra. The cached 2 GiB object is not affected
+(entries are capped at 64 MiB); single stream stayed at 4.77 GB/s.
+
+Also found in this phase: with `RUSTFS_RDMA_POOL_BYTES=2147483648` the
+32-stream runs exhausted the internode registered pool on the storage nodes
+(`rdma_transport_fallback ... pool exhausted`, 10 s TCP backoff), which is
+why 32 in flight scored below 16 in the earlier tables. Use 8 GiB per node
+for that concurrency, as the settings reference says.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -235,4 +265,5 @@ gains only partially because its body copy stays serial.
 | 2 4 MiB shards | ec92a122b | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
 | 3 pipelined RDMA writes | 914bec288 | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
 | 3b buffer pool fix (prefetch 2) | fb18e317f | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
-| 3c off-thread bitrot verification | (phase 3c) | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
+| 3c off-thread bitrot verification | f570dfcd4 | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
+| 4 object data cache (48 MiB KV chunk) | f570dfcd4 | warm hit 11.8 ms p50 (4.2 GB/s) vs 21.4 ms off | | | | |
