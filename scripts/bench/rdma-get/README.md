@@ -13,6 +13,7 @@ Direct cuObject client checks and the four-tray benchmark runner used for
   `node4.sh`/`stop4.sh`, then records single-stream, HTTP, CPU per GiB and
   parallel results to `out/results.tsv`.
 - `kvlat.py`: cold/warm latency of N single-stripe 48 MiB objects (`UPLOAD=1` creates them).
+- `drill.py <victim ssh host> <endpoint host> [key]`: node-loss drill; freezes rustfs on the victim with SIGSTOP for `FREEZE_S` seconds while a GET and a PUT loop run, prints per-phase latency and the longest stall.
 - `cpu.sh`: CPU ticks of the local rustfs processes (summed across trays).
 
 Build the helpers with `build.sh`; run with `RDMA_BENCH_CUFILE_JSON` pointing
