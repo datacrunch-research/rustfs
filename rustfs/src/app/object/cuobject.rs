@@ -27,20 +27,22 @@ use crate::app::storage_api::object_usecase::runtime::{get_global_endpoints_opt,
 use bytes::Bytes;
 use http::HeaderMap;
 use rustfs_config::{
-    DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS,
-    DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES, DEFAULT_RUSTFS_CUOBJECT_PORT, ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES,
-    ENV_RUSTFS_CUOBJECT_ENABLE, ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
+    DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
+    DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS, DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES, DEFAULT_RUSTFS_CUOBJECT_PORT,
+    ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_ENABLE, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
+    ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
 };
-use rustfs_cuobject::{CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken};
+use rustfs_cuobject::{CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken, StagingChunk};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u16, get_env_usize};
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 const LOG_COMPONENT_OBJECT: &str = "object";
@@ -53,6 +55,7 @@ static SERVICE: OnceLock<Arc<CuObjectService>> = OnceLock::new();
 
 pub(crate) struct CuObjectService {
     servers: Vec<Arc<CuObjectServer>>,
+    inflight_writes: usize,
     next: AtomicUsize,
 }
 
@@ -136,6 +139,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
             format!("{ENV_RUSTFS_CUOBJECT_CHUNK_BYTES}/{ENV_RUSTFS_CUOBJECT_POOL_BYTES} are inconsistent"),
         ));
     }
+    let inflight_writes = get_env_usize(ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES).max(1);
     let addrs = resolve_addrs().await?;
     if addrs.is_empty() {
         info!(
@@ -173,6 +177,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
     );
     let _ = SERVICE.set(Arc::new(CuObjectService {
         servers,
+        inflight_writes,
         next: AtomicUsize::new(0),
     }));
     Ok(())
@@ -207,20 +212,150 @@ fn transfer_error(context: &str, error: CuObjectError) -> S3Error {
     S3Error::with_message(S3ErrorCode::InternalError, format!("rdma get {context}: {error}"))
 }
 
-/// Writes the staged bytes at the client's current offset and empties the chunk.
-async fn flush_chunk(
-    server: &Arc<CuObjectServer>,
-    object: &str,
-    token: &RdmaToken,
-    chunk: &mut rustfs_cuobject::StagingChunk,
-    moved: &mut u64,
+/// Pipelines RDMA writes behind the decode stream: up to `inflight` staging
+/// chunks are filled and written concurrently, writes complete in issue order,
+/// and the first failure aborts the GET.
+struct WritePipeline {
+    server: Arc<CuObjectServer>,
+    object: String,
+    token: RdmaToken,
+    free: Vec<StagingChunk>,
+    writes: VecDeque<JoinHandle<Result<(u64, StagingChunk), CuObjectError>>>,
+    issued: u64,
+    moved: u64,
+}
+
+impl WritePipeline {
+    async fn new(server: Arc<CuObjectServer>, object: String, token: RdmaToken, inflight: usize) -> S3Result<Self> {
+        // The first chunk must be reserved; extra chunks are best effort so a
+        // busy pool degrades to a shallower pipeline instead of failing the GET.
+        let mut free = vec![
+            server
+                .reserve(STAGING_RESERVE_TIMEOUT)
+                .await
+                .map_err(|error| transfer_error("staging", error))?,
+        ];
+        while free.len() < inflight {
+            match server.reserve(Duration::ZERO).await {
+                Ok(chunk) => free.push(chunk),
+                Err(_) => break,
+            }
+        }
+        Ok(Self {
+            server,
+            object,
+            token,
+            free,
+            writes: VecDeque::new(),
+            issued: 0,
+            moved: 0,
+        })
+    }
+
+    /// Returns an empty chunk, waiting for the oldest write when none is free.
+    async fn take(&mut self) -> S3Result<StagingChunk> {
+        if self.free.is_empty() {
+            self.reap_oldest().await?;
+        }
+        Ok(self.free.pop().expect("a chunk is free after reaping"))
+    }
+
+    /// Starts the RDMA write of `chunk` at the next client offset.
+    fn submit(&mut self, chunk: StagingChunk) {
+        if chunk.is_empty() {
+            self.free.push(chunk);
+            return;
+        }
+        let len = chunk.len() as u64;
+        let offset = self.issued;
+        self.issued += len;
+        let server = Arc::clone(&self.server);
+        let object = self.object.clone();
+        let token = self.token.clone();
+        self.writes.push_back(tokio::spawn(async move {
+            let written = server.write_to_client(&object, &token, offset, &chunk).await?;
+            Ok((written, chunk))
+        }));
+    }
+
+    async fn reap_oldest(&mut self) -> S3Result<()> {
+        let Some(handle) = self.writes.pop_front() else {
+            return Ok(());
+        };
+        let (written, mut chunk) = handle
+            .await
+            .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, format!("rdma get write task: {error}")))?
+            .map_err(|error| transfer_error("write", error))?;
+        self.moved += written;
+        chunk.clear();
+        self.free.push(chunk);
+        Ok(())
+    }
+
+    /// Waits for every outstanding write; returns the bytes moved.
+    async fn finish(mut self) -> S3Result<u64> {
+        while !self.writes.is_empty() {
+            self.reap_oldest().await?;
+        }
+        Ok(self.moved)
+    }
+
+    /// Cancels outstanding writes on error so their chunks return to the pool.
+    fn abort(&mut self) {
+        for handle in self.writes.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+/// Streams the response into staging chunks, submitting each full chunk to the
+/// write pipeline so decoding keeps running while earlier chunks are written.
+async fn fill_pipeline(
+    pipeline: &mut WritePipeline,
+    stream: DynReader,
+    buffered_body: Option<Bytes>,
+    expected: u64,
 ) -> S3Result<()> {
-    let written = server
-        .write_to_client(object, token, *moved, chunk)
-        .await
-        .map_err(|error| transfer_error("write", error))?;
-    *moved += written;
-    chunk.clear();
+    let mut chunk = pipeline.take().await?;
+    match buffered_body {
+        Some(bytes) => {
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                let take = rest.len().min(chunk.capacity() - chunk.len());
+                chunk
+                    .append(&rest[..take])
+                    .map_err(|error| transfer_error("staging", error))?;
+                rest = &rest[take..];
+                if chunk.is_full() {
+                    pipeline.submit(chunk);
+                    chunk = pipeline.take().await?;
+                }
+            }
+        }
+        None => {
+            let mut stream = stream;
+            // Stop at the committed response length: readers may be unbounded.
+            let mut remaining = expected;
+            while remaining > 0 {
+                let spare = chunk.spare_mut().map_err(|error| transfer_error("staging", error))?;
+                let want = spare.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                let read = stream
+                    .read(&mut spare[..want])
+                    .await
+                    .map_err(|error| transfer_error("read", CuObjectError::Source(error)))?;
+                if read == 0 {
+                    break;
+                }
+                chunk.advance(read).map_err(|error| transfer_error("staging", error))?;
+                remaining -= read as u64;
+                if chunk.is_full() {
+                    pipeline.submit(chunk);
+                    chunk = pipeline.take().await?;
+                }
+            }
+        }
+    }
+    pipeline.submit(chunk);
     Ok(())
 }
 
@@ -249,50 +384,14 @@ pub(crate) async fn serve_get_over_rdma(
     let server = Arc::clone(service.pick());
     let started = Instant::now();
     let object = format!("{bucket}/{key}");
-    let mut chunk = server
-        .reserve(STAGING_RESERVE_TIMEOUT)
-        .await
-        .map_err(|error| transfer_error("staging", error))?;
-    let mut moved: u64 = 0;
-    match buffered_body {
-        Some(bytes) => {
-            let mut rest = &bytes[..];
-            while !rest.is_empty() {
-                let take = rest.len().min(chunk.capacity() - chunk.len());
-                chunk
-                    .append(&rest[..take])
-                    .map_err(|error| transfer_error("staging", error))?;
-                rest = &rest[take..];
-                if chunk.is_full() {
-                    flush_chunk(&server, &object, token, &mut chunk, &mut moved).await?;
-                }
-            }
+    let mut pipeline = WritePipeline::new(server, object, token.clone(), service.inflight_writes).await?;
+    let moved = match fill_pipeline(&mut pipeline, stream, buffered_body, expected).await {
+        Ok(()) => pipeline.finish().await?,
+        Err(error) => {
+            pipeline.abort();
+            return Err(error);
         }
-        None => {
-            let mut stream = stream;
-            // Stop at the committed response length: readers may be unbounded.
-            let mut remaining = expected;
-            while remaining > 0 {
-                let spare = chunk.spare_mut().map_err(|error| transfer_error("staging", error))?;
-                let want = spare.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
-                let read = stream
-                    .read(&mut spare[..want])
-                    .await
-                    .map_err(|error| transfer_error("read", CuObjectError::Source(error)))?;
-                if read == 0 {
-                    break;
-                }
-                chunk.advance(read).map_err(|error| transfer_error("staging", error))?;
-                remaining -= read as u64;
-                if chunk.is_full() {
-                    flush_chunk(&server, &object, token, &mut chunk, &mut moved).await?;
-                }
-            }
-        }
-    }
-    if !chunk.is_empty() {
-        flush_chunk(&server, &object, token, &mut chunk, &mut moved).await?;
-    }
+    };
     if moved != expected {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,

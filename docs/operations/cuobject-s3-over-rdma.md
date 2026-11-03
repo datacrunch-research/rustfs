@@ -34,8 +34,9 @@ tokens are left untouched, so the client falls back to a normal HTTP GET.
 | `RUSTFS_CUOBJECT_ENABLE` | `false` | Start the cuObject servers and honour `x-amz-rdma-token`. |
 | `RUSTFS_CUOBJECT_ADDRS` | local endpoint hosts | Comma-separated RDMA (RoCE/IB) IPs to serve from; one cuObject server per address. |
 | `RUSTFS_CUOBJECT_PORT` | `18515` | cuObject control port; the client never dials it directly with the DC transport. |
-| `RUSTFS_CUOBJECT_CHUNK_BYTES` | `64 MiB` | Staging chunk: the object is streamed into registered host memory in chunks of this size and each chunk is written to the client with one RDMA operation. Max 1 GiB. |
-| `RUSTFS_CUOBJECT_POOL_BYTES` | `1 GiB` | Registered staging pool per server; bounds concurrent RDMA GETs to `pool / chunk`. |
+| `RUSTFS_CUOBJECT_CHUNK_BYTES` | `16 MiB` | Staging chunk: the object is streamed into registered host memory in chunks of this size and each chunk is written to the client with one RDMA operation. Max 1 GiB. |
+| `RUSTFS_CUOBJECT_INFLIGHT_WRITES` | `3` | Staging chunks per GET: while one chunk is being RDMA-written the decoder keeps filling the next ones, so the stripe loop never waits for a write. Each costs one chunk of the pool; a busy pool degrades to fewer chunks rather than failing the GET. |
+| `RUSTFS_CUOBJECT_POOL_BYTES` | `1 GiB` | Registered staging pool per server; bounds concurrent RDMA GETs to about `pool / (chunk x inflight)`. |
 | `RUSTFS_CUOBJECT_NUM_DCIS` | `128` | DC initiators the server library opens. |
 
 Invalid settings or a server library failure stop startup. A node whose
@@ -55,6 +56,11 @@ and `Content-Length: 0`, plus:
   HTTP status, which is `206` whenever a range was requested).
 - `x-amz-rdma-bytes-transferred`: bytes written into the client buffer; absent
   when zero.
+
+Writes are pipelined: chunk N is written by its own task while the decoder
+fills chunk N+1; completions are collected in issue order and the first
+failure aborts the GET (outstanding writes are cancelled and their chunks
+return to the pool).
 
 A malformed token is ignored (the GET is served over HTTP); the client treats
 the missing reply header as "declined". A token buffer smaller than the

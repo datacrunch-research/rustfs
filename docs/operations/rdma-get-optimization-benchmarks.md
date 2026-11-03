@@ -131,6 +131,40 @@ stays in because it is a prerequisite for aligned 4 MiB shard I/O and for
 the pipelining work; a 2x single-stream gain needs the read and emit stages
 to overlap, not a bigger block.
 
+## Phase 3: pipelined cuObject RDMA writes
+
+`RUSTFS_CUOBJECT_INFLIGHT_WRITES=3` staging chunks per GET (default), chunk
+default lowered to 16 MiB; the write of chunk N runs on its own task while
+the decoder fills N+1. Same 4 MiB-shard objects and settings as Phase 2
+unless noted.
+
+| Variant | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| pipelined writes, defaults | **3.17 GB/s** | 2.04 GB/s | 6.80 GB/s | 9.00 GB/s | 8.42 GB/s | **0.84** |
+| + duplex 48 MiB | 2.84 | 1.68 | 7.01 | 8.64 | 2.96 | 0.98 |
+| + duplex 48 MiB + bitrot overlap | 2.48 | 1.44 | 6.86 | 9.08 | 8.47 | 1.12 |
+| 6 x 8 MiB chunks + duplex + overlap | 2.87 | 1.72 | 6.82 | 8.54 | 7.79 | 1.02 |
+| 1 MiB-block objects, duplex + overlap | 2.95 | 2.03 | 8.05 | 9.44 | 9.34 | 1.11 |
+
+Per-stage timings (two single-stream GETs of the 2 GiB, 48 MiB-stripe object):
+
+| Stage | Phase 2 | Phase 3 |
+| --- | --- | --- |
+| `emit` per stripe | 14.4 ms | 6.6 ms |
+| `duplex_backpressure` per wait | 1.2 ms | 0.55 ms |
+| `stripe_read` per stripe | 12.4 ms | 10.6 ms |
+| `reader_setup` per decode run | 8.8 ms | 10.4 ms |
+
+The write no longer stalls the decoder: emit halved and backpressure waits
+halved. What remains per 48 MiB stripe is the shard read (10.6 ms) and a
+reader setup of about 10 ms that is paid once per decode run, and the
+summary shows two decode runs per 96 MiB part, so it is paid per stripe.
+Single-stream run-to-run spread is about 0.3 GB/s on this cluster, which
+is why the larger duplex pipe shows no gain here. Gate 2: a model load is
+within 20 percent of the link rate through the loader (Phase 1), so Phase 5
+server-side fan-out is skipped; the next single-stream work is the reader
+setup and the stripe read/emit overlap in the decode loop.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -138,4 +172,5 @@ to overlap, not a bigger block.
 | 0 baseline | 039443eef | 2.24 GB/s | 2.30 GB/s | 9.14 GB/s (8 GiB, host) | 9.22 GB/s | 1.02 |
 | 0 all switches | 039443eef | 3.11 GB/s | 2.65 GB/s | 8.97 GB/s | 8.76 GB/s | 0.77 |
 | 1 loader, 16 in flight | 039443eef | (model load 7.79 GB/s) | | | | |
-| 2 4 MiB shards | e58522d81+ | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
+| 2 4 MiB shards | ec92a122b | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
+| 3 pipelined RDMA writes | (phase 3) | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
