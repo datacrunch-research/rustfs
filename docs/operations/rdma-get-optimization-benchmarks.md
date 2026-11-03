@@ -249,6 +249,15 @@ straight from the cache entry), not more cache. Filling on GET costs the
 first reader about 13 ms extra. The cached 2 GiB object is not affected
 (entries are capped at 64 MiB); single stream stayed at 4.77 GB/s.
 
+With `RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT=true` (Phase 4 code change: the
+streaming PUT keeps its plaintext frames and inserts them after the commit)
+the first GET after the PUT is already a hit:
+
+| Cache | first GET p50 | first GET p99 | warm p50 | warm p99 |
+| --- | --- | --- | --- | --- |
+| on, fill on GET | 36.4 ms | 119.0 ms | 11.9 ms | 19.9 ms |
+| on, fill on PUT | **11.8 ms** | 21.5 ms | 11.0 ms | 21.2 ms |
+
 Also found in this phase: with `RUSTFS_RDMA_POOL_BYTES=2147483648` the
 32-stream runs exhausted the internode registered pool on the storage nodes
 (`rdma_transport_fallback ... pool exhausted`, 10 s TCP backoff), which is
@@ -267,3 +276,4 @@ for that concurrency, as the settings reference says.
 | 3b buffer pool fix (prefetch 2) | fb18e317f | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
 | 3c off-thread bitrot verification | f570dfcd4 | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
 | 4 object data cache (48 MiB KV chunk) | f570dfcd4 | warm hit 11.8 ms p50 (4.2 GB/s) vs 21.4 ms off | | | | |
+| 4 fill on PUT | (phase 4) | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
