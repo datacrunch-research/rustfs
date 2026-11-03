@@ -7,6 +7,22 @@ client into GPU memory unless noted. Object: `models/bench/rand-8g.bin`
 (8 GiB random bytes, 1 MiB erasure block) unless noted. Each number is the best
 of three rounds. Plan: `tmp/rustfs-optimization-plan.md`.
 
+## Where things stand (2026-11-03)
+
+| Benchmark (plan target) | Phase 0 | Now |
+| --- | --- | --- |
+| Single RDMA GET into GPU, 2 GiB (>= 8 GB/s after Phases 2-3) | 2.24 GB/s | 4.65 GB/s (2.1x) |
+| Model load through the SGLang loader (within 20% of the 16-stream aggregate) | 1.15 GB/s (1 in flight) | 7.8 GB/s, 16 in flight (met) |
+| 48 MiB KV chunk GET cold / warm p50 (< 15 ms / < 5 ms) | 23 ms / 21 ms | 11.8 ms first GET after PUT / 11 ms warm |
+| 64 concurrent GETs across clients (no TCP fallback) | | 2 clients x 32 streams: 17 GB/s, no fallback with an 8 GiB internode pool |
+| One node down during load (stall < 5 s, no 503) | 25 s worst stall | 10.6 s worst stall, no failures (moderate timeouts) |
+
+The single-stream target of 8 GB/s is not reached: after Phases 2, 3 and
+3c the stripe loop still runs shard read (4.4 ms) and emit (6.5 ms, one
+core) back to back per 48 MiB stripe, and the two ran concurrently in no
+configuration tried; the emit copy into the duplex pipe is the next thing
+to remove. The warm KV target needs the registered cache arena (Phase 6).
+
 ## Link baseline (ib_write_bw, tray18 -> tray17, 1 MiB messages)
 
 | Queue pairs | Average |
@@ -264,6 +280,37 @@ Also found in this phase: with `RUSTFS_RDMA_POOL_BYTES=2147483648` the
 why 32 in flight scored below 16 in the earlier tables. Use 8 GiB per node
 for that concurrency, as the settings reference says.
 
+## Phase 4c: one node down (freeze drill)
+
+`scripts/bench/rdma-get/drill.py` freezes the rustfs process on tray18 with
+SIGSTOP for 40 s (a black hole: the host answers ARP and TCP keeps the
+connections, nothing is reset) while one client runs a GET loop (96 MiB
+uncacheable object on 4 MiB shards, RDMA into host memory, 0.2 s apart) and
+a PUT loop (8 MiB objects, 1 s apart). No request failed in any run; the
+numbers are latencies while the node was frozen.
+
+| Settings | GET p50 frozen | GET worst | PUT p50 frozen | PUT worst | single-stream GET after |
+| --- | --- | --- | --- | --- | --- |
+| defaults (connect 3 s, RPC 30 s, disk read 10 s, write stall 30 s, RDMA stall 30 s) | 67 ms | 5.1 s | 57 ms | 24.9 s | 4.6 GB/s |
+| fast (connect 1 s, RPC 3 s, HTTP/2 keepalive 1/3 s, TCP keepalive 2 s, disk read 2 s, write stall 3 s, RDMA stall 2 s, lock RPC 1 s, reprobe 2 s) | 66 ms | 6.9 s | 57 ms | 6.4 s | 2.7 GB/s |
+| moderate (connect 1 s, RPC 5 s, disk read 5 s, write stall 5 s, RDMA stall 5 s, lock RPC 1 s, reprobe 2 s; keepalives default) | 59 ms | 10.1 s | 53 ms | 10.6 s | 3.8 GB/s |
+
+Reads already engage parity within one shard-read timeout, so the GET
+stall is bounded by the disk read timeout plus one RPC round; writes wait
+for the frozen peer until the write-stall budget, which is the 25 s. The
+worst case is twice the budget in each set (two rounds against the frozen
+peer before it is treated as offline), so the plan's 5 s target needs the
+peer circuit breaker from the Phase 4c task list, not smaller timeouts:
+the 2 s budgets already cost single-stream throughput (2.7 GB/s) while the
+moderate set stays within the normal 3.8-5.0 GB/s spread. The moderate set
+is the recommended one until the breaker lands. Before and after the freeze the
+latencies were identical to a healthy cluster; the returning node needed
+no manual action.
+
+Two clients at once (tray17 and tray18, each 32 ranged RDMA GETs of the
+8 GiB object spread over the four trays): 8.52 + 8.48 GB/s, about 17 GB/s
+aggregate from four storage nodes, no TCP fallback (8 GiB internode pool).
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -276,4 +323,5 @@ for that concurrency, as the settings reference says.
 | 3b buffer pool fix (prefetch 2) | fb18e317f | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
 | 3c off-thread bitrot verification | f570dfcd4 | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
 | 4 object data cache (48 MiB KV chunk) | f570dfcd4 | warm hit 11.8 ms p50 (4.2 GB/s) vs 21.4 ms off | | | | |
-| 4 fill on PUT | (phase 4) | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
+| 4 fill on PUT | 53c178def | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
+| 4c one node frozen (moderate timeouts) | 53c178def | no failures; worst stall 10.6 s (25 s with defaults) | | 2 clients x 32: 17 GB/s | | |

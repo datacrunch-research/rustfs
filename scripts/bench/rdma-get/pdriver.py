@@ -3,7 +3,10 @@ import os, subprocess, sys, time, hashlib, threading
 import boto3
 from botocore.config import Config
 # A bodiless RDMA reply still carries the object's checksum header; do not let boto3 compare it with the empty body.
-BOTO_CONFIG = Config(response_checksum_validation="when_required")
+try:
+    BOTO_CONFIG = Config(response_checksum_validation="when_required")
+except TypeError:  # older botocore: no response checksum validation to disable
+    BOTO_CONFIG = Config()
 S = os.path.dirname(os.path.abspath(__file__))
 bucket, key, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 hosts = sys.argv[4].split(",")
