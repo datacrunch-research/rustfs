@@ -125,6 +125,7 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
+pub(crate) type StorageGetObjectSink = ecstore_object::GetObjectSink;
 pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
@@ -662,7 +663,7 @@ pub(crate) mod ecstore_object {
     pub(crate) use rustfs_ecstore::api::object::GetObjectBodySource;
     pub(crate) use rustfs_ecstore::api::object::{
         EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup,
-        GetObjectReadCondition, GetObjectReadMetadata, ObjectEncryptionResolver, ObjectMutationHook,
+        GetObjectReadCondition, GetObjectReadMetadata, GetObjectSink, ObjectEncryptionResolver, ObjectMutationHook,
         PrepareSelectObjectSnapshotError, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SelectObjectSnapshot, WriteCommitGuard, WriteCompletion, get_object_body_cache_plaintext_len,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,

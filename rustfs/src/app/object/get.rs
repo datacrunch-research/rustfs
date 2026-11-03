@@ -4091,16 +4091,27 @@ impl DefaultObjectUsecase {
                 // S3-over-RDMA: the object bytes go straight into the client's
                 // registered (GPU or host) memory; the HTTP response carries no body.
                 let mut lifecycle = lifecycle;
-                let moved = match super::cuobject::serve_get_over_rdma(
-                    final_stream,
-                    buffered_body,
-                    response_content_length,
-                    bucket,
-                    key,
-                    &token,
-                )
-                .await
-                {
+                let sink_handle = req
+                    .extensions
+                    .get::<super::cuobject::RdmaSinkSlot>()
+                    .and_then(super::cuobject::RdmaSinkSlot::take);
+                let transfer = match sink_handle {
+                    Some(handle) if handle.was_used() => {
+                        super::cuobject::finish_get_through_sink(final_stream, response_content_length, handle).await
+                    }
+                    _ => {
+                        super::cuobject::serve_get_over_rdma(
+                            final_stream,
+                            buffered_body,
+                            response_content_length,
+                            bucket,
+                            key,
+                            &token,
+                        )
+                        .await
+                    }
+                };
+                let moved = match transfer {
                     Ok(moved) => moved,
                     Err(error) => {
                         lifecycle.finish_err();
@@ -4558,6 +4569,20 @@ impl DefaultObjectUsecase {
             opts,
         } = request_context;
         drop(object_metadata_progress);
+        // cuObject S3-over-RDMA: hand the storage layer a sink that writes decoded
+        // bytes straight into registered staging (no pipe, no consumer copy). The
+        // handle rides in the request extensions until the body is built.
+        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        let opts = match super::cuobject::rdma_token_for_request(&req.headers) {
+            Some(token) => {
+                let handle = super::cuobject::StagingSinkHandle::new(&bucket, &key, &token).await?;
+                let mut opts = opts;
+                opts.get_object_sink = Some(handle.sink());
+                req.extensions.insert(super::cuobject::RdmaSinkSlot::new(handle));
+                opts
+            }
+            None => opts,
+        };
 
         let manager = get_concurrency_manager();
 

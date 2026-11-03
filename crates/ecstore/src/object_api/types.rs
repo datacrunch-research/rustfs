@@ -1038,10 +1038,48 @@ impl DeleteRecoveryWorkBudget {
     }
 }
 
+/// A one-shot writer handed to the GET read pipeline through
+/// [`ObjectOptions::get_object_sink`]; the pipeline takes it exactly once.
+#[derive(Clone, Default)]
+pub struct GetObjectSink {
+    writer: Arc<std::sync::Mutex<Option<Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>>>>,
+}
+
+impl GetObjectSink {
+    pub fn new(writer: Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>) -> Self {
+        Self {
+            writer: Arc::new(std::sync::Mutex::new(Some(writer))),
+        }
+    }
+
+    /// Takes the writer; `None` once it has been taken (or was never set).
+    pub fn take(&self) -> Option<Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>> {
+        self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
+
+    /// Whether the pipeline took the writer.
+    pub fn is_taken(&self) -> bool {
+        self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none()
+    }
+}
+
+impl std::fmt::Debug for GetObjectSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectSink").field("taken", &self.is_taken()).finish()
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
+    /// Caller-provided destination for a GET body: when set, the legacy
+    /// duplex read pipeline writes the decoded bytes straight into this sink
+    /// instead of a pipe the caller drains, and the returned reader only
+    /// carries the producer's completion. Paths that do not stream through the
+    /// pipeline (inline bodies, cache hits, the codec streaming reader) leave
+    /// the sink untaken, and the caller must then consume the reader as usual.
+    pub get_object_sink: Option<GetObjectSink>,
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,

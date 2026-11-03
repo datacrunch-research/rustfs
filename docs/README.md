@@ -18,6 +18,7 @@ collection:
 - [cuObject S3-over-RDMA GET](operations/cuobject-s3-over-rdma.md) — optional `cuobject` feature: GET straight into client GPU/host memory via `x-amz-rdma-token`; build, settings, wire contract.
 - [Erasure shard size](operations/erasure-shard-size.md) — `RUSTFS_ERASURE_SHARD_BYTES`: larger, aligned shards for new objects; rules and memory cost.
 - [Object data cache fill on PUT](operations/object-data-cache-fill-on-put.md) — `RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT`: insert plain streaming PUT bodies so the first GET hits.
+- [RDMA GET optimization handoff](operations/rdma-get-optimization-handoff.md) — what is committed, the in-progress GET sink diff, and how to continue on another cluster.
 - [RDMA GET optimization benchmarks](operations/rdma-get-optimization-benchmarks.md) — per-phase results on the 4-tray GB300 cluster.
 
 - [Persisted config compatibility](operations/persisted-config-compatibility.md) — ignored MinIO settings, bounded diagnostics, alias retention, and safe resets.
