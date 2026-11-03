@@ -372,13 +372,18 @@ pub const DEFAULT_RUSTFS_CUOBJECT_PORT: u16 = 18515;
 
 /// Staging chunk size per RDMA write to a client.
 pub const ENV_RUSTFS_CUOBJECT_CHUNK_BYTES: &str = "RUSTFS_CUOBJECT_CHUNK_BYTES";
-pub const DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Registered staging memory per cuObject server.
 pub const ENV_RUSTFS_CUOBJECT_POOL_BYTES: &str = "RUSTFS_CUOBJECT_POOL_BYTES";
 pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Dynamically connected initiators per cuObject server (concurrent client connections).
+/// Staging chunks (RDMA writes) kept in flight per GET, so decoding never waits
+/// for the write of the previous chunk; each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES: &str = "RUSTFS_CUOBJECT_INFLIGHT_WRITES";
+pub const DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES: usize = 3;
+
 pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
 pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
 
