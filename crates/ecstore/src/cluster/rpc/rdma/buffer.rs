@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::error::RdmaError;
-use super::ffi::{Connection, DeviceId, MemoryRegion, copy_from_region, copy_into_region};
+use super::ffi::{Connection, DeviceId, MemoryRegion, copy_from_region, copy_into_region, region_slice, region_slice_mut};
 use bytes::Bytes;
 use memmap2::{MmapMut, MmapOptions};
 use std::collections::HashMap;
@@ -171,18 +171,20 @@ impl Slot {
         (self.pool.base + self.offset()) as u64
     }
 
-    pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), RdmaError> {
-        if offset.saturating_add(data.len()) > self.pool.chunk_size {
-            return Err(RdmaError::Protocol("slot write exceeds chunk size".to_owned()));
+    /// Borrows the first `len` bytes; valid while the peer has not been credited for this slot.
+    pub fn as_slice(&self, len: usize) -> Result<&[u8], RdmaError> {
+        if len > self.pool.chunk_size {
+            return Err(RdmaError::Protocol("slot borrow exceeds chunk size".to_owned()));
         }
-        copy_into_region(self.pool.base, self.pool.len, self.offset() + offset, data)
+        region_slice(self.pool.base, self.pool.len, self.offset(), len)
     }
 
-    pub fn read(&self, len: usize) -> Result<Bytes, RdmaError> {
+    /// Mutably borrows the first `len` bytes of a locally owned staging slot.
+    pub fn as_mut_slice(&mut self, len: usize) -> Result<&mut [u8], RdmaError> {
         if len > self.pool.chunk_size {
-            return Err(RdmaError::Protocol("slot read exceeds chunk size".to_owned()));
+            return Err(RdmaError::Protocol("slot borrow exceeds chunk size".to_owned()));
         }
-        copy_from_region(self.pool.base, self.pool.len, self.offset(), len)
+        region_slice_mut(self.pool.base, self.pool.len, self.offset(), len)
     }
 }
 

@@ -26,7 +26,7 @@ use super::buffer::RegisteredPool;
 use super::conn::{Event, RdmaConn};
 use super::error::RdmaError;
 use super::proto::{Auth, Message, RDMA_PROTOCOL_VERSION, ReadRequest, StreamOp, StreamRequest, WriteRequest};
-use super::stream::{ReceiveState, next_event_with_stall, push_stream, receive_stream, window_descriptor};
+use super::stream::{StreamSource, next_event_with_stall, push_stream, receive_stream, window_descriptor};
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, InternodeDataTransportCapabilities, NsScannerCapabilityRequest, NsScannerStreamRequest,
     PutFileAuthWriter, ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
@@ -301,11 +301,8 @@ impl RdmaInternodeDataTransport {
         let (tx, rx) = mpsc::channel(self.settings.stream_slots.max(2));
         let idle = Arc::clone(&self.idle);
         tokio::spawn(async move {
-            // `conn` is declared after `slots`, so it closes before the slots return to the pool.
-            let slots = slots;
             let mut conn = conn;
-            let mut state = ReceiveState::new(stream, &slots);
-            let result = receive_stream(&mut conn, &mut state, &slots, &tx, stall, Some(first), |bytes| {
+            let result = receive_stream(&mut conn, stream, slots, &tx, stall, Some(first), |bytes| {
                 metrics.record_recv_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_RDMA, bytes);
             })
             .await;
@@ -331,7 +328,6 @@ impl RdmaInternodeDataTransport {
                     drop(conn);
                 }
             }
-            drop(slots);
         });
         Ok(Box::new(RdmaChunkReader::new(rx)))
     }
@@ -429,7 +425,7 @@ impl RdmaInternodeDataTransport {
         let stall = Some(self.settings.stall_timeout);
         tokio::spawn(async move {
             let mut conn = conn;
-            let source = ReceiverStream::new(rx).map(Ok::<Bytes, io::Error>);
+            let source = StreamSource::new(ReceiverStream::new(rx).map(Ok::<Bytes, io::Error>));
             let outcome = async {
                 push_stream(&mut conn, &pool, stream, &window, source, |bytes| {
                     metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_RDMA, bytes);
