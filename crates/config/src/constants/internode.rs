@@ -355,6 +355,7 @@ pub const DEFAULT_RUSTFS_RDMA_STREAM_SLOTS: usize = 4;
 /// Total pinned, registered memory per process shared by all RDMA streams.
 pub const ENV_RUSTFS_RDMA_POOL_BYTES: &str = "RUSTFS_RDMA_POOL_BYTES";
 pub const DEFAULT_RUSTFS_RDMA_POOL_BYTES: usize = 256 * 1024 * 1024;
+const _: () = assert!(DEFAULT_RUSTFS_RDMA_POOL_BYTES >= DEFAULT_RUSTFS_RDMA_CHUNK_SIZE * DEFAULT_RUSTFS_RDMA_STREAM_SLOTS);
 
 /// Whether a failed RDMA setup falls back to `tcp-http` for that transfer.
 pub const ENV_RUSTFS_RDMA_FALLBACK_TCP: &str = "RUSTFS_RDMA_FALLBACK_TCP";
@@ -527,6 +528,5 @@ mod tests {
         assert_eq!(DEFAULT_RUSTFS_RDMA_PORT_OFFSET, 1000);
         assert_eq!(DEFAULT_RUSTFS_RDMA_CHUNK_SIZE, 1024 * 1024);
         assert_eq!(DEFAULT_RUSTFS_RDMA_STREAM_SLOTS, 4);
-        assert!(DEFAULT_RUSTFS_RDMA_POOL_BYTES >= DEFAULT_RUSTFS_RDMA_CHUNK_SIZE * DEFAULT_RUSTFS_RDMA_STREAM_SLOTS);
     }
 }

@@ -75,9 +75,61 @@ change (numbers from the baseline binary):
 
 The 988 MB file is too small to amortize connection and token setup; the
 8 GiB object shows the real aggregate, within 25 percent of the single
-queue-pair link rate. The SGLang loader got an `inflight` option (default 16
-ranged GETs of 64 MiB in flight per file) to issue the same pattern through
-NIXL.
+queue-pair link rate.
+
+The SGLang loader (`--load-format rdma`, NIXL OBJ backend) got an `inflight`
+option: that many ranged GETs of `staging_bytes` each stay in flight per
+file (default 16 x 64 MiB). Synthetic 3 GiB safetensors model (32 tensors of
+96 MiB, 96 MiB multipart parts), one GPU, transfer time reported by the
+loader itself:
+
+| `inflight` x `staging_bytes` | accelerated (RDMA into VRAM) | HTTP into pinned host |
+| --- | --- | --- |
+| 1 x 64 MiB | 1.15 GB/s | |
+| 2 x 64 MiB (old double buffer) | 2.45 GB/s | |
+| 16 x 64 MiB | **7.79 GB/s** | 8.31 GB/s |
+| 32 x 32 MiB | 6.03 GB/s | |
+
+Exit criterion met: one model load runs within 15 percent of the 16-stream
+direct-client aggregate (7.8 vs 9.1 GB/s). The accelerated path still pays
+about 2.4 s once per process to bring up the cuObject fabric, which dominates
+small models; the HTTP path then needs a host-to-GPU copy that the RDMA path
+does not.
+
+## Phase 2: 4 MiB shards (48 MiB erasure block)
+
+`RUSTFS_ERASURE_SHARD_BYTES=4194304` with `RUSTFS_RDMA_CHUNK_SIZE=4194304`
+and `RUSTFS_RDMA_POOL_BYTES=2147483648`; the bench objects were re-uploaded
+with 96 MiB multipart parts (`bench/rand-2g-s4m.bin`, `bench/rand-8g-s4m.bin`),
+so each part holds two stripes. Same client and object sizes as Phase 0.
+
+| Variant | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 MiB shards, defaults | 2.57 GB/s | 2.01 GB/s | 6.43 GB/s | **11.21 GB/s** | 7.79 GB/s | 0.94 |
+| + `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=2` | 1.93 | 1.49 | 6.51 | 9.07 | 8.20 | 1.06 |
+| + prefetch + overlap + duplex 64 MiB | 2.38 | 1.63 | 6.37 | 8.36 | 7.93 | 0.98 |
+
+Per-stage timings of one single-stream GET (2 GiB, 48 MiB stripes):
+
+| Stage | Defaults | overlap + duplex 64 MiB |
+| --- | --- | --- |
+| whole GET (`rdma_transfer`) | 1,043 ms (2.04 GB/s) | 820 ms (2.60 GB/s) |
+| `reader_setup` per 96 MiB part | 8.8 ms | 9.9 ms |
+| `stripe_read` per 48 MiB stripe | 12.4 ms (3.9 GB/s) | 10.2 ms |
+| `emit` per stripe (bitrot, decode, copy into the pipe) | 14.4 ms (3.3 GB/s) | 15.2 ms |
+
+Reading: the expected 2-3x did not appear because the stripe loop was never
+dominated by fixed per-stripe overhead; stripe read and emit both scale with
+bytes (0.21 + 0.23 ms per MiB in Phase 0, 12.4 + 14.4 ms per 48 MiB here) and
+still run back to back. With the big block the three serial costs are now of
+the same order: per-part reader setup, the shard reads, and emit. Larger
+blocks did help the aggregate (16 x 8 GiB: 11.2 GB/s, up from 9.1) and keep
+CPU per GiB flat while cutting bitrot hashes and stripe round trips 48x.
+Depth-1 prefetch hurts at this block size (64 MiB stripe buffers allocated
+per stripe), which is the next thing to fix in the decode loop. The setting
+stays in because it is a prerequisite for aligned 4 MiB shard I/O and for
+the pipelining work; a 2x single-stream gain needs the read and emit stages
+to overlap, not a bigger block.
 
 ## Results by phase
 
@@ -85,3 +137,5 @@ NIXL.
 | --- | --- | --- | --- | --- | --- | --- |
 | 0 baseline | 039443eef | 2.24 GB/s | 2.30 GB/s | 9.14 GB/s (8 GiB, host) | 9.22 GB/s | 1.02 |
 | 0 all switches | 039443eef | 3.11 GB/s | 2.65 GB/s | 8.97 GB/s | 8.76 GB/s | 0.77 |
+| 1 loader, 16 in flight | 039443eef | (model load 7.79 GB/s) | | | | |
+| 2 4 MiB shards | e58522d81+ | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
