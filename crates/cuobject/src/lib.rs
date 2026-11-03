@@ -337,6 +337,61 @@ impl CuObjectServer {
     }
 }
 
+impl CuObjectServer {
+    /// Like [`Self::write_to_client`], but owns the chunk for the whole DMA: the
+    /// blocking task holds it until the library call returns, so cancelling the
+    /// awaiting future can never release the staging slot under an in-flight
+    /// write. Returns the chunk with the byte count so the caller can reuse it.
+    pub async fn write_to_client_owned(
+        self: &Arc<Self>,
+        key: &str,
+        token: &RdmaToken,
+        remote_offset: u64,
+        chunk: StagingChunk,
+    ) -> Result<(u64, StagingChunk), CuObjectError> {
+        let len = chunk.len() as u64;
+        if len == 0 {
+            return Ok((0, chunk));
+        }
+        let end = remote_offset
+            .checked_add(len)
+            .ok_or_else(|| CuObjectError::Token("remote offset overflow".to_owned()))?;
+        if end > token.buffer_len {
+            return Err(CuObjectError::TokenTooSmall {
+                buffer: token.buffer_len,
+                needed: end,
+            });
+        }
+        let remote_addr = token
+            .remote_addr
+            .checked_add(remote_offset)
+            .ok_or_else(|| CuObjectError::Token("remote address overflow".to_owned()))?;
+        let server = Arc::clone(self);
+        let key = key.to_owned();
+        let descriptor = token.raw.clone();
+        tokio::task::spawn_blocking(move || {
+            let local_offset = chunk.local_offset();
+            let len_usize = chunk.len();
+            let channel = server.raw.alloc_channel()?;
+            let result = server
+                .raw
+                .get(&key, &server.staging.buffer, local_offset, remote_addr, len_usize, &descriptor, channel);
+            server.raw.free_channel(channel);
+            let moved = result?;
+            if moved != len {
+                return Err(CuObjectError::ShortTransfer { moved, expected: len });
+            }
+            // `chunk` is dropped (or returned) only here, after the DMA finished.
+            Ok((moved, chunk))
+        })
+        .await
+        .map_err(|error| CuObjectError::Os {
+            op: "write task",
+            source: std::io::Error::other(error),
+        })?
+    }
+}
+
 /// Copies owned bytes into staging; convenience for callers holding `Bytes`.
 pub fn fill_chunk(chunk: &mut StagingChunk, data: &Bytes) -> Result<(), CuObjectError> {
     chunk.append(data)

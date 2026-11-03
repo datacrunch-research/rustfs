@@ -18,3 +18,22 @@ Direct cuObject client checks and the four-tray benchmark runner used for
 
 Build the helpers with `build.sh`; run with `RDMA_BENCH_CUFILE_JSON` pointing
 at a `cufile.json` whose `rdma_dev_addr_list` names the client's RDMA IP.
+
+## Building the server for iteration
+
+The release profile (thin LTO, one codegen unit) rebuilds the two largest
+crates from scratch on every edit, 20 minutes or more on the GB300 trays.
+For A/B runs use the `fast` profile (release optimization, no LTO, incremental),
+linked with the toolchain's lld because the larger binary exceeds GNU ld's
+direct-branch range on aarch64:
+
+```bash
+GCCLD=$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld
+RUSTFLAGS="-Clink-arg=-fuse-ld=lld -Clink-arg=-B$GCCLD" \
+  cargo build --profile fast -p rustfs --features rdma,cuobject
+RUSTFS_BIN=target/fast/rustfs bash node4.sh
+```
+
+Measured: full build 25 min, rebuild after an edit in `rustfs` or `ecstore`
+under 3 min. Numbers published in the benchmark record come from the release
+profile unless the row says otherwise.

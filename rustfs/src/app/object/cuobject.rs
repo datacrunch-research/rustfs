@@ -272,10 +272,11 @@ impl WritePipeline {
         let server = Arc::clone(&self.server);
         let object = self.object.clone();
         let token = self.token.clone();
-        self.writes.push_back(tokio::spawn(async move {
-            let written = server.write_to_client(&object, &token, offset, &chunk).await?;
-            Ok((written, chunk))
-        }));
+        // The blocking write owns the chunk until the DMA completes, so neither a
+        // cancelled task nor an aborted pipeline can return the slot early.
+        self.writes.push_back(tokio::spawn(
+            async move { server.write_to_client_owned(&object, &token, offset, chunk).await },
+        ));
     }
 
     async fn reap_oldest(&mut self) -> S3Result<()> {
@@ -300,10 +301,13 @@ impl WritePipeline {
         Ok(self.moved)
     }
 
-    /// Cancels outstanding writes on error so their chunks return to the pool.
-    fn abort(&mut self) {
+    /// Waits for the outstanding writes on error. Their DMAs cannot be
+    /// cancelled, and each chunk is released only when its write returns, so
+    /// draining here is what keeps a staging slot from being reused while the
+    /// NIC still reads it; results are ignored because the GET already failed.
+    async fn abort(&mut self) {
         for handle in self.writes.drain(..) {
-            handle.abort();
+            let _ = handle.await;
         }
     }
 }
@@ -388,7 +392,7 @@ pub(crate) async fn serve_get_over_rdma(
     let moved = match fill_pipeline(&mut pipeline, stream, buffered_body, expected).await {
         Ok(()) => pipeline.finish().await?,
         Err(error) => {
-            pipeline.abort();
+            pipeline.abort().await;
             return Err(error);
         }
     };
