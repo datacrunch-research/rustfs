@@ -77,6 +77,8 @@ offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
 # Linux-only internode RDMA data transport; needs libibverbs and librdmacm at build and run time.
 rdma = ["rustfs-ecstore/rdma"]
+# Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
+cuobject = ["dep:rustfs-cuobject"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
@@ -245,6 +247,7 @@ rustfs-config = { workspace = true, features = ["notify", "server-config-model"]
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-cuobject = { workspace = true, optional = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
 rustfs-keystone = { workspace = true }

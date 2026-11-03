@@ -91,6 +91,17 @@ async fn init_rdma_internode_listener() -> Result<Option<ShutdownHandle>> {
     Ok(None)
 }
 
+/// cuObject S3-over-RDMA servers live for the process lifetime; they stop with it.
+#[cfg(all(feature = "cuobject", target_os = "linux"))]
+async fn init_cuobject_servers() -> Result<()> {
+    crate::app::object::cuobject::init_cuobject_service().await
+}
+
+#[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+async fn init_cuobject_servers() -> Result<()> {
+    Ok(())
+}
+
 pub(crate) async fn init_startup_listen_context(
     config: &Config,
     instance_ctx: &Arc<InstanceContext>,
@@ -287,6 +298,7 @@ pub(crate) async fn init_startup_http_servers(
     };
 
     let rdma_internode_shutdown_tx = init_rdma_internode_listener().await?;
+    init_cuobject_servers().await?;
 
     Ok(StartupHttpServers {
         state_manager,

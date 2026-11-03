@@ -9596,6 +9596,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-crypto",
+ "rustfs-cuobject",
  "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-extension-schema",
@@ -9799,6 +9800,18 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "rustfs-cuobject"
+version = "1.0.2"
+dependencies = [
+ "bytes",
+ "cc",
+ "parking_lot 0.13.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

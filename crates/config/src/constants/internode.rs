@@ -368,6 +368,31 @@ pub const DEFAULT_RUSTFS_RDMA_CONNECT_TIMEOUT_MS: u64 = 2000;
 pub const ENV_RUSTFS_RDMA_STALL_TIMEOUT_SECS: &str = "RUSTFS_RDMA_STALL_TIMEOUT_SECS";
 pub const DEFAULT_RUSTFS_RDMA_STALL_TIMEOUT_SECS: u64 = 30;
 
+/// Whether S3 GETs carrying an `x-amz-rdma-token` are served over cuObject S3-over-RDMA
+/// (requires a build with the `cuobject` feature and libcuobjserver).
+pub const ENV_RUSTFS_CUOBJECT_ENABLE: &str = "RUSTFS_CUOBJECT_ENABLE";
+pub const DEFAULT_RUSTFS_CUOBJECT_ENABLE: bool = false;
+
+/// Comma-separated RDMA-capable IP addresses that get a cuObject server each.
+/// Defaults to the hosts of this node's own endpoints.
+pub const ENV_RUSTFS_CUOBJECT_ADDRS: &str = "RUSTFS_CUOBJECT_ADDRS";
+
+/// UDP/RDMA control port of the cuObject servers.
+pub const ENV_RUSTFS_CUOBJECT_PORT: &str = "RUSTFS_CUOBJECT_PORT";
+pub const DEFAULT_RUSTFS_CUOBJECT_PORT: u16 = 18515;
+
+/// Staging chunk size per RDMA write to a client.
+pub const ENV_RUSTFS_CUOBJECT_CHUNK_BYTES: &str = "RUSTFS_CUOBJECT_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Registered staging memory per cuObject server.
+pub const ENV_RUSTFS_CUOBJECT_POOL_BYTES: &str = "RUSTFS_CUOBJECT_POOL_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Dynamically connected initiators per cuObject server (concurrent client connections).
+pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
+pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
+
 #[cfg(test)]
 mod tests {
     use super::*;

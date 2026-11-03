@@ -1,0 +1,25 @@
+[package]
+name = "rustfs-cuobject"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "Server side of NVIDIA cuObject S3-over-RDMA (GPUDirect object loading) for RustFS"
+keywords = ["rdma", "cuobject", "gpudirect", "s3"]
+categories = ["network-programming"]
+documentation = "https://docs.rs/rustfs-cuobject/latest/rustfs_cuobject/"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
