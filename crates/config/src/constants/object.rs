@@ -297,6 +297,21 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
 
+/// Environment variable for the smallest bitrot frame (hash + shard bytes)
+/// that is verified on a blocking thread instead of inline on the decode task
+/// (`0` disables off-thread verification).
+///
+/// The shard reads of one stripe complete on one task, so with large shards
+/// their hashes were computed one after another on one core: at 4 MiB shards
+/// a 12+4 stripe spent about 10 ms hashing serially. Frames at or above this
+/// size are hashed on the blocking pool so the shards of a stripe verify in
+/// parallel; small frames stay inline because a thread hop would cost more
+/// than the hash.
+pub const ENV_BITROT_VERIFY_OFFLOAD_MIN_BYTES: &str = "RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES";
+/// Default smallest off-thread bitrot frame: 2 MiB (frames of the legacy 1 MiB
+/// block, and 1 MiB shards, stay inline).
+pub const DEFAULT_BITROT_VERIFY_OFFLOAD_MIN_BYTES: usize = 2 * 1024 * 1024;
+
 /// Environment variable for the erasure shard size, in bytes, of newly written
 /// objects (`0`, the default, keeps the historical 1 MiB erasure block).
 ///

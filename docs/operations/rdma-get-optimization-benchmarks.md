@@ -193,6 +193,38 @@ bound at roughly 4.6 GB/s of hashing and `emit` adds the reconstruct and
 copy on the same core. The next step is to verify shards on separate
 cores.
 
+## Phase 3c: shard bitrot verification off the decode task
+
+Frames of at least `RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES` (default 2 MiB;
+the benchmark binary used 1 MiB, identical for 4 MiB shards) are hashed on the
+blocking pool, so the twelve shards of a stripe verify on twelve cores instead
+of one after another on the decode task.
+
+| Variant (4 MiB-shard objects, pipelined writes) | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| off-thread verification, defaults | **4.65 GB/s** | 2.16 GB/s | 7.04 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
+| + prefetch 2 | 4.12 | 1.96 | 6.96 | 10.54 | 8.53 | 1.04 |
+| + prefetch 2 + duplex 48 MiB + bitrot overlap | 3.40 | 1.91 | 6.99 | 10.37 | 8.51 | 1.09 |
+| offload disabled (`...=0`), prefetch 2 | 2.99 | 2.00 | 6.94 | 9.55 | 8.42 | 0.84 |
+| 1 MiB-block objects (stay inline), prefetch 2 | 3.60 | 2.53 | 8.38 | 9.43 | 9.29 | 0.72 |
+
+Per-stage timings (three single-stream GETs of the 2 GiB, 48 MiB-stripe
+object; 3.8-5.0 GB/s run to run):
+
+| Stage | Phase 3 | Phase 3c |
+| --- | --- | --- |
+| `stripe_read` per stripe | 10.6 ms | 4.4 ms |
+| `emit` per stripe | 6.6 ms | 6.5 ms |
+| `reader_setup` per decode run | 10.4 ms | 9.7 ms |
+
+A single RDMA stream is now 2.1x the Phase 0 baseline (4.65 vs 2.24 GB/s)
+and runs above the HTTP path, which still copies its body through the
+response. The next ceilings, in order: the reader setup, which the stage
+summary shows is paid twice per 96 MiB part (two decode runs per part, about
+10 ms each), and the emit stage (reconstruct plus the copy into the pipe,
+6.5 ms per 48 MiB, one core). The HTTP path shows the same decode-side
+gains only partially because its body copy stays serial.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -202,4 +234,5 @@ cores.
 | 1 loader, 16 in flight | 039443eef | (model load 7.79 GB/s) | | | | |
 | 2 4 MiB shards | ec92a122b | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
 | 3 pipelined RDMA writes | 914bec288 | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
-| 3b buffer pool fix (prefetch 2) | (phase 3b) | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
+| 3b buffer pool fix (prefetch 2) | fb18e317f | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
+| 3c off-thread bitrot verification | (phase 3c) | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |

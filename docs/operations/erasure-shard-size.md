@@ -32,5 +32,15 @@ Rules:
   shard: `RUSTFS_RDMA_CHUNK_SIZE=4194304` with the default 4 slots, and size
   `RUSTFS_RDMA_POOL_BYTES` for the expected number of concurrent streams.
 
-See [rdma-get-optimization.md](rdma-get-optimization-benchmarks.md) for the
-measured effect.
+## Bitrot verification with large shards
+
+The shard reads of one stripe complete on the decode task, and each frame is
+bitrot-hashed as it lands, so with large shards the twelve hashes of a 12+4
+stripe used to run one after another on one core (about 10 ms per 48 MiB
+stripe). Frames of at least `RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES`
+(default 2 MiB, `0` disables) are hashed on the blocking thread pool
+instead, so the shards of a stripe verify in parallel; smaller frames stay
+inline where a thread hop would cost more than the hash.
+
+See [rdma-get-optimization-benchmarks.md](rdma-get-optimization-benchmarks.md)
+for the measured effect.
