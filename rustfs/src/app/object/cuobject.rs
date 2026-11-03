@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -508,4 +508,242 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken) -> S3Res
             .map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?,
     };
     Ok((StreamingBlob::new(body), total))
+}
+
+/// Shared state of a [`StagingSink`]: the erasure decoder writes decoded bytes
+/// straight into cuObject staging chunks (no duplex pipe, no consumer copy),
+/// full chunks are RDMA-written on their own tasks, and the GET handler
+/// finishes or aborts the sink once the producer has reported completion.
+struct StagingSinkState {
+    server: Arc<CuObjectServer>,
+    object: String,
+    token: RdmaToken,
+    free: Vec<StagingChunk>,
+    current: Option<StagingChunk>,
+    writes: VecDeque<JoinHandle<Result<(u64, StagingChunk), CuObjectError>>>,
+    issued: u64,
+    /// Bytes confirmed written by reaped writes.
+    moved: u64,
+}
+
+impl StagingSinkState {
+    fn submit_current(&mut self) {
+        let Some(chunk) = self.current.take() else {
+            return;
+        };
+        if chunk.is_empty() {
+            self.free.push(chunk);
+            return;
+        }
+        let len = chunk.len() as u64;
+        let offset = self.issued;
+        self.issued += len;
+        let server = Arc::clone(&self.server);
+        let object = self.object.clone();
+        let token = self.token.clone();
+        self.writes.push_back(tokio::spawn(
+            async move { server.write_to_client_owned(&object, &token, offset, chunk).await },
+        ));
+    }
+
+    /// Polls the oldest write; on completion its chunk returns to `free`.
+    fn poll_reap_oldest(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(handle) = self.writes.front_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(joined) => {
+                self.writes.pop_front();
+                let (written, mut chunk) = joined
+                    .map_err(|error| io::Error::other(format!("rdma get write task: {error}")))?
+                    .map_err(|error| io::Error::other(format!("rdma get write: {error}")))?;
+                self.moved += written;
+                chunk.clear();
+                self.free.push(chunk);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+/// The writer half handed to the storage layer through the GET options.
+pub(crate) struct StagingSink {
+    state: Arc<std::sync::Mutex<StagingSinkState>>,
+}
+
+/// The handler's half: finishes or aborts the transfer after the producer ends.
+pub(crate) struct StagingSinkHandle {
+    sink: crate::app::storage_api::object_usecase::StorageGetObjectSink,
+    state: Arc<std::sync::Mutex<StagingSinkState>>,
+}
+
+fn lock_state(state: &std::sync::Mutex<StagingSinkState>) -> std::sync::MutexGuard<'_, StagingSinkState> {
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl AsyncWrite for StagingSink {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut state = lock_state(&self.state);
+        if state.current.is_none() {
+            if state.free.is_empty() {
+                match state.poll_reap_oldest(cx) {
+                    Poll::Ready(Ok(())) if !state.free.is_empty() => {}
+                    Poll::Ready(Ok(())) => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            state.current = state.free.pop();
+        }
+        let chunk = state.current.as_mut().expect("a current chunk was just installed");
+        let spare = chunk.spare_mut().map_err(io::Error::other)?;
+        let n = spare.len().min(buf.len());
+        spare[..n].copy_from_slice(&buf[..n]);
+        chunk.advance(n).map_err(io::Error::other)?;
+        if chunk.is_full() {
+            state.submit_current();
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl StagingSinkHandle {
+    /// Reserves the staging chunks and builds the sink for one GET.
+    pub(crate) async fn new(bucket: &str, key: &str, token: &RdmaToken) -> S3Result<Self> {
+        let service = SERVICE
+            .get()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma get is not enabled"))?;
+        let server = Arc::clone(service.pick());
+        let mut free = vec![
+            server
+                .reserve(STAGING_RESERVE_TIMEOUT)
+                .await
+                .map_err(|error| transfer_error("staging", error))?,
+        ];
+        while free.len() < service.inflight_writes {
+            match server.reserve(Duration::ZERO).await {
+                Ok(chunk) => free.push(chunk),
+                Err(_) => break,
+            }
+        }
+        let state = Arc::new(std::sync::Mutex::new(StagingSinkState {
+            server,
+            object: format!("{bucket}/{key}"),
+            token: token.clone(),
+            free,
+            current: None,
+            writes: VecDeque::new(),
+            issued: 0,
+            moved: 0,
+        }));
+        let sink = crate::app::storage_api::object_usecase::StorageGetObjectSink::new(Box::new(StagingSink {
+            state: Arc::clone(&state),
+        }));
+        Ok(Self { sink, state })
+    }
+
+    /// The option value to hand to the storage layer.
+    pub(crate) fn sink(&self) -> crate::app::storage_api::object_usecase::StorageGetObjectSink {
+        self.sink.clone()
+    }
+
+    /// Whether the storage layer streamed the body through the sink.
+    pub(crate) fn was_used(&self) -> bool {
+        self.sink.is_taken()
+    }
+
+    /// After the producer finished: writes the last partial chunk and waits for
+    /// every write; returns the bytes moved into the client buffer.
+    pub(crate) async fn finish(self) -> S3Result<u64> {
+        let mut moved = {
+            let mut state = lock_state(&self.state);
+            state.submit_current();
+            state.moved
+        };
+        loop {
+            let handle = lock_state(&self.state).writes.pop_front();
+            let Some(handle) = handle else { break };
+            let (written, _chunk) = handle
+                .await
+                .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, format!("rdma get write task: {error}")))?
+                .map_err(|error| transfer_error("write", error))?;
+            moved += written;
+        }
+        Ok(moved)
+    }
+
+    /// After a failed GET: waits for the in-flight writes so their chunks are
+    /// only released once the DMAs are over.
+    pub(crate) async fn abort(self) {
+        loop {
+            let handle = lock_state(&self.state).writes.pop_front();
+            let Some(handle) = handle else { break };
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Request-extension slot carrying the sink handle from request setup to the
+/// body build; taken exactly once.
+#[derive(Clone)]
+pub(crate) struct RdmaSinkSlot(Arc<std::sync::Mutex<Option<StagingSinkHandle>>>);
+
+impl RdmaSinkSlot {
+    pub(crate) fn new(handle: StagingSinkHandle) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(handle))))
+    }
+
+    pub(crate) fn take(&self) -> Option<StagingSinkHandle> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
+}
+
+/// Completes a GET whose body went through the sink: drains the reader (which
+/// only yields the producer's completion), then flushes the sink and reports
+/// the bytes moved. A producer error aborts the sink first.
+pub(crate) async fn finish_get_through_sink(
+    mut stream: DynReader,
+    response_content_length: i64,
+    handle: StagingSinkHandle,
+) -> S3Result<u64> {
+    let started = Instant::now();
+    let mut scratch = [0u8; 4096];
+    loop {
+        match stream.read(&mut scratch).await {
+            Ok(0) => break,
+            Ok(_) => {
+                // The pipe's write end was dropped unused, so nothing arrives here.
+            }
+            Err(error) => {
+                handle.abort().await;
+                return Err(transfer_error("read", CuObjectError::Source(error)));
+            }
+        }
+    }
+    let moved = handle.finish().await?;
+    let expected = u64::try_from(response_content_length).unwrap_or(0);
+    if moved != expected {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("rdma get moved {moved} of {expected} bytes"),
+        ));
+    }
+    rustfs_io_metrics::record_get_object_stage_duration(
+        super::GET_OBJECT_STAGE_PATH_S3_HANDLER,
+        "rdma_transfer",
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(moved)
 }

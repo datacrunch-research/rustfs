@@ -3597,6 +3597,24 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let duplex_buffer_size = adaptive_duplex_buffer_size(object_info.size);
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
+        // A caller-provided sink replaces the pipe's write end: the producer writes
+        // decoded bytes into it, the pipe's read end sees EOF at once, and the
+        // returned reader then only waits for the producer's terminal result.
+        // Only a plain body can bypass the pipe: compressed or encrypted objects
+        // are transformed by readers layered on the pipe's read end.
+        let sink_usable = !object_info.is_compressed() && !object_info.is_encrypted();
+        let downstream: Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static> = match opts
+            .get_object_sink
+            .as_ref()
+            .filter(|_| sink_usable)
+            .and_then(|sink| sink.take())
+        {
+            Some(sink) => {
+                drop(wd);
+                sink
+            }
+            None => Box::new(wd),
+        };
 
         let (producer_terminal_tx, producer_terminal_rx) = tokio::sync::oneshot::channel();
         let (mut reader, offset, length) =
@@ -3629,7 +3647,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (fi, files, disks) = snapshot.into_owned();
         let producer = async move {
             let _guard = read_lock_guard;
-            let mut writer = GetObjectDownstreamWriter::new(wd);
+            let mut writer = GetObjectDownstreamWriter::new(downstream);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
