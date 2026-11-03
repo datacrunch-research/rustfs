@@ -12,6 +12,7 @@ Direct cuObject client checks and the four-tray benchmark runner used for
 - `bench4.sh`: restarts the cluster with the caller's `RUSTFS_*` environment via
   `node4.sh`/`stop4.sh`, then records single-stream, HTTP, CPU per GiB and
   parallel results to `out/results.tsv`.
+- `kvlat.py`: cold/warm latency of N single-stripe 48 MiB objects (`UPLOAD=1` creates them).
 - `cpu.sh`: CPU ticks of the local rustfs processes (summed across trays).
 
 Build the helpers with `build.sh`; run with `RDMA_BENCH_CUFILE_JSON` pointing
