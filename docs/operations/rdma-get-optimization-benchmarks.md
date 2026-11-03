@@ -11,17 +11,16 @@ of three rounds. Plan: `tmp/rustfs-optimization-plan.md`.
 
 | Benchmark (plan target) | Phase 0 | Now |
 | --- | --- | --- |
-| Single RDMA GET into GPU, 2 GiB (>= 8 GB/s after Phases 2-3) | 2.24 GB/s | 4.65 GB/s (2.1x) |
+| Single RDMA GET into GPU, 2 GiB (>= 8 GB/s after Phases 2-3) | 2.24 GB/s | 5.48 GB/s (2.4x) |
 | Model load through the SGLang loader (within 20% of the 16-stream aggregate) | 1.15 GB/s (1 in flight) | 7.8 GB/s, 16 in flight (met) |
 | 48 MiB KV chunk GET cold / warm p50 (< 15 ms / < 5 ms) | 23 ms / 21 ms | 11.8 ms first GET after PUT / 11 ms warm |
 | 64 concurrent GETs across clients (no TCP fallback) | | 2 clients x 32 streams: 17 GB/s, no fallback with an 8 GiB internode pool |
 | One node down during load (stall < 5 s, no 503) | 25 s worst stall | 10.6 s worst stall, no failures (moderate timeouts) |
 
-The single-stream target of 8 GB/s is not reached: after Phases 2, 3 and
-3c the stripe loop still runs shard read (4.4 ms) and emit (6.5 ms, one
-core) back to back per 48 MiB stripe, and the two ran concurrently in no
-configuration tried; the emit copy into the duplex pipe is the next thing
-to remove. The warm KV target needs the registered cache arena (Phase 6).
+The single-stream target of 8 GB/s is not reached: with the pipe one block
+deep and prefetch on, the read and emit of consecutive stripes overlap, and
+what remains is the two 48 MiB copies per stripe (decoder into the pipe,
+consumer into the cuObject staging) which the zero-copy emit work removes. The warm KV target needs the registered cache arena (Phase 6).
 
 ## Link baseline (ib_write_bw, tray18 -> tray17, 1 MiB messages)
 
@@ -311,6 +310,37 @@ Two clients at once (tray17 and tray18, each 32 ranged RDMA GETs of the
 8 GiB object spread over the four trays): 8.52 + 8.48 GB/s, about 17 GB/s
 aggregate from four storage nodes, no TCP fallback (8 GiB internode pool).
 
+## Phase 3d: a pipe one block deep
+
+`RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` used to act only as a cap: the adaptive
+sizing topped out at 8 MiB for large objects, so the earlier 48 and 64 MiB
+runs changed nothing. An explicit value above the 4 MiB default now raises
+the pipe for objects over 256 MiB. Binary: `fast` profile (no LTO, 16
+codegen units), which measured the same as the release build (4.97 vs
+4.65 GB/s is within the run-to-run spread). Also includes the abort-path
+fix for pipelined writes (a staging chunk is owned by its blocking write
+until the DMA returns).
+
+| Variant (4 MiB-shard objects) | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- |
+| defaults (8 MiB pipe) | 4.97 GB/s | 2.96 GB/s | 7.22 | 9.11 | 0.87 |
+| 64 MiB pipe | 3.53 | 1.83 | 7.07 | 9.08 | 1.19 |
+| 64 MiB pipe + prefetch 2 | **5.48** | 2.75 | 6.98 | 9.28 | 0.96 |
+| 128 MiB pipe + prefetch 2 | **5.48** | 2.75 | 7.02 | 9.19 | 0.89 |
+| prefetch 2 (8 MiB pipe) | 4.22 | 2.14 | 7.26 | 9.10 | 1.04 |
+
+With a pipe that holds a whole 48 MiB stripe the decoder's emit no longer
+blocks on the consumer, and with prefetch the next stripe's read overlaps
+it: 5.48 GB/s, 2.4x the baseline. A big pipe alone is slower (the decoder
+runs ahead and the two copies then contend), and 128 MiB adds nothing over
+64 MiB. The remaining chain is the two 48 MiB copies per stripe (decoder
+into the pipe, consumer into staging) on two cores; removing them is the
+zero-copy emit work.
+
+Recommended settings for the RDMA GET path, in addition to the ones from
+Phases 2 and 3: `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=67108864` and
+`RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=2`.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -321,7 +351,8 @@ aggregate from four storage nodes, no TCP fallback (8 GiB internode pool).
 | 2 4 MiB shards | ec92a122b | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
 | 3 pipelined RDMA writes | 914bec288 | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
 | 3b buffer pool fix (prefetch 2) | fb18e317f | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
-| 3c off-thread bitrot verification | f570dfcd4 | **4.65 GB/s** | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
+| 3c off-thread bitrot verification | f570dfcd4 | 4.65 GB/s | 2.16 GB/s | 9.15 GB/s | 8.25 GB/s | 0.97 |
+| 3d 64 MiB pipe + prefetch 2 | (phase 3d) | **5.48 GB/s** | 2.75 GB/s | 9.28 GB/s | | 0.96 |
 | 4 object data cache (48 MiB KV chunk) | f570dfcd4 | warm hit 11.8 ms p50 (4.2 GB/s) vs 21.4 ms off | | | | |
 | 4 fill on PUT | 53c178def | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
 | 4c one node frozen (moderate timeouts) | 53c178def | no failures; worst stall 10.6 s (25 s with defaults) | | 2 clients x 32: 17 GB/s | | |

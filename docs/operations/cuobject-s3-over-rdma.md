@@ -58,9 +58,10 @@ and `Content-Length: 0`, plus:
   when zero.
 
 Writes are pipelined: chunk N is written by its own task while the decoder
-fills chunk N+1; completions are collected in issue order and the first
-failure aborts the GET (outstanding writes are cancelled and their chunks
-return to the pool).
+fills chunk N+1; completions are collected in issue order. Each chunk is
+owned by its blocking write until the DMA returns, so on a failure the GET
+waits for the outstanding writes before their chunks return to the pool;
+a staging slot is never reused while the NIC may still read it.
 
 A malformed token is ignored (the GET is served over HTTP); the client treats
 the missing reply header as "declined". A token buffer smaller than the

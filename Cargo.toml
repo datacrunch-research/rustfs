@@ -425,6 +425,21 @@ split-debuginfo = "off"
 [profile.production]
 inherits = "release"
 
+# Iteration profile for benchmarking and hardware tests (`cargo build --profile fast`):
+# release optimization without the link-time pass that dominates rebuilds of
+# the two 500k-line crates. Link with the toolchain's lld on aarch64, where the
+# larger code section exceeds the direct-branch range of GNU ld:
+#   RUSTFLAGS="-Clink-arg=-fuse-ld=lld -Clink-arg=-B$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld"
+# Runtime differs from release by a few percent at most (no cross-crate inlining).
+# Incremental compilation is what makes a rebuild after a small edit take minutes
+# instead of recompiling the whole 465k-line crate (cargo turns it off for
+# optimized profiles by default).
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 [profile.profiling]
 inherits = "release"
 debug = true
