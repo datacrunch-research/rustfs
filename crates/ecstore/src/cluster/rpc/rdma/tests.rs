@@ -37,6 +37,7 @@ use http::Method;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -204,6 +205,42 @@ async fn rdma_read_round_trips_whole_and_ranged_streams() {
     let mut body = Vec::new();
     again.read_to_end(&mut body).await.expect("read one byte");
     assert_eq!(body, data[..1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rdma_read_tolerates_a_consumer_that_holds_every_slot_past_the_stall_timeout() {
+    let Some(ip) = test_addr() else { return };
+    let fixture = fixture(ip).await;
+    let data = pattern(16 * 64 * 1024);
+    fixture.handler.files.lock().insert("object/slow".to_owned(), data.clone());
+    let mut request = read_request(&fixture, "object/slow", 0, 0);
+    request.stall_timeout = Some(Duration::from_millis(500));
+    let mut reader = fixture
+        .transport
+        .open_read_chunks(request)
+        .await
+        .expect("open rdma read")
+        .expect("owned-chunk reader");
+    // Hold the whole window (3 slots) for longer than the stall timeout: the peer
+    // cannot write, so the receiver must wait rather than fail the stream.
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let chunk =
+            futures::future::poll_fn(|cx| rustfs_rio::ChunkReader::poll_read_chunk(Pin::new(&mut *reader), cx, 64 * 1024))
+                .await
+                .expect("chunk")
+                .expect("not eof");
+        held.push(chunk);
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut body: Vec<u8> = held.iter().flat_map(|chunk| chunk.iter().copied()).collect();
+    drop(held);
+    reader
+        .read_to_end(&mut body)
+        .await
+        .expect("rest of the stream after the hold");
+    assert_eq!(body.len(), data.len());
+    assert!(body == data, "held-slot stream must still deliver every byte in order");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

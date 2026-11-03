@@ -454,3 +454,28 @@ pub fn async_fd(op: &'static str, fd: RawFd) -> Result<AsyncFd<RawFdHandle>, Rdm
         source: error.into_parts().1,
     })
 }
+
+/// Borrows `count` bytes of a mapped region at `offset`.
+///
+/// The caller guarantees the device does not write the range while the borrow
+/// lives: a receive slot is uncredited, a staging slot is locally owned.
+pub fn region_slice<'a>(base: usize, len: usize, offset: usize, count: usize) -> Result<&'a [u8], RdmaError> {
+    offset
+        .checked_add(count)
+        .filter(|end| *end <= len)
+        .ok_or_else(|| RdmaError::Protocol("buffer borrow exceeds region".to_owned()))?;
+    // SAFETY: the range was bounds-checked against a live mapping that outlives every borrow
+    // (slots hold the pool), and the protocol keeps the device away from it (see above).
+    Ok(unsafe { std::slice::from_raw_parts((base + offset) as *const u8, count) })
+}
+
+/// Mutably borrows `count` bytes of a mapped region at `offset`; same contract as [`region_slice`].
+pub fn region_slice_mut<'a>(base: usize, len: usize, offset: usize, count: usize) -> Result<&'a mut [u8], RdmaError> {
+    offset
+        .checked_add(count)
+        .filter(|end| *end <= len)
+        .ok_or_else(|| RdmaError::Protocol("buffer borrow exceeds region".to_owned()))?;
+    // SAFETY: as for `region_slice`; the caller holds the only `Slot` for this range, so no
+    // other Rust reference to it exists while the mutable borrow lives.
+    Ok(unsafe { std::slice::from_raw_parts_mut((base + offset) as *mut u8, count) })
+}

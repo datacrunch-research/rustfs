@@ -30,7 +30,7 @@ use super::proto::{
     Auth, ErrorCode, Message, RDMA_PROTOCOL_VERSION, RDMA_PUT_FILE_STREAM_PATH, ReadRequest, StreamOp, StreamRequest,
     WindowDescriptor, WriteRequest,
 };
-use super::stream::{ReceiveState, push_stream, receive_stream, window_descriptor};
+use super::stream::{ReaderSource, push_stream, receive_stream, window_descriptor};
 use crate::cluster::rpc::http_auth::{check_and_record_signed_rpc_nonce, tonic_rpc_auth_failure_reason, verify_rpc_signature};
 use crate::disk::FileReader;
 use crate::disk::error::DiskError;
@@ -51,7 +51,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
@@ -468,7 +467,7 @@ async fn serve_read(
         })
         .await?;
     let limit = if request.length == 0 { u64::MAX } else { request.length };
-    let source = ReaderStream::with_capacity(reader.take(limit), ctx.pool.chunk_size());
+    let source = ReaderSource::new(reader.take(limit));
     let metrics = global_internode_metrics();
     push_stream(conn, &ctx.pool, stream, &window, source, |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
@@ -526,11 +525,10 @@ async fn serve_write(
         body,
     );
     let metrics = global_internode_metrics();
-    let mut state = ReceiveState::new(stream, &slots);
     let stall = Some(ctx.settings.stall_timeout);
     let receive = async {
         let tx = tx;
-        receive_stream(conn, &mut state, &slots, &tx, stall, None, |bytes| {
+        receive_stream(conn, stream, slots, &tx, stall, None, |bytes| {
             metrics.record_recv_bytes_for_operation_and_backend(
                 INTERNODE_OPERATION_PUT_FILE_STREAM,
                 INTERNODE_TRANSPORT_BACKEND_RDMA,
