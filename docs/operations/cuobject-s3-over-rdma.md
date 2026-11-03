@@ -69,6 +69,22 @@ response is rejected with `InvalidRange`; RDMA write failures surface as
 `InternalError` and nothing is sent over HTTP. Stage metrics record the
 transfer under `s3_handler/rdma_transfer`.
 
+## PUT and UploadPart over RDMA
+
+A `PutObject` or `UploadPart` with an empty HTTP body and
+`x-amz-rdma-token` (SigV4-signed, `x-amz-content-sha256: UNSIGNED-PAYLOAD`,
+`Content-Length: 0`) takes its bytes from the client's registered buffer: the
+object (or part) length is the token's buffer length, RustFS RDMA-reads it
+into staging chunks one chunk ahead of the writer, and the bytes then go
+through the ordinary PUT pipeline (checksums, erasure encode, fill-on-PUT
+when enabled). The response is the usual one plus `x-amz-rdma-reply: 200`
+and `x-amz-rdma-bytes-transferred`. A malformed token is ignored and the
+empty body is stored as an empty object, exactly as without the feature;
+the NIXL client treats a reply without `x-amz-rdma-reply` as declined.
+
+The PUT tool for the direct check is `scripts/bench/rdma-get/putdriver.py`
+with `puthelper` (mints a `CUOBJ_PUT` token over a pattern-filled buffer).
+
 ## Validation
 
 1. `RUSTFS_CUOBJECT_ENABLE=true RUSTFS_CUOBJECT_ADDRS=<roce ip>` on each node

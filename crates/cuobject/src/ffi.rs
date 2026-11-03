@@ -60,6 +60,17 @@ unsafe extern "C" {
         channel: u16,
         verbs_status: *mut c_int,
     ) -> isize;
+    fn rfs_cuobj_put(
+        server: *mut RawServer,
+        key: *const c_char,
+        buffer: *mut RawBuffer,
+        local_offset: u64,
+        remote_addr: u64,
+        size: usize,
+        descriptor: *const c_char,
+        channel: u16,
+        verbs_status: *mut c_int,
+    ) -> isize;
     fn rfs_cuobj_version() -> c_int;
 }
 
@@ -183,6 +194,52 @@ impl Server {
         }
         Ok(rc as u64)
     }
+
+    /// Blocking RDMA read of `size` bytes from client memory into `buffer + local_offset`.
+    #[allow(clippy::too_many_arguments, reason = "mirrors the library call")]
+    pub fn put(
+        &self,
+        key: &str,
+        buffer: &RegisteredBuffer,
+        local_offset: u64,
+        remote_addr: u64,
+        size: usize,
+        descriptor: &str,
+        channel: u16,
+    ) -> Result<u64, CuObjectError> {
+        let key = CString::new(key).map_err(|_| CuObjectError::Token("key contains NUL".to_owned()))?;
+        let descriptor = CString::new(descriptor).map_err(|_| CuObjectError::Token("token contains NUL".to_owned()))?;
+        let mut verbs_status: c_int = 0;
+        if local_offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > buffer.len as u64)
+        {
+            return Err(CuObjectError::Token("staged range exceeds the registered buffer".to_owned()));
+        }
+        // SAFETY: all handles are live; the destination range lies inside the registered
+        // buffer (checked above) and the caller holds the only staging chunk covering it;
+        // the remote range was bounds-checked against the token by the caller.
+        let rc = unsafe {
+            rfs_cuobj_put(
+                self.raw.as_ptr(),
+                key.as_ptr(),
+                buffer.raw.as_ptr(),
+                local_offset,
+                remote_addr,
+                size,
+                descriptor.as_ptr(),
+                channel,
+                &mut verbs_status,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjectError::Transfer {
+                verbs_status,
+                source: std::io::Error::from_raw_os_error(i32::try_from(-rc).unwrap_or(libc_eio())),
+            });
+        }
+        Ok(rc as u64)
+    }
 }
 
 impl Drop for Server {
@@ -220,6 +277,16 @@ impl RegisteredBuffer {
 }
 
 impl RegisteredBuffer {
+    /// Borrows `len` staged bytes at `offset`.
+    pub fn slice(&self, offset: usize, len: usize) -> Result<&[u8], CuObjectError> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(CuObjectError::Token("staging borrow exceeds the registered buffer".to_owned()));
+        }
+        // SAFETY: the range lies inside the live library-owned allocation; the caller holds
+        // the only staging chunk covering it and no DMA targets it while the borrow lives.
+        Ok(unsafe { std::slice::from_raw_parts((self.base + offset) as *const u8, len) })
+    }
+
     /// Mutably borrows `len` bytes at `offset` for filling by a reader.
     ///
     /// The caller holds the only staging chunk covering this range, and no RDMA

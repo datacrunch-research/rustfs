@@ -207,6 +207,12 @@ impl StagingChunk {
         self.len >= self.server.staging.chunk_bytes
     }
 
+    /// The bytes staged so far.
+    pub fn staged(&self) -> Result<&[u8], CuObjectError> {
+        let offset = self.index * self.server.staging.chunk_bytes;
+        self.server.staging.buffer.slice(offset, self.len)
+    }
+
     /// The unfilled remainder of the chunk, for a reader to fill directly.
     pub fn spare_mut(&mut self) -> Result<&mut [u8], CuObjectError> {
         let offset = self.index * self.server.staging.chunk_bytes + self.len;
@@ -387,6 +393,67 @@ impl CuObjectServer {
         .await
         .map_err(|error| CuObjectError::Os {
             op: "write task",
+            source: std::io::Error::other(error),
+        })?
+    }
+}
+
+impl CuObjectServer {
+    /// RDMA-reads `len` bytes from `token.remote_addr + remote_offset` into the
+    /// (empty) `chunk`, owning it for the whole DMA like
+    /// [`Self::write_to_client_owned`]. On success the chunk holds `len` staged
+    /// bytes.
+    pub async fn read_from_client_owned(
+        self: &Arc<Self>,
+        key: &str,
+        token: &RdmaToken,
+        remote_offset: u64,
+        len: usize,
+        mut chunk: StagingChunk,
+    ) -> Result<StagingChunk, CuObjectError> {
+        chunk.clear();
+        if len == 0 {
+            return Ok(chunk);
+        }
+        if len > chunk.capacity() {
+            return Err(CuObjectError::Token("read exceeds the staging chunk".to_owned()));
+        }
+        let end = remote_offset
+            .checked_add(len as u64)
+            .ok_or_else(|| CuObjectError::Token("remote offset overflow".to_owned()))?;
+        if end > token.buffer_len {
+            return Err(CuObjectError::TokenTooSmall {
+                buffer: token.buffer_len,
+                needed: end,
+            });
+        }
+        let remote_addr = token
+            .remote_addr
+            .checked_add(remote_offset)
+            .ok_or_else(|| CuObjectError::Token("remote address overflow".to_owned()))?;
+        let server = Arc::clone(self);
+        let key = key.to_owned();
+        let descriptor = token.raw.clone();
+        tokio::task::spawn_blocking(move || {
+            let local_offset = chunk.local_offset();
+            let channel = server.raw.alloc_channel()?;
+            let result = server
+                .raw
+                .put(&key, &server.staging.buffer, local_offset, remote_addr, len, &descriptor, channel);
+            server.raw.free_channel(channel);
+            let moved = result?;
+            if moved != len as u64 {
+                return Err(CuObjectError::ShortTransfer {
+                    moved,
+                    expected: len as u64,
+                });
+            }
+            chunk.advance(len)?;
+            Ok(chunk)
+        })
+        .await
+        .map_err(|error| CuObjectError::Os {
+            op: "read task",
             source: std::io::Error::other(error),
         })?
     }

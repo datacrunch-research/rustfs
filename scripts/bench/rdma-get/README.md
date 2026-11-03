@@ -6,6 +6,8 @@ Direct cuObject client checks and the four-tray benchmark runner used for
 - `helper.cpp` / `driver.py`: one GET with one `x-amz-rdma-token` into a GPU or
   pinned host buffer; verifies bytes against the HTTP body (`VERIFY=0` skips,
   `HTTPCMP=0` skips the HTTP timing run, `BUFSIZE` shrinks the token buffer).
+- `puthelper.cpp` / `putdriver.py <endpoint> <bucket> <key> <size> [gpu|host]`: cuObject PUT; the helper fills a buffer with a seeded pattern and mints a `CUOBJ_PUT` token, the driver sends the bodiless signed PUT and verifies the stored object over HTTP.
+- `mpdriver.py <endpoint> <bucket> <key> <part size> <parts> [gpu|host]`: multipart upload with one RDMA `UploadPart` per part; `pputs.py <endpoint> <n> <size> [gpu|host]`: n concurrent RDMA PUTs.
 - `phelper.cpp` / `pdriver.py`: N ranged GETs in flight into one buffer, each
   slice registered on its own (a registration must stay under 4 GiB), spread
   over the listed hosts.
