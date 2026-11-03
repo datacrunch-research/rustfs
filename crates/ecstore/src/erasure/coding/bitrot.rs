@@ -177,7 +177,8 @@ where
 
         let need = self.hash_algo.size() + want;
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
+        let verify = self.verify_scratch(need).await?;
+        let data = &self.buf[self.hash_algo.size()..need];
         if let Some(integrity) = &mut self.integrity {
             integrity.verify(data).await?;
         }
@@ -299,6 +300,102 @@ fn split_and_verify<'a>(hash_algo: &HashAlgorithm, skip_verify: bool, block: &'a
     Ok((data, verify))
 }
 
+/// Smallest frame verified off the decode task (see
+/// `RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES`), read once.
+fn verify_offload_min_bytes() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_BITROT_VERIFY_OFFLOAD_MIN_BYTES,
+            rustfs_config::DEFAULT_BITROT_VERIFY_OFFLOAD_MIN_BYTES,
+        )
+    })
+}
+
+fn should_offload_verify(skip_verify: bool, frame_len: usize) -> bool {
+    let min = verify_offload_min_bytes();
+    !skip_verify && min != 0 && frame_len >= min
+}
+
+fn join_error(error: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::other(error)
+}
+
+/// Verifies an owned frame (`hash || data`) on the blocking pool and returns
+/// the verification time; the caller still owns `frame` through the clone.
+async fn verify_frame_off_thread(hash_algo: &HashAlgorithm, frame: bytes::Bytes) -> std::io::Result<Duration> {
+    let hash_algo = hash_algo.clone();
+    tokio::task::spawn_blocking(move || split_and_verify(&hash_algo, false, &frame).map(|(_, verify)| verify))
+        .await
+        .map_err(join_error)?
+}
+
+/// Verifies a frame spread over `chunks` followed by `tail` (the chunk handoff
+/// path) against the hash in its first `hash_size` bytes.
+fn verify_chunked_frame(
+    hash_algo: &HashAlgorithm,
+    chunks: &[bytes::Bytes],
+    tail: &[u8],
+    hash_size: usize,
+    want: usize,
+) -> std::io::Result<Duration> {
+    let block_chunks = || {
+        chunks
+            .iter()
+            .map(|chunk| chunk.as_ref())
+            .chain((!tail.is_empty()).then_some(tail))
+    };
+    let verify_start = std::time::Instant::now();
+    let actual_hash = hash_algo.hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
+        let start = (*skip).min(chunk.len());
+        *skip -= start;
+        Some(&chunk[start..])
+    }));
+    let verify = verify_start.elapsed();
+    let mut hash_offset = 0;
+    let mut remaining = hash_size;
+    for chunk in block_chunks() {
+        let take = remaining.min(chunk.len());
+        if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
+            error!(
+                event = EVENT_BITROT_HASH_MISMATCH,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_ERASURE,
+                state = "failed",
+                data_len = want,
+                "bitrot hash mismatch"
+            );
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
+        }
+        hash_offset += take;
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(verify)
+}
+
+impl<R> BitrotReader<R> {
+    /// Verifies the frame held in `self.buf[..need]`, off-thread when it is large.
+    async fn verify_scratch(&mut self, need: usize) -> std::io::Result<Duration> {
+        if !should_offload_verify(self.skip_verify, need) {
+            return split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need]).map(|(_, verify)| verify);
+        }
+        // Hand the scratch buffer to the blocking task and take it back after.
+        let hash_algo = self.hash_algo.clone();
+        let buf = std::mem::take(&mut self.buf);
+        let (buf, result) = tokio::task::spawn_blocking(move || {
+            let result = split_and_verify(&hash_algo, false, &buf[..need]).map(|(_, verify)| verify);
+            (buf, result)
+        })
+        .await
+        .map_err(join_error)?;
+        self.buf = buf;
+        result
+    }
+}
+
 impl<R> BitrotReader<R>
 where
     R: ShardSource,
@@ -356,8 +453,12 @@ where
         let need = hash_size + want;
 
         if let Some(block) = self.inner.try_take_block(need) {
-            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block)?;
-            out.extend_from_slice(data);
+            let verify = if should_offload_verify(self.skip_verify, block.len()) {
+                verify_frame_off_thread(&self.hash_algo, block.clone()).await?
+            } else {
+                split_and_verify(&self.hash_algo, self.skip_verify, &block)?.1
+            };
+            out.extend_from_slice(&block[hash_size..]);
             self.last_verify_duration = verify;
             return Ok(want);
         }
@@ -432,51 +533,42 @@ where
         if handed_off {
             if self.chunks.len() == 1 && self.buf.is_empty() {
                 let block = &self.chunks[0];
-                let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, block)?;
-                out.extend_from_slice(data);
+                let verify = if should_offload_verify(self.skip_verify, block.len()) {
+                    verify_frame_off_thread(&self.hash_algo, block.clone()).await?
+                } else {
+                    split_and_verify(&self.hash_algo, self.skip_verify, block)?.1
+                };
+                out.extend_from_slice(&block[hash_size..]);
                 self.last_verify_duration = verify;
                 return Ok(want);
             }
 
+            if !self.skip_verify {
+                let verify = if should_offload_verify(self.skip_verify, need) {
+                    // Move the chunks and tail to the blocking task and take them back.
+                    let hash_algo = self.hash_algo.clone();
+                    let chunks = std::mem::take(&mut self.chunks);
+                    let tail = std::mem::take(&mut self.buf);
+                    let (chunks, tail, result) = tokio::task::spawn_blocking(move || {
+                        let result = verify_chunked_frame(&hash_algo, &chunks, &tail, hash_size, want);
+                        (chunks, tail, result)
+                    })
+                    .await
+                    .map_err(join_error)?;
+                    self.chunks = chunks;
+                    self.buf = tail;
+                    result?
+                } else {
+                    verify_chunked_frame(&self.hash_algo, &self.chunks, &self.buf, hash_size, want)?
+                };
+                self.last_verify_duration = verify;
+            }
             let block_chunks = || {
                 self.chunks
                     .iter()
                     .map(|chunk| chunk.as_ref())
                     .chain((!self.buf.is_empty()).then_some(self.buf.as_slice()))
             };
-            if !self.skip_verify {
-                let verify_start = std::time::Instant::now();
-                let actual_hash = self
-                    .hash_algo
-                    .hash_encode_slices(block_chunks().scan(hash_size, |skip, chunk| {
-                        let start = (*skip).min(chunk.len());
-                        *skip -= start;
-                        Some(&chunk[start..])
-                    }));
-                let verify = verify_start.elapsed();
-                let mut hash_offset = 0;
-                let mut remaining = hash_size;
-                for chunk in block_chunks() {
-                    let take = remaining.min(chunk.len());
-                    if actual_hash.as_ref()[hash_offset..hash_offset + take] != chunk[..take] {
-                        error!(
-                            event = EVENT_BITROT_HASH_MISMATCH,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_ERASURE,
-                            state = "failed",
-                            data_len = want,
-                            "bitrot hash mismatch"
-                        );
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::FileCorrupt));
-                    }
-                    hash_offset += take;
-                    remaining -= take;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-                self.last_verify_duration = verify;
-            }
             let mut skip = hash_size;
             for chunk in block_chunks() {
                 let start = skip.min(chunk.len());
@@ -490,8 +582,8 @@ where
         // the sink differs (`extend_from_slice` into `out` instead of
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
-        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need])?;
-        out.extend_from_slice(data);
+        let verify = self.verify_scratch(need).await?;
+        out.extend_from_slice(&self.buf[hash_size..need]);
         self.last_verify_duration = verify;
         Ok(want)
     }
