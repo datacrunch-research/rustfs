@@ -341,6 +341,29 @@ Recommended settings for the RDMA GET path, in addition to the ones from
 Phases 2 and 3: `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=67108864` and
 `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=2`.
 
+## Phase 4 (write path): cuObject PUT
+
+`PutObject` and `UploadPart` accept `x-amz-rdma-token` with an empty body:
+RustFS RDMA-reads the object from the client's buffer into staging, one
+16 MiB chunk ahead of the writer, and runs the ordinary PUT pipeline on it.
+Verified byte-exact from GPU and pinned host memory (direct client,
+`putdriver.py` / `mpdriver.py`), and the first GET after an RDMA PUT with
+fill-on-PUT is a cache hit (10-15 ms, same as after an HTTP PUT).
+
+| Write | RDMA PUT | HTTP PUT (same client) |
+| --- | --- | --- |
+| single 1 GiB object | 0.39 GB/s (2.8 s) | 0.26 GB/s (4.2 s) |
+| multipart 4 x 96 MiB parts, sequential | 1.07 s per part | |
+| 16 concurrent 48 MiB objects | 0.58 s each, 1.35 GB/s aggregate | 0.70 s each, 1.10 GB/s |
+
+The RDMA read is not the limit (a 48 MiB chunk lands in about 4 ms); the
+PUT pipeline is: a 48 MiB object takes about 0.2 s alone and 0.58 s with 16
+in flight, so one storage node drains about 1.3 GB/s of KV chunks. The
+plan's 20 GB/s per node prefill-drain target therefore needs PUT-side
+work (erasure encode and shard write pipelining), which is outside the GET
+plan; this phase gives the KV write path its RDMA transport and the
+cache-hit on first read.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -355,4 +378,5 @@ Phases 2 and 3: `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE=67108864` and
 | 3d 64 MiB pipe + prefetch 2 | (phase 3d) | **5.48 GB/s** | 2.75 GB/s | 9.28 GB/s | | 0.96 |
 | 4 object data cache (48 MiB KV chunk) | f570dfcd4 | warm hit 11.8 ms p50 (4.2 GB/s) vs 21.4 ms off | | | | |
 | 4 fill on PUT | 53c178def | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
+| 4 cuObject PUT | (put) | RDMA PUT 0.39 GB/s single, 1.35 GB/s x16 | | | | |
 | 4c one node frozen (moderate timeouts) | 53c178def | no failures; worst stall 10.6 s (25 s with defaults) | | 2 clients x 32: 17 GB/s | | |

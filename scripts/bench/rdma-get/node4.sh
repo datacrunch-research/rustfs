@@ -16,7 +16,7 @@ RUSTFS_CONSOLE_ENABLE=false RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUSTFS_RPC_SECR
 RUSTFS_INTERNODE_DATA_TRANSPORT="$TRANSPORT" RUSTFS_RDMA_PORT_OFFSET=1000 RUSTFS_OBS_ENDPOINT="" \
 RUSTFS_CUOBJECT_ENABLE="${RUSTFS_CUOBJECT_ENABLE:-true}" RUSTFS_CUOBJECT_ADDRS="$MYIP" \
 LD_LIBRARY_PATH="${CUOBJSERVER_LIB:-/mnt/shared/home/rain/rustfs/target/cuobjserver/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-RUST_LOG="${RUST_LOG:-info,rustfs_ecstore::cluster::rpc::rdma=debug,rustfs::app::object::cuobject=debug}" \
+RUST_LOG="${RUST_LOG:-info,rustfs_ecstore::cluster::rpc::rdma=debug,rustfs::app::object::cuobject=debug,rustfs::app::object::put=debug}" \
 nohup "$BIN" > "$ROOT/node.log" 2>&1 &
 echo $! > "$ROOT/node.pid"
 echo "$(hostname) ($MYIP): started"
