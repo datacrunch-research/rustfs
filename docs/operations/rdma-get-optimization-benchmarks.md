@@ -165,6 +165,34 @@ within 20 percent of the link rate through the loader (Phase 1), so Phase 5
 server-side fan-out is skipped; the next single-stream work is the reader
 setup and the stripe read/emit overlap in the decode loop.
 
+## Phase 3b: two buffer generations per shard slot
+
+Depth-1 prefetch reads stripe N+1 while stripe N is emitted, but the shard
+buffer pool kept one buffer per slot, so every prefetched read allocated and
+page-faulted a fresh 4 MiB buffer and the returned one was dropped: 64 MiB of
+fresh pages per stripe. The pool now keeps two generations per slot.
+
+| Variant (4 MiB-shard objects, pipelined writes) | Single RDMA GET | Single HTTP GET | CPU s/GiB |
+| --- | --- | --- | --- |
+| defaults, 96 MiB parts | 2.95 GB/s | 1.50 GB/s | 1.03 |
+| defaults, 480 MiB parts | 2.23 | 1.55 | 1.07 |
+| prefetch 2, 96 MiB parts | 2.74 (was 1.93 before the fix) | 1.55 | 1.04 |
+| prefetch 2, 480 MiB parts | 2.88 | 1.81 | 1.08 |
+| prefetch 2 + duplex 48 MiB | 2.89 | 1.90 | 0.90 |
+| prefetch 2 + duplex 48 MiB + bitrot overlap | 2.98 | 2.03 | 0.85 |
+| same switches, 1 MiB-block objects | 2.67 | 1.99 | 0.98 |
+
+Prefetch no longer regresses, but no switch combination moves a single
+stream past about 3 GB/s, and larger multipart parts do not help, so neither
+per-part reader setup nor read/emit overlap is the ceiling. The stage data
+says what is: within one stripe the first shard lands after 0.9 ms and the
+twelfth after 10.5 ms, i.e. the twelve shard reads complete about 0.9 ms
+apart, the time to bitrot-hash one 4 MiB shard on one core. Shard
+verification runs on the decode task, serially, so `stripe_read` is CPU
+bound at roughly 4.6 GB/s of hashing and `emit` adds the reconstruct and
+copy on the same core. The next step is to verify shards on separate
+cores.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -173,4 +201,5 @@ setup and the stripe read/emit overlap in the decode loop.
 | 0 all switches | 039443eef | 3.11 GB/s | 2.65 GB/s | 8.97 GB/s | 8.76 GB/s | 0.77 |
 | 1 loader, 16 in flight | 039443eef | (model load 7.79 GB/s) | | | | |
 | 2 4 MiB shards | ec92a122b | 2.57 GB/s | 2.01 GB/s | 11.21 GB/s | 7.79 GB/s | 0.94 |
-| 3 pipelined RDMA writes | (phase 3) | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
+| 3 pipelined RDMA writes | 914bec288 | 3.17 GB/s | 2.04 GB/s | 9.00 GB/s | 8.42 GB/s | 0.84 |
+| 3b buffer pool fix (prefetch 2) | (phase 3b) | 2.74-2.98 GB/s | 1.55-2.03 GB/s | | | 0.85-1.04 |
