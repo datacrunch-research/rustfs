@@ -158,3 +158,10 @@ pub const ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT: &str = "RUSTFS_OBJECT_D
 pub const ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU";
 pub const ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX";
 pub const ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX: &str = "RUSTFS_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX";
+/// Fill the object data cache from the PUT body as it streams in, so the first
+/// GET after a write is a hit (write-once KV-cache chunks). Only objects that
+/// fit the cache entry limit and take the plain streaming PUT path (no
+/// compression, no SSE) are filled; the body is kept in memory once more
+/// during the PUT.
+pub const ENV_OBJECT_DATA_CACHE_FILL_ON_PUT: &str = "RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT";
+pub const DEFAULT_OBJECT_DATA_CACHE_FILL_ON_PUT: bool = false;
