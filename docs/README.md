@@ -15,6 +15,7 @@ collection:
 
 - [Internode HTTP streaming transport](operations/internode-http-transport.md) — protocol selection, pooled connection isolation, and distributed read validation.
 - [Internode RDMA data transport](operations/internode-rdma-transport.md) — optional `rdma` backend for shard streams: settings, fallback, metrics, and single-host validation.
+- [cuObject S3-over-RDMA GET](operations/cuobject-s3-over-rdma.md) — optional `cuobject` feature: GET straight into client GPU/host memory via `x-amz-rdma-token`; build, settings, wire contract.
 
 - [Persisted config compatibility](operations/persisted-config-compatibility.md) — ignored MinIO settings, bounded diagnostics, alias retention, and safe resets.
 

@@ -1226,6 +1226,12 @@ pub(crate) mod object_usecase {
         pub(crate) use crate::storage::storage_api::{evaluate_read_preconditions, has_read_preconditions};
     }
 
+    /// Process-wide runtime facts the object use case reads (cuObject S3-over-RDMA addressing).
+    #[cfg(all(feature = "cuobject", target_os = "linux"))]
+    pub(crate) mod runtime {
+        pub(crate) use super::super::runtime::{get_global_endpoints_opt, global_rustfs_port};
+    }
+
     pub(crate) mod contract {
         #[cfg(test)]
         pub(crate) mod http {

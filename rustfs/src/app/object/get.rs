@@ -246,7 +246,7 @@ const VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 1024 * 1024;
 
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 
-const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
+pub(super) const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
 
 const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
 
@@ -3868,31 +3868,72 @@ impl DefaultObjectUsecase {
             enable_readahead,
         } = strategy;
         let cache_adapter = self.object_data_cache();
-
         let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let body = Self::build_get_object_body_with_cache(
-            &cache_adapter,
-            final_stream,
-            &info,
-            response_content_length,
-            request_id,
-            content_range.as_deref(),
-            optimal_buffer_size,
-            enable_readahead,
-            concurrent_requests,
-            part_number,
-            rs.is_some(),
-            encryption_applied,
-            buffered_body,
-            cache_hook_served,
-            cache_hook_probed,
-            cache_fill_allowed,
-            bucket,
-            key,
-            lifecycle,
-            resume,
-        )
-        .await?;
+        // Extra response headers beyond what `GetObjectOutput` carries.
+        let mut extra_headers: Vec<(&'static str, String)> = Vec::new();
+        let mut http_content_length = response_content_length;
+        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        let rdma_token = super::cuobject::rdma_token_for_request(&req.headers);
+        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        let rdma_token: Option<std::convert::Infallible> = None;
+        let body = match rdma_token {
+            #[cfg(all(feature = "cuobject", target_os = "linux"))]
+            Some(token) => {
+                // S3-over-RDMA: the object bytes go straight into the client's
+                // registered (GPU or host) memory; the HTTP response carries no body.
+                let mut lifecycle = lifecycle;
+                let moved = match super::cuobject::serve_get_over_rdma(
+                    final_stream,
+                    buffered_body,
+                    response_content_length,
+                    bucket,
+                    key,
+                    &token,
+                )
+                .await
+                {
+                    Ok(moved) => moved,
+                    Err(error) => {
+                        lifecycle.finish_err();
+                        return Err(error);
+                    }
+                };
+                lifecycle.finish_ok();
+                extra_headers.push((rustfs_cuobject::RDMA_REPLY_HEADER, if rs.is_some() { "206" } else { "200" }.to_owned()));
+                if moved > 0 {
+                    extra_headers.push((rustfs_cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+                }
+                http_content_length = 0;
+                StreamingBlob::from(s3s::Body::empty())
+            }
+            #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+            Some(never) => match never {},
+            None => {
+                Self::build_get_object_body_with_cache(
+                    &cache_adapter,
+                    final_stream,
+                    &info,
+                    response_content_length,
+                    request_id,
+                    content_range.as_deref(),
+                    optimal_buffer_size,
+                    enable_readahead,
+                    concurrent_requests,
+                    part_number,
+                    rs.is_some(),
+                    encryption_applied,
+                    buffered_body,
+                    cache_hook_served,
+                    cache_hook_probed,
+                    cache_fill_allowed,
+                    bucket,
+                    key,
+                    lifecycle,
+                    resume,
+                )
+                .await?
+            }
+        };
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUILD, body_build_start);
 
         let checksum_headers_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -3922,7 +3963,7 @@ impl DefaultObjectUsecase {
         let parts_count = Self::get_object_parts_count(part_number, &info);
         let output = GetObjectOutput {
             body: Some(body),
-            content_length: Some(response_content_length),
+            content_length: Some(http_content_length),
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
@@ -3960,7 +4001,11 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
-            extra_checksum_headers: checksums.extra,
+            extra_checksum_headers: {
+                let mut extra_checksum_headers = checksums.extra;
+                extra_checksum_headers.extend(extra_headers);
+                extra_checksum_headers
+            },
         })
     }
 
