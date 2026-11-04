@@ -62,22 +62,56 @@ record for the environment, the fabric findings, and the numbers.
   persistent across reboots) and the cluster uses two drives per node (6+2).
   cuFile needs `CUFILE_DMABUF_ENABLE=true` (no peermem on the inbox stack).
 
+- Zero-copy emit step 2 is in this tree: `ShardBuf` (heap or registered
+  arena block) replaces `Vec<u8>` shard buffers in the erasure read path, the
+  erasure coder, integrity proof, decode engine and bitrot reader are generic
+  over the container, and a `ShardEmitter` offered through the sink writer
+  (task-local for the decode loop) lets the cuObject handler RDMA-write data
+  shards in place from an arena registered with the first cuObject server
+  (`RUSTFS_CUOBJECT_SHARD_ARENA_BYTES`, 0 = off). Single stream 10.3 -> 13.9
+  GB/s, 16 x 8 GiB host 21.6 -> 24.6 GB/s; byte-exact on all checks.
+- Client GPU placement: the storage NIC is on NUMA 1, so the receiving GPU
+  must be one under that socket (GPU 4-7 here; 5-7 GB/s into GPU 0 vs 10.8
+  without and 13.9 with zero-copy into GPU 4). RDMA into any GPU through the
+  CPU root complex caps at 13-14 GB/s per client; full rate needs the GPU's
+  own IB NIC.
+- `RUSTFS_RDMA_IDLE_CONNS_PER_PEER` (default 16, was a constant): every
+  shard read is a stream on its own connection and under 16 producers per
+  node the surplus dialed fresh connections per read (`rdma_fresh_connect`
+  debug events count them). Not yet measured with a deeper pool.
+
+- b300-121's PCIe fault was confirmed as a hardware error; the storage
+  cluster is now b300-139 and b300-141 with four drives each (6+2), client on
+  b300-110. The idle-connection pool depth (64, 256) changed nothing and the
+  dial counter stayed low, so connection dials are not the stripe-read cost.
+- Multi-GPU client: four processes into one GPU or into host memory reach
+  13-17 GB/s, four processes into four GPUs 5-6 GB/s; concurrent peer-to-peer
+  writes into several GPUs through the CPU root complex are the limit, so a
+  multi-GPU loader at full rate needs the GPUs' own InfiniBand NICs.
+
 ## Next steps
 
-1. Zero-copy emit step 2 (the handoff's original item): RDMA-write straight
-   from the shard buffers. The cuObject shim registers arbitrary memory
-   (`rfs_cuobj_register(ptr, len)`), so the practical route is a registered
-   shard-buffer arena behind `ShardBufferPool` with ownership handed to the
-   sink until the DMA completes, rather than copying into staging chunks.
-   This removes the last copy per stripe (about 5 ms of one core per 48 MiB,
-   now overlapped) and is mainly a CPU-per-GiB win; it does not change the
-   stripe-level parallelism the fan-out provides.
-2. Reader setup under load: the stage summary shows `reader_setup` at 80 ms
-   per part with 16 streams (10 ms idle); profile the shard-stream open path
-   (remote opens, lock RPC) before adding more concurrency.
-3. The remaining plan items are unchanged: affinity routing (4), the KV-cache
+1. Reader setup and stripe read under load (10 -> 80 ms per part, 4 -> 20
+   ms per stripe with 16 producers per node): profile the shard-stream open
+   path and the remote read RPC; connection dials are excluded. Also try
+   `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT` above 2 now that stripes are 24
+   MiB and buffers come from the arena (the Gen5 drives sit at a quarter of
+   their rate, a queue-depth symptom).
+2. Zero-copy write submissions are batched per stripe (scatter-gather, up to
+   10 ranges per RDMA operation) and every library transfer waits on a
+   channel permit (`RUSTFS_CUOBJECT_NUM_DCIS`, 128): the first zero-copy
+   build issued one blocking call per 4 MiB shard with thirteen in flight per
+   segment, exhausted the channels under load (`EBUSY`, failed segments) and
+   raised CPU per GiB (3.8 vs 2.4 s/GiB). Still open: the library's
+   asynchronous mode (submit plus poll) to avoid a blocking thread per
+   transfer, and the multi-GPU client numbers with the batched build.
+3. Internode zero-copy: receive remote shards straight into the arena block
+   (register the arena with the transport's protection domain, carry the
+   bitrot hash separately) and read local shards from disk into registered
+   memory; a CPU-per-GiB refinement once the producer pipeline is fast.
+4. The remaining plan items are unchanged: affinity routing (4), the KV-cache
    tier (4b), the peer circuit breaker and lock quorum (4c), the registered
-   cache arena (6).
+   cache arena (6) for the warm KV hit.
 
 ## Porting to an Intel cluster
 
