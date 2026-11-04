@@ -25,7 +25,7 @@ use super::RdmaSettings;
 use super::buffer::RegisteredPool;
 use super::conn::{Event, RdmaConn};
 use super::error::RdmaError;
-use super::ffi::{Connection, Listener, RawFdHandle, async_fd};
+use super::ffi::{Accept, Connection, Listener, RawFdHandle, async_fd};
 use super::proto::{
     Auth, ErrorCode, Message, RDMA_PROTOCOL_VERSION, RDMA_PUT_FILE_STREAM_PATH, ReadRequest, StreamOp, StreamRequest,
     WindowDescriptor, WriteRequest,
@@ -235,12 +235,25 @@ async fn accept_loop(bound: BoundListener, ctx: Arc<ServerContext>, cancel: Canc
                 }
             },
         };
+        // Drain every queued event before clearing readiness: the channel is
+        // edge-triggered, so a request left behind a stale event or a failed
+        // accept would otherwise wait for the next arrival, by which time the
+        // dialer has given up and its request can no longer be accepted.
         loop {
             match listener.try_accept(&ctx.settings.qp_limits()) {
-                Ok(Some(raw)) => {
+                Ok(Accept::Connection(raw)) => {
                     tracker.spawn(serve_connection(raw, Arc::clone(&ctx), cancel.clone()));
                 }
-                Ok(None) => {
+                Ok(Accept::Skipped) => {
+                    debug!(
+                        event = EVENT_RDMA_LISTENER_STATE,
+                        component = LOG_COMPONENT_INTERNODE_RPC,
+                        subsystem = LOG_SUBSYSTEM_RDMA_SERVER,
+                        state = "stale_event",
+                        "rdma listener skipped an event that was not a connection request"
+                    );
+                }
+                Ok(Accept::WouldBlock) => {
                     guard.clear_ready();
                     break;
                 }
@@ -253,8 +266,6 @@ async fn accept_loop(bound: BoundListener, ctx: Arc<ServerContext>, cancel: Canc
                         error = %err,
                         "rdma accept failed"
                     );
-                    guard.clear_ready();
-                    break;
                 }
             }
         }

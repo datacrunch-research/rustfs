@@ -65,6 +65,9 @@ int rfs_rdma_listener_create(const char *ip, uint16_t port, int backlog, struct 
 int rfs_rdma_listener_fd(const struct rfs_rdma_listener *listener);
 // Returns 1 and sets *out when a connection request produced a pending
 // connection, 0 when no request is available, and a negative errno on failure.
+// Returns 1 with a new connection, 0 when no event is pending (EAGAIN), 2
+// when an event that was not a connection request was consumed (keep
+// draining), or a negative errno.
 int rfs_rdma_listener_accept(struct rfs_rdma_listener *listener, const struct rfs_rdma_qp_limits *limits,
                              struct rfs_rdma_conn **out);
 void rfs_rdma_listener_destroy(struct rfs_rdma_listener *listener);

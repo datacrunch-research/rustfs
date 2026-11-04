@@ -941,6 +941,20 @@ What bounds the 16-32 stream rows, measured afterwards:
   802.3ad hashing applies to TCP only, and RoCE LAG needs both ports on one
   card, so all RDMA of a node uses one 400G port (`mlx5_11`), which the
   raw test shows taking 45 GB/s.
+- Not the channel count: `RUSTFS_CUOBJECT_NUM_DCIS` 32 gave 9.2 GB/s single
+  and 17.3 / 17.3 at 16 / 32 host streams, 64 gave 9.8 and 15.8 / 14.1, 128
+  (default) 14-15 and 21 / 25, and 256 collapsed to 0.9 single and 3.5 at
+  both stream counts (the run after it, back on 128, collapsed the same way
+  once and then recovered; cause not found). The default stays 128.
+- Not the server's CPU: during 23 GB/s runs b300-139 peaks at 17 busy cores
+  of 256 (10 user, 7 system).
+- Stream length matters more than count: one 8 GiB object as 4 x 2 GiB
+  streams gives 3.4-4.1 GB/s per stream (13.5-16.3 total), 8 x 1 GiB 1.5
+  (12.0), 16 x 512 MiB 1.2-1.3 (19.3-20.3), 32 x 256 MiB 0.6-0.7 (17.9-22.6).
+  Note that every `benchk` row on the staging cluster from the two-server
+  rows onward ran without the shard arena (`RUSTFS_CUOBJECT_SHARD_ARENA_BYTES`
+  is not in the base environment), that is, on the staging-copy emit path;
+  the arena rows are measured separately below.
 
 Byte-exact on all verify checks. The blocking control run on the same build
 (`RUSTFS_CUOBJECT_ASYNC_TRANSFERS=false`, right after the asynchronous rows)
@@ -950,6 +964,33 @@ under load. The KV chunk rows did not change (cold and warm p50 both 31 ms
 for 48 MiB, 1.6 GB/s): the warm GET is not served from the object data
 cache at all on this cluster (no cache-path stages appear), which is the
 next item for the KV use case.
+
+### Listener drain fix: the collapses were stale accepts (2026-11-04)
+
+Several runs in this record collapsed to 0.9 GB/s single-stream and 3.5
+GB/s at 16-32 streams (the first fan-out pass, the blocking control, the
+256-channel run and the runs after it). On the peer the RDMA listener was
+failing every accept with `EINVAL`, so the serving node fell back to TCP for
+internode shard reads for 10 s at a time. A syscall trace on the peer put
+the failure in queue-pair setup for a connection request the dialer had
+already abandoned: the listener's event channel is edge-triggered, the loop
+treated an event that was not a connection request (a stale event for a
+child id) as "nothing pending" and cleared readiness, and a failed accept
+cleared it as well, so from then on every request was handled one arrival
+late, after the dialer's 2 s timeout. With a 15 s dial timeout the failures
+disappeared, which confirmed the timing. The loop now drains every queued
+event (stale events and failed accepts included) before clearing readiness.
+Two restarts at the default timeout: no accept failures on the peer, no TCP
+fallback, single GETs 6.4-12.6 GB/s. The serving node still logs eight
+failed accepts at startup, from the peer's warm-up dials arriving while the
+8 GiB pool registration runs before the accept loop starts; the dialer
+retries and nothing falls back.
+
+Per-write timing of the cuObject path (`cuobject_emit` stages: `write_total`
+and latency buckets per RDMA write, `write_bytes` as the average write size)
+shows the writes themselves are not slow under load: on the staging-copy
+path at 32 host streams the 16 MiB writes complete in 2.3 ms on average,
+471 of 768 under 1 ms, 53 between 5 and 20 ms, none above 20 ms.
 
 ## Results by phase
 

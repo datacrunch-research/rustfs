@@ -185,7 +185,7 @@ impl Listener {
     }
 
     /// Accepts one pending connection request without blocking.
-    pub fn try_accept(&self, limits: &QpLimits) -> Result<Option<Connection>, RdmaError> {
+    pub fn try_accept(&self, limits: &QpLimits) -> Result<Accept, RdmaError> {
         let mut out: *mut RawConn = ptr::null_mut();
         // SAFETY: `raw` is live, `limits` outlives the call, and `out` is a valid out-pointer.
         let rc = unsafe { rfs_rdma_listener_accept(self.raw.as_ptr(), limits, &mut out) };
@@ -193,11 +193,25 @@ impl Listener {
             return Err(os_error("accept", rc));
         }
         if rc == 0 {
-            return Ok(None);
+            return Ok(Accept::WouldBlock);
+        }
+        if rc == 2 {
+            return Ok(Accept::Skipped);
         }
         let raw = NonNull::new(out).ok_or_else(|| RdmaError::Protocol("accepted connection handle missing".to_owned()))?;
-        Ok(Some(Connection::from_raw(raw)))
+        Ok(Accept::Connection(Connection::from_raw(raw)))
     }
+}
+
+/// One step of draining a listener's event channel.
+pub enum Accept {
+    /// A connection request was accepted into a new connection.
+    Connection(Connection),
+    /// No event is pending; the caller may wait for readiness again.
+    WouldBlock,
+    /// An event that was not a connection request was consumed; keep draining
+    /// before waiting, since readiness is edge-triggered.
+    Skipped,
 }
 
 impl Drop for Listener {

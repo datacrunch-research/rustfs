@@ -256,8 +256,11 @@ int rfs_rdma_listener_accept(struct rfs_rdma_listener *listener, const struct rf
         return neg_errno();
     }
     if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+        // A stale event for a child id that was torn down before it migrated
+        // off this channel. The caller must keep draining: returning "no event"
+        // here would clear the edge-triggered readiness with requests still queued.
         rdma_ack_cm_event(event);
-        return 0;
+        return 2;
     }
     struct rdma_cm_id *id = event->id;
     rdma_ack_cm_event(event);
