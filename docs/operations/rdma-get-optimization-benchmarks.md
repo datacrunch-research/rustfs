@@ -922,8 +922,16 @@ What bounds the 16-32 stream rows, measured afterwards:
   load (2.7 GB/s), so a 512 MiB stream lasts about 0.4 s of which the
   metadata, reader setup and segment ramp are a visible share (slowest
   stream 0.42 s against a 0.48 s wall). Per-stream throughput in these
-  rows is therefore the per-segment rate minus setup, not a fabric cap;
-  longer streams and a larger budget per node raise it (measured next).
+  rows is therefore the per-segment rate minus setup, not a fabric cap.
+- A larger budget per node does not help: budget 64 (up to four segments
+  per stream at 16 streams) gave 11.7 GB/s at 16 and 23.7 at 32 host
+  streams, budget 128 19.6 and 17.1, single GETs 7.6-11.6, all at or below
+  the budget-16 rows. More producers per node share the same node-wide
+  ceiling (about 20 GB/s served per node at 16-32 streams, CPU 2.0
+  s/GiB), so the next lever is that shared cost on the serving node
+  (per-part decode latency, the blocking-pool round trips per stripe, NUMA
+  placement of the arena and decode work against the NIC's socket), not
+  more segments.
 
 Byte-exact on all verify checks. The blocking control run on the same build
 (`RUSTFS_CUOBJECT_ASYNC_TRANSFERS=false`, right after the asynchronous rows)

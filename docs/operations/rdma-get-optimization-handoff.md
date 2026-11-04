@@ -145,9 +145,13 @@ record for the environment, the fabric findings, and the numbers.
    straight from the cache.
 2. Per-stream rate at 16-32 streams: each stream holds one producer
    segment (budget 16 per node) and a segment decodes a 128 MiB part in 47
-   ms under load, so a stream moves 2.7 GB/s at best; a larger budget per
-   node (64, 128) and longer streams are the first things to measure, then
-   the per-part latency itself. Still inside the stripe: the emit is
+   ms under load, so a stream moves 2.7 GB/s at best. A larger budget (64,
+   128) does not raise the node's 20 GB/s, so the shared per-node cost is
+   the target: the per-part decode latency under load, the blocking-pool
+   round trips per stripe (hash plus copy per shard), and NUMA placement of
+   the shard arena and decode work relative to the NIC's socket. Longer
+   streams per GET would also lift the measured per-stream number since
+   the rows are 256-512 MiB ranged streams. Still inside the stripe: the emit is
    8.1 ms per stripe under load (a deeper per-segment write pipeline than
    four in flight is the next knob), the first shard takes 3.3 ms (one
    blocking round trip for hash plus copy), the local shard's mmap copy at
