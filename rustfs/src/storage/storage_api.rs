@@ -124,11 +124,11 @@ pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
-#[cfg(all(feature = "cuobject", target_os = "linux"))]
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) type StorageGetObjectSink = ecstore_object::GetObjectSink;
-#[cfg(all(feature = "cuobject", target_os = "linux"))]
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) type StorageGetObjectSinkSegments = ecstore_object::GetObjectSinkSegments;
-#[cfg(all(feature = "cuobject", target_os = "linux"))]
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) type StorageGetObjectSinkWriter = ecstore_object::GetObjectSinkWriter;
 pub(crate) type StoragePrepareSelectObjectSnapshotError = ecstore_object::PrepareSelectObjectSnapshotError;
 pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapshot;
@@ -654,7 +654,7 @@ pub(crate) mod ecstore_object {
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook, register_object_mutation_hook,
         unregister_get_object_body_cache_hook, unregister_object_mutation_hook, with_get_object_read_condition,
     };
-    #[cfg(all(feature = "cuobject", target_os = "linux"))]
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) use rustfs_ecstore::api::object::{GetObjectSink, GetObjectSinkSegments, GetObjectSinkWriter};
 }
 

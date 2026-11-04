@@ -79,6 +79,8 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 rdma = ["rustfs-ecstore/rdma"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject"]
+# NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
+nixl = ["dep:rustfs-nixl"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
@@ -248,6 +250,7 @@ rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-cuobject = { workspace = true, optional = true }
+rustfs-nixl = { workspace = true, optional = true }
 rustfs-filemeta.workspace = true
 rustfs-iam = { workspace = true }
 rustfs-keystone = { workspace = true }

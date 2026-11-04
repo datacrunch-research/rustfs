@@ -1227,9 +1227,11 @@ pub(crate) mod object_usecase {
     }
 
     /// Process-wide runtime facts the object use case reads (cuObject S3-over-RDMA addressing).
-    #[cfg(all(feature = "cuobject", target_os = "linux"))]
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) mod runtime {
-        pub(crate) use super::super::runtime::{get_global_endpoints_opt, global_rustfs_port};
+        pub(crate) use super::super::runtime::get_global_endpoints_opt;
+        #[cfg(not(feature = "nixl"))]
+        pub(crate) use super::super::runtime::global_rustfs_port;
     }
 
     pub(crate) mod contract {
@@ -1262,7 +1264,7 @@ pub(crate) mod object_usecase {
         remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
         validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
     };
-    #[cfg(all(feature = "cuobject", target_os = "linux"))]
+    #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) use crate::storage::storage_api::{
         StorageGetObjectSink, StorageGetObjectSinkSegments, StorageGetObjectSinkWriter,
     };

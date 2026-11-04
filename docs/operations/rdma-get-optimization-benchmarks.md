@@ -1036,6 +1036,27 @@ for GPU 4-7), start barrier shared through `/shared`:
 | two servers -> GPU 4-7 (two rails each) | 57.8-58.8 | 96 (start skew between the two servers; per-pair rate is the full rail) |
 | two servers -> client host memory, 8 streams over 4 rails | 43.6-55.6 | 165 |
 
+End to end through RustFS (branch `rainj-me/nixl-transport`, server built
+with `--features rdma,nixl`, agent on rails mlx5_9/10/12/13, staging-copy
+emit path, fan-out 8, `nixl-get` from the `rustfs-bench` repository):
+
+| GET | rate | verified |
+| --- | --- | --- |
+| 2 GiB into host memory (rail mlx5_9) | 13.6 GB/s | byte-exact |
+| 2 GiB into GPU 4 (rail mlx5_9) | 14.2 GB/s | byte-exact |
+| 4 x 2 GiB into GPU 4-7 at once, one server | 12.5-15.9 GB/s per process alone, 3-7 while all four overlap | |
+| 4 x 8 GiB into GPU 4-7 at once, one server | 7.0-8.2 GB/s per process with all four active (about 26-30 aggregate) | |
+
+So the GPU target no longer sits at the client's root-complex ceiling and
+four GPUs at once get five times what the cuObject path gave them (5-6
+GB/s); what bounds them now is the serving node's pipeline (the same
+staging-copy emit and per-part decode measured above), not the client or
+the fabric. The UCX inside the wheel reports no accelerated mlx5 transport
+unless `UCX_MODULE_DIR` points at the wheel's `ucx/` modules; with the
+modules a concurrent four-GPU run once stalled on one transfer (not
+reproduced since), so a transfer timeout now fails such a GET instead of
+hanging it.
+
 One rail into one GPU delivers four times the cuObject root-complex path,
 four GPUs scale linearly (228 GB/s out of one server's host memory), and no
 subnet administrator, IPoIB address or RoCE setting is involved. UCX can

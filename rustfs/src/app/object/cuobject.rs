@@ -23,30 +23,46 @@
 //! with the HTTP path, so the data is identical; only the last hop differs.
 
 use crate::app::storage_api::object_usecase::io::DynReader;
-use crate::app::storage_api::object_usecase::runtime::{get_global_endpoints_opt, global_rustfs_port};
+use crate::app::storage_api::object_usecase::runtime::get_global_endpoints_opt;
+#[cfg(not(feature = "nixl"))]
+use crate::app::storage_api::object_usecase::runtime::global_rustfs_port;
 use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
 use rustfs_config::{
-    DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS, DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES,
-    DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
-    DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS,
-    DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES, DEFAULT_RUSTFS_CUOBJECT_PORT, DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
-    ENV_ERASURE_SHARD_BYTES, ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES,
-    ENV_RUSTFS_CUOBJECT_ENABLE, ENV_RUSTFS_CUOBJECT_GET_FANOUT, ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
-    ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, ENV_RUSTFS_CUOBJECT_NUM_DCIS,
-    ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT, ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
+    DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
+    DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
+    DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES, ENV_ERASURE_SHARD_BYTES, ENV_RUSTFS_CUOBJECT_GET_FANOUT,
+    ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
+    ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
 };
-use rustfs_cuobject::{
-    CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken, RegisteredArena, StagingChunk,
-};
+/// The transport this build moves bytes with: NIXL/UCX when the `nixl`
+/// feature is on, otherwise NVIDIA cuObject. Both crates expose the same
+/// surface, so the pipeline below is written once against these names.
+#[cfg(feature = "nixl")]
+pub(crate) mod transport {
+    pub(crate) use rustfs_nixl::{
+        ArenaRanges, MAX_RDMA_OP_BYTES, MAX_SG_RANGES, NIXL_AGENT_HEADER, NIXL_BUFFER_HEADER, NIXL_METADATA_HEADER,
+        NixlError as Error, NixlServer as Server, RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER, RdmaToken, RegisteredArena,
+        StagingChunk, library_version,
+    };
+}
+#[cfg(not(feature = "nixl"))]
+pub(crate) mod transport {
+    pub(crate) use rustfs_cuobject::{
+        ArenaRanges, CuObjectError as Error, CuObjectServer as Server, MAX_RDMA_OP_BYTES, MAX_SG_RANGES,
+        RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER, RDMA_TOKEN_HEADER, RdmaToken, RegisteredArena, StagingChunk,
+        library_version,
+    };
+}
 use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
-use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u16, get_env_u64, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
 use s3s::dto::StreamingBlob;
 use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
+#[cfg(not(feature = "nixl"))]
 use std::net::IpAddr;
 use std::ops::Range;
 use std::pin::Pin;
@@ -57,6 +73,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+use transport::{Error as CuObjectError, RdmaToken, RegisteredArena, Server as CuObjectServer, StagingChunk};
+pub(crate) use transport::{RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER};
 
 const LOG_COMPONENT_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_CUOBJECT: &str = "cuobject";
@@ -106,7 +124,11 @@ fn local_endpoint_hosts() -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(not(feature = "nixl"))]
 async fn resolve_addrs() -> io::Result<Vec<IpAddr>> {
+    use rustfs_config::ENV_RUSTFS_CUOBJECT_ADDRS;
+    use std::collections::BTreeSet;
+
     let mut ips = BTreeSet::new();
     match get_env_opt_str(ENV_RUSTFS_CUOBJECT_ADDRS) {
         Some(raw) => {
@@ -140,14 +162,30 @@ async fn resolve_addrs() -> io::Result<Vec<IpAddr>> {
     Ok(ips.into_iter().collect())
 }
 
-/// Starts one cuObject server per RDMA address when `RUSTFS_CUOBJECT_ENABLE` is set.
-///
-/// Invalid settings and server construction failures fail startup; a node
-/// without RDMA addresses logs and serves GETs over HTTP only.
-pub(crate) async fn init_cuobject_service() -> io::Result<()> {
-    if !get_env_bool(ENV_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_ENABLE) {
-        return Ok(());
-    }
+/// Whether the RDMA transport of this build is switched on.
+#[cfg(not(feature = "nixl"))]
+fn transport_enabled() -> bool {
+    get_env_bool(rustfs_config::ENV_RUSTFS_CUOBJECT_ENABLE, rustfs_config::DEFAULT_RUSTFS_CUOBJECT_ENABLE)
+}
+
+#[cfg(feature = "nixl")]
+fn transport_enabled() -> bool {
+    get_env_bool(rustfs_config::ENV_RUSTFS_NIXL_ENABLE, rustfs_config::DEFAULT_RUSTFS_NIXL_ENABLE)
+}
+
+/// The transport servers of this node plus (control port, chunk bytes, pool
+/// bytes) for the startup log; an empty list means the node has nowhere to
+/// serve RDMA from and keeps serving over HTTP only.
+#[cfg(not(feature = "nixl"))]
+async fn build_servers() -> io::Result<(Vec<Arc<CuObjectServer>>, u16, usize, usize)> {
+    use rustfs_config::{
+        DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS, DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS,
+        DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES, DEFAULT_RUSTFS_CUOBJECT_PORT, ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS,
+        ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
+    };
+    use rustfs_cuobject::CuObjectConfig;
+    use rustfs_utils::get_env_u16;
+
     let config = CuObjectConfig {
         port: get_env_u16(ENV_RUSTFS_CUOBJECT_PORT, DEFAULT_RUSTFS_CUOBJECT_PORT),
         num_dcis: i32::try_from(get_env_usize(ENV_RUSTFS_CUOBJECT_NUM_DCIS, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS as usize))
@@ -157,14 +195,83 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         async_transfers: get_env_bool(ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS, DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS),
         ..CuObjectConfig::default()
     };
-    if config.chunk_bytes == 0
-        || config.chunk_bytes > rustfs_cuobject::MAX_RDMA_OP_BYTES
-        || config.pool_bytes < config.chunk_bytes
-    {
+    if config.chunk_bytes == 0 || config.chunk_bytes > transport::MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{ENV_RUSTFS_CUOBJECT_CHUNK_BYTES}/{ENV_RUSTFS_CUOBJECT_POOL_BYTES} are inconsistent"),
         ));
+    }
+    let addrs = resolve_addrs().await?;
+    let mut servers = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let config = config.clone();
+        let server = tokio::task::spawn_blocking(move || CuObjectServer::new(addr, &config))
+            .await
+            .map_err(io::Error::other)?
+            .map_err(|error| io::Error::other(format!("cuobject server on {addr}: {error}")))?;
+        servers.push(server);
+    }
+    Ok((servers, config.port, config.chunk_bytes, config.pool_bytes))
+}
+
+/// One NIXL agent per node with the UCX backend; no address is needed, the
+/// agent metadata carries every device.
+#[cfg(feature = "nixl")]
+async fn build_servers() -> io::Result<(Vec<Arc<CuObjectServer>>, u16, usize, usize)> {
+    use rustfs_config::{
+        DEFAULT_RUSTFS_NIXL_CHUNK_BYTES, DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT, DEFAULT_RUSTFS_NIXL_NUM_WORKERS,
+        DEFAULT_RUSTFS_NIXL_POOL_BYTES, DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, ENV_RUSTFS_NIXL_AGENT_NAME,
+        ENV_RUSTFS_NIXL_CHUNK_BYTES, ENV_RUSTFS_NIXL_MAX_INFLIGHT, ENV_RUSTFS_NIXL_NUM_WORKERS, ENV_RUSTFS_NIXL_POOL_BYTES,
+        ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, ENV_RUSTFS_NIXL_UCX_DEVICES,
+    };
+    use rustfs_nixl::NixlConfig;
+
+    let agent_name = get_env_opt_str(ENV_RUSTFS_NIXL_AGENT_NAME).unwrap_or_else(|| {
+        let host = local_endpoint_hosts().into_iter().next().unwrap_or_else(|| "node".to_owned());
+        format!("rustfs-{}", host.trim_matches(|c| c == '[' || c == ']'))
+    });
+    let ucx_devices: Vec<String> = get_env_opt_str(ENV_RUSTFS_NIXL_UCX_DEVICES)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|device| !device.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let config = NixlConfig {
+        agent_name,
+        ucx_devices,
+        num_workers: u32::try_from(get_env_usize(ENV_RUSTFS_NIXL_NUM_WORKERS, DEFAULT_RUSTFS_NIXL_NUM_WORKERS as usize))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{ENV_RUSTFS_NIXL_NUM_WORKERS} is too large")))?,
+        chunk_bytes: get_env_usize(ENV_RUSTFS_NIXL_CHUNK_BYTES, DEFAULT_RUSTFS_NIXL_CHUNK_BYTES),
+        pool_bytes: get_env_usize(ENV_RUSTFS_NIXL_POOL_BYTES, DEFAULT_RUSTFS_NIXL_POOL_BYTES),
+        max_inflight: get_env_usize(ENV_RUSTFS_NIXL_MAX_INFLIGHT, DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT),
+        transfer_timeout: Duration::from_secs(
+            get_env_u64(ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS).max(1),
+        ),
+        ..NixlConfig::default()
+    };
+    if config.chunk_bytes == 0 || config.chunk_bytes > transport::MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{ENV_RUSTFS_NIXL_CHUNK_BYTES}/{ENV_RUSTFS_NIXL_POOL_BYTES} are inconsistent"),
+        ));
+    }
+    let (chunk_bytes, pool_bytes) = (config.chunk_bytes, config.pool_bytes);
+    let server = tokio::task::spawn_blocking(move || CuObjectServer::new(&config))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|error| io::Error::other(format!("nixl agent: {error}")))?;
+    Ok((vec![server], 0, chunk_bytes, pool_bytes))
+}
+
+/// Starts the RDMA transport servers of this node when the transport is
+/// enabled (`RUSTFS_CUOBJECT_ENABLE` or `RUSTFS_NIXL_ENABLE`).
+///
+/// Invalid settings and server construction failures fail startup; a node
+/// without RDMA addresses logs and serves GETs over HTTP only.
+pub(crate) async fn init_cuobject_service() -> io::Result<()> {
+    if !transport_enabled() {
+        return Ok(());
     }
     let inflight_writes = get_env_usize(ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES).max(1);
     let get_fanout = get_env_usize(ENV_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT).max(1);
@@ -172,46 +279,36 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         get_env_u64(ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES);
     let get_fanout_budget = get_env_usize(ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET)
         .min(tokio::sync::Semaphore::MAX_PERMITS);
-    let addrs = resolve_addrs().await?;
-    if addrs.is_empty() {
+    let (servers, port, chunk_bytes, pool_bytes) = build_servers().await?;
+    if servers.is_empty() {
         info!(
             event = EVENT_CUOBJECT_SERVICE_STATE,
             component = LOG_COMPONENT_OBJECT,
             subsystem = LOG_SUBSYSTEM_CUOBJECT,
             state = "skipped",
             reason = "no_rdma_address",
-            "cuobject service not started: no local endpoint host or RUSTFS_CUOBJECT_ADDRS"
+            "rdma transport service not started: no local endpoint host or RUSTFS_CUOBJECT_ADDRS"
         );
         return Ok(());
     }
-    let mut servers = Vec::with_capacity(addrs.len());
-    for addr in addrs {
-        let config = config.clone();
-        // Server construction opens the RDMA device and pins the staging pool.
-        let server = tokio::task::spawn_blocking(move || CuObjectServer::new(addr, &config))
-            .await
-            .map_err(io::Error::other)?
-            .map_err(|error| io::Error::other(format!("cuobject server on {addr}: {error}")))?;
-        servers.push(server);
-    }
     let shard_arena = install_cuobject_shard_arena(&servers).await?;
-    let (major, minor) = rustfs_cuobject::library_version();
+    let (major, minor) = transport::library_version();
     info!(
         event = EVENT_CUOBJECT_SERVICE_STATE,
         component = LOG_COMPONENT_OBJECT,
         subsystem = LOG_SUBSYSTEM_CUOBJECT,
         state = "started",
         server_count = servers.len(),
-        port = config.port,
-        chunk_bytes = config.chunk_bytes,
-        pool_bytes = config.pool_bytes,
+        port,
+        chunk_bytes,
+        pool_bytes,
         inflight_writes,
         get_fanout,
         get_fanout_min_bytes,
         get_fanout_budget,
         shard_arena_bytes = shard_arena.as_ref().map_or(0, |arena| arena.len()),
         library = format_args!("{major}.{minor}"),
-        "cuobject s3-over-rdma service started"
+        "s3-over-rdma transport service started"
     );
     let _ = SERVICE.set(Arc::new(CuObjectService {
         servers,
@@ -277,15 +374,32 @@ fn build_slab_arena(arena: &Arc<RegisteredArena>, block_len: usize) -> Arc<Regis
     unsafe { RegisteredSlabArena::new(arena.as_mut_ptr(), arena.len(), block_len, arena.id(), Box::new(Arc::clone(arena))) }
 }
 
+/// The cuObject token: one opaque header from the client library.
+#[cfg(not(feature = "nixl"))]
+fn parse_rdma_token(headers: &HeaderMap) -> Option<Result<RdmaToken, CuObjectError>> {
+    let raw = headers.get(transport::RDMA_TOKEN_HEADER)?.to_str().ok()?;
+    Some(RdmaToken::parse(raw))
+}
+
+/// The NIXL token: agent name, optional agent metadata and the client buffer.
+#[cfg(feature = "nixl")]
+fn parse_rdma_token(headers: &HeaderMap) -> Option<Result<RdmaToken, CuObjectError>> {
+    let agent = headers.get(transport::NIXL_AGENT_HEADER)?.to_str().ok()?;
+    let buffer = headers.get(transport::NIXL_BUFFER_HEADER)?.to_str().ok()?;
+    let metadata = headers
+        .get(transport::NIXL_METADATA_HEADER)
+        .and_then(|value| value.to_str().ok());
+    Some(RdmaToken::from_headers(agent, metadata, buffer))
+}
+
 /// The parsed RDMA token of a GET that must be served over RDMA.
 ///
 /// Returns `None` when the header is absent, the service is not running, or
 /// the token is malformed; in the last two cases the response carries no
 /// `x-amz-rdma-reply`, which the client reads as "declined".
 pub(crate) fn rdma_token_for_request(headers: &HeaderMap) -> Option<RdmaToken> {
-    let raw = headers.get(RDMA_TOKEN_HEADER)?.to_str().ok()?;
     SERVICE.get()?;
-    match RdmaToken::parse(raw) {
+    match parse_rdma_token(headers)? {
         Ok(token) => Some(token),
         Err(error) => {
             warn!(
@@ -534,7 +648,7 @@ impl ByteStream for RdmaPutBody {
     }
 }
 
-type StagedRead = JoinHandle<Result<rustfs_cuobject::StagingChunk, CuObjectError>>;
+type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
 fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaToken, offset: u64, len: usize) -> StagedRead {
     let server = Arc::clone(server);
@@ -735,7 +849,7 @@ impl SegmentState {
         let server = Arc::clone(&shared.server);
         let object = shared.object.clone();
         let token = shared.token.clone();
-        let source = rustfs_cuobject::ArenaRanges {
+        let source = transport::ArenaRanges {
             arena: Arc::clone(arena),
             ranges,
         };
@@ -934,7 +1048,7 @@ impl ShardEmitter for StagingShardEmitter {
         let local_offset = block.offset() + range.start;
         let shared = Arc::clone(&self.shared);
         let mut state = lock_segment(&self.state);
-        if state.pending.len() >= rustfs_cuobject::MAX_SG_RANGES {
+        if state.pending.len() >= transport::MAX_SG_RANGES {
             // The batch is full: submit it (with backpressure) before taking more.
             while state.writes.len() >= MAX_INFLIGHT_SHARD_WRITES {
                 match state.poll_reap_oldest(&shared, cx) {

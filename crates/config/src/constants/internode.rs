@@ -373,6 +373,32 @@ pub const DEFAULT_RUSTFS_RDMA_CONNECT_TIMEOUT_MS: u64 = 2000;
 pub const ENV_RUSTFS_RDMA_STALL_TIMEOUT_SECS: &str = "RUSTFS_RDMA_STALL_TIMEOUT_SECS";
 pub const DEFAULT_RUSTFS_RDMA_STALL_TIMEOUT_SECS: u64 = 30;
 
+/// Whether S3 GETs and PUTs carrying the NIXL headers are served over NIXL/UCX
+/// S3-over-RDMA (requires a build with the `nixl` feature and libnixl). The
+/// pipeline settings below (`RUSTFS_CUOBJECT_GET_FANOUT*`, `_INFLIGHT_WRITES`,
+/// `_SHARD_ARENA_BYTES`) apply to this transport as well.
+pub const ENV_RUSTFS_NIXL_ENABLE: &str = "RUSTFS_NIXL_ENABLE";
+pub const DEFAULT_RUSTFS_NIXL_ENABLE: bool = false;
+/// This node's NIXL agent name; defaults to `rustfs-<first local endpoint host>`.
+pub const ENV_RUSTFS_NIXL_AGENT_NAME: &str = "RUSTFS_NIXL_AGENT_NAME";
+/// Comma-separated UCX device names (`mlx5_9,mlx5_10`; NIXL adds the port); empty lets UCX use every device.
+pub const ENV_RUSTFS_NIXL_UCX_DEVICES: &str = "RUSTFS_NIXL_UCX_DEVICES";
+/// UCX progress workers of the agent.
+pub const ENV_RUSTFS_NIXL_NUM_WORKERS: &str = "RUSTFS_NIXL_NUM_WORKERS";
+pub const DEFAULT_RUSTFS_NIXL_NUM_WORKERS: u32 = 1;
+/// Staging chunk size per transfer descriptor to a client.
+pub const ENV_RUSTFS_NIXL_CHUNK_BYTES: &str = "RUSTFS_NIXL_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Registered staging memory of the agent.
+pub const ENV_RUSTFS_NIXL_POOL_BYTES: &str = "RUSTFS_NIXL_POOL_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_POOL_BYTES: usize = 1024 * 1024 * 1024;
+/// Transfers in flight per node at most.
+pub const ENV_RUSTFS_NIXL_MAX_INFLIGHT: &str = "RUSTFS_NIXL_MAX_INFLIGHT";
+pub const DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT: usize = 256;
+/// A transfer that has not completed after this many seconds fails the request.
+pub const ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: &str = "RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS";
+pub const DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: u64 = 60;
+
 /// Whether S3 GETs carrying an `x-amz-rdma-token` are served over cuObject S3-over-RDMA
 /// (requires a build with the `cuobject` feature and libcuobjserver).
 pub const ENV_RUSTFS_CUOBJECT_ENABLE: &str = "RUSTFS_CUOBJECT_ENABLE";

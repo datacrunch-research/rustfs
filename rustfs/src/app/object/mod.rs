@@ -207,7 +207,7 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
 #[cfg(test)]
 mod conditional_read_bench;
 mod copy;
-#[cfg(all(feature = "cuobject", target_os = "linux"))]
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) mod cuobject;
 mod delete;
 mod extract;

@@ -1428,7 +1428,7 @@ impl DefaultObjectUsecase {
         // cuObject S3-over-RDMA PUT: an empty HTTP body plus `x-amz-rdma-token`
         // means the bytes are read from the client's registered buffer; the
         // token's buffer length is the object length.
-        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match super::cuobject::rdma_token_for_request(&req.headers) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
                 let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token)?;
@@ -1437,7 +1437,7 @@ impl DefaultObjectUsecase {
             }
             _ => (body, content_length, None),
         };
-        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
         let rdma_put: Option<i64> = None;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -1519,20 +1519,20 @@ impl DefaultObjectUsecase {
             origin: PutObjectOrigin::S3 { req: &req, event_name },
         };
         #[cfg_attr(
-            not(all(feature = "cuobject", target_os = "linux")),
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
             allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
         )]
         let mut committed = self.put_object_core(write, body, start_time).await?;
-        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
         let _ = rdma_put;
-        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         if let Some(moved) = rdma_put {
             committed
                 .put_extra_checksum_headers
-                .push((rustfs_cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
+                .push((crate::app::object::cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
             committed
                 .put_extra_checksum_headers
-                .push((rustfs_cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+                .push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
         }
 
         let raw_version = s3_response_version_id(committed.obj_info.version_id);
