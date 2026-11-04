@@ -63,20 +63,31 @@ const LOG_COMPONENT_INTERNODE_RPC: &str = "internode_rpc";
 const LOG_SUBSYSTEM_RDMA_TRANSPORT: &str = "rdma_transport";
 const EVENT_RDMA_TRANSPORT_FALLBACK: &str = "rdma_transport_fallback";
 const EVENT_RDMA_STREAM_FAILED: &str = "rdma_stream_failed";
+const EVENT_RDMA_FRESH_CONNECT: &str = "rdma_fresh_connect";
 const FALLBACK_CLASSIFICATION: &str = "tcp_fallback";
 
 /// How long a peer stays on the TCP path after an RDMA setup failure.
 const PEER_BACKOFF: Duration = Duration::from_secs(10);
 const RESOLVE_TTL: Duration = Duration::from_secs(60);
-const MAX_IDLE_PER_PEER: usize = 16;
 const IDLE_TTL: Duration = Duration::from_secs(60);
 
-#[derive(Default)]
 struct IdlePool {
     conns: parking_lot::Mutex<HashMap<SocketAddr, Vec<(RdmaConn, Instant)>>>,
+    /// Idle connections kept per peer; see `RUSTFS_RDMA_IDLE_CONNS_PER_PEER`.
+    max_idle_per_peer: usize,
+    /// Connections dialed because no idle one was available (diagnostics).
+    fresh_connects: std::sync::atomic::AtomicU64,
 }
 
 impl IdlePool {
+    fn new(max_idle_per_peer: usize) -> Self {
+        Self {
+            conns: parking_lot::Mutex::new(HashMap::new()),
+            max_idle_per_peer: max_idle_per_peer.max(1),
+            fresh_connects: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     fn take(&self, addr: SocketAddr) -> Option<RdmaConn> {
         let mut stale = Vec::new();
         let taken = {
@@ -106,7 +117,7 @@ impl IdlePool {
             let (keep, expired): (Vec<_>, Vec<_>) = list.drain(..).partition(|(_, since)| now.duration_since(*since) < IDLE_TTL);
             evicted.extend(expired.into_iter().map(|(conn, _)| conn));
             *list = keep;
-            if list.len() < MAX_IDLE_PER_PEER {
+            if list.len() < self.max_idle_per_peer {
                 list.push((conn, now));
             } else {
                 evicted.push(conn);
@@ -137,11 +148,12 @@ impl std::fmt::Debug for RdmaInternodeDataTransport {
 
 impl RdmaInternodeDataTransport {
     pub fn new(settings: Arc<RdmaSettings>, pool: Arc<RegisteredPool>) -> Self {
+        let idle_conns_per_peer = settings.idle_conns_per_peer;
         Self {
             tcp: TcpHttpInternodeDataTransport,
             settings,
             pool,
-            idle: Arc::new(IdlePool::default()),
+            idle: Arc::new(IdlePool::new(idle_conns_per_peer)),
             resolved: parking_lot::Mutex::new(HashMap::new()),
             backoff: parking_lot::Mutex::new(HashMap::new()),
         }
@@ -190,6 +202,18 @@ impl RdmaInternodeDataTransport {
             return Ok((addr, conn));
         }
         let conn = RdmaConn::connect(addr, self.settings.connect_timeout, self.settings.qp_limits()).await?;
+        let fresh_connects = self.idle.fresh_connects.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if fresh_connects.is_power_of_two() {
+            debug!(
+                event = EVENT_RDMA_FRESH_CONNECT,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem = LOG_SUBSYSTEM_RDMA_TRANSPORT,
+                peer = %addr,
+                fresh_connects,
+                idle_conns_per_peer = self.idle.max_idle_per_peer,
+                "rdma transport dialed a fresh connection (no idle connection to the peer)"
+            );
+        }
         Ok((addr, conn))
     }
 
