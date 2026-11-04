@@ -929,9 +929,18 @@ What bounds the 16-32 stream rows, measured afterwards:
   the budget-16 rows. More producers per node share the same node-wide
   ceiling (about 20 GB/s served per node at 16-32 streams, CPU 2.0
   s/GiB), so the next lever is that shared cost on the serving node
-  (per-part decode latency, the blocking-pool round trips per stripe, NUMA
-  placement of the arena and decode work against the NIC's socket), not
+  (per-part decode latency, the blocking-pool round trips per stripe), not
   more segments.
+- Not NUMA placement: both servers pinned with `taskset` to the NIC's
+  socket (CPUs 64-127,192-255; the registered pools are first-touched
+  there) gave 17.6 / 17.3 GB/s at 16 / 32 host streams, pinned to the far
+  socket 20.8 / 17.2, unpinned 18.2 / 19.0 (two rounds each, same build).
+  The spread between runs (plus or minus 15 percent) is larger than any
+  socket effect, so cross-socket traffic is not the node cap. The bond
+  does not spread RDMA either: a queue pair lives on one port's device,
+  802.3ad hashing applies to TCP only, and RoCE LAG needs both ports on one
+  card, so all RDMA of a node uses one 400G port (`mlx5_11`), which the
+  raw test shows taking 45 GB/s.
 
 Byte-exact on all verify checks. The blocking control run on the same build
 (`RUSTFS_CUOBJECT_ASYNC_TRANSFERS=false`, right after the asynchronous rows)
