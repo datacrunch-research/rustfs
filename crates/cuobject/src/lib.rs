@@ -72,6 +72,8 @@ pub enum CuObjectError {
     ShortTransfer { moved: u64, expected: u64 },
     #[error("cuobject staging pool exhausted")]
     PoolExhausted,
+    #[error("cuobject library offers no completion descriptor for channel {0}")]
+    AsyncUnavailable(u16),
     #[error("cuobject read source failed: {0}")]
     Source(#[source] std::io::Error),
 }
@@ -128,6 +130,10 @@ pub struct CuObjectConfig {
     pub chunk_bytes: usize,
     /// Total registered staging memory per server instance.
     pub pool_bytes: usize,
+    /// Complete transfers through the library's asynchronous mode (submit,
+    /// then wait on the channel's completion descriptor) instead of one
+    /// blocking library call per transfer.
+    pub async_transfers: bool,
 }
 
 impl Default for CuObjectConfig {
@@ -138,6 +144,7 @@ impl Default for CuObjectConfig {
             cq_depth: 640,
             chunk_bytes: 64 * 1024 * 1024,
             pool_bytes: 1024 * 1024 * 1024,
+            async_transfers: true,
         }
     }
 }
@@ -158,6 +165,7 @@ pub struct CuObjectServer {
     /// One permit per library channel (DC initiator): a transfer waits here
     /// instead of failing with `EBUSY` when every channel is in use.
     channels: Arc<Semaphore>,
+    async_transfers: bool,
 }
 
 impl std::fmt::Debug for CuObjectServer {
@@ -327,6 +335,7 @@ impl CuObjectServer {
         let buffer = raw.register_host_buffer(chunks * config.chunk_bytes)?;
         Ok(Arc::new(Self {
             channels: Arc::new(Semaphore::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
+            async_transfers: config.async_transfers,
             raw,
             staging: Staging {
                 buffer,
@@ -429,6 +438,25 @@ impl CuObjectServer {
             .acquire_owned()
             .await
             .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        if self.async_transfers {
+            match self
+                .transfer_async(&key, arena.buffer.transfer_buffer(), local_offset as u64, remote_addr, len, &descriptor)
+                .await
+            {
+                Err(CuObjectError::AsyncUnavailable(_)) => {}
+                Err(error) => return Err(error),
+                Ok(moved) => {
+                    drop(channel_permit);
+                    if moved != len_u64 {
+                        return Err(CuObjectError::ShortTransfer {
+                            moved,
+                            expected: len_u64,
+                        });
+                    }
+                    return Ok((moved, keep));
+                }
+            }
+        }
         tokio::task::spawn_blocking(move || {
             let _channel_permit = channel_permit;
             let channel = server.raw.alloc_channel()?;
@@ -504,6 +532,27 @@ impl CuObjectServer {
             .acquire_owned()
             .await
             .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        if self.async_transfers {
+            let sg = self.raw.sg_buffer(&arena.buffer, &entries)?;
+            let outcome = self
+                .transfer_async(&key, sg.transfer_buffer(), 0, remote_addr, total, &descriptor)
+                .await;
+            drop(sg);
+            match outcome {
+                Err(CuObjectError::AsyncUnavailable(_)) => {}
+                Err(error) => return Err(error),
+                Ok(moved) => {
+                    drop(channel_permit);
+                    if moved != total_u64 {
+                        return Err(CuObjectError::ShortTransfer {
+                            moved,
+                            expected: total_u64,
+                        });
+                    }
+                    return Ok((moved, keep));
+                }
+            }
+        }
         tokio::task::spawn_blocking(move || {
             let _channel_permit = channel_permit;
             let sg = server.raw.sg_buffer(&arena.buffer, &entries)?;
@@ -529,6 +578,60 @@ impl CuObjectServer {
     }
 
     /// Reserves one staging chunk without waiting; `None` when the pool is empty.
+    /// Moves `size` bytes of `buffer` into the client without holding a
+    /// blocking thread: the write is submitted with a handle on a channel of
+    /// its own and the task waits on that channel's completion descriptor.
+    /// `Err(AsyncUnavailable)` means the library offers no descriptor and the
+    /// caller should run the blocking call instead.
+    async fn transfer_async(
+        &self,
+        key: &str,
+        buffer: ffi::TransferBuffer,
+        local_offset: u64,
+        remote_addr: u64,
+        size: usize,
+        descriptor: &str,
+    ) -> Result<u64, CuObjectError> {
+        let channel = ChannelLease::alloc(&self.raw)?;
+        let Some(fd) = self.raw.completion_fd(channel.id) else {
+            return Err(CuObjectError::AsyncUnavailable(channel.id));
+        };
+        let completions = ffi::register_completion_fd(fd).map_err(|source| CuObjectError::Os {
+            op: "completion fd",
+            source,
+        })?;
+        // Non-zero by construction: the library treats a null handle as a synchronous call.
+        let handle = usize::from(channel.id) + 1;
+        self.raw
+            .get_async(key, buffer, local_offset, remote_addr, size, descriptor, channel.id, handle)?;
+        let mut events = [ffi::Completion::EMPTY; 8];
+        loop {
+            let mut ready = completions.readable().await.map_err(|source| CuObjectError::Os {
+                op: "completion wait",
+                source,
+            })?;
+            loop {
+                let landed = self.raw.process_completions(fd, &mut events)?;
+                if let Some(done) = events[..landed].iter().find(|event| event.handle == handle) {
+                    // A completion's status is 0 for success or a negative errno; the
+                    // byte count only comes back from the synchronous call.
+                    let status = done.status;
+                    if status < 0 {
+                        return Err(CuObjectError::Transfer {
+                            verbs_status: 0,
+                            source: std::io::Error::from_raw_os_error(i32::try_from(-status).unwrap_or(ffi::libc_eio())),
+                        });
+                    }
+                    return Ok(size as u64);
+                }
+                if landed < events.len() {
+                    break;
+                }
+            }
+            ready.clear_ready();
+        }
+    }
+
     pub fn try_reserve(self: &Arc<Self>) -> Option<StagingChunk> {
         let permit = self.staging.permits.try_acquire().ok()?;
         permit.forget();
@@ -577,6 +680,29 @@ impl CuObjectServer {
             .acquire_owned()
             .await
             .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        if self.async_transfers {
+            match self
+                .transfer_async(
+                    &key,
+                    self.staging.buffer.transfer_buffer(),
+                    local_offset,
+                    remote_addr,
+                    len_usize,
+                    &descriptor,
+                )
+                .await
+            {
+                Err(CuObjectError::AsyncUnavailable(_)) => {}
+                Err(error) => return Err(error),
+                Ok(moved) => {
+                    drop(channel_permit);
+                    if moved != len {
+                        return Err(CuObjectError::ShortTransfer { moved, expected: len });
+                    }
+                    return Ok(moved);
+                }
+            }
+        }
         tokio::task::spawn_blocking(move || {
             let _channel_permit = channel_permit;
             let channel = server.raw.alloc_channel()?;
@@ -634,6 +760,29 @@ impl CuObjectServer {
             .acquire_owned()
             .await
             .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        if self.async_transfers {
+            let outcome = self
+                .transfer_async(
+                    &key,
+                    self.staging.buffer.transfer_buffer(),
+                    chunk.local_offset(),
+                    remote_addr,
+                    chunk.len(),
+                    &descriptor,
+                )
+                .await;
+            match outcome {
+                Err(CuObjectError::AsyncUnavailable(_)) => {}
+                Err(error) => return Err(error),
+                Ok(moved) => {
+                    drop(channel_permit);
+                    if moved != len {
+                        return Err(CuObjectError::ShortTransfer { moved, expected: len });
+                    }
+                    return Ok((moved, chunk));
+                }
+            }
+        }
         tokio::task::spawn_blocking(move || {
             let _channel_permit = channel_permit;
             let local_offset = chunk.local_offset();
@@ -727,6 +876,25 @@ impl CuObjectServer {
 /// Copies owned bytes into staging; convenience for callers holding `Bytes`.
 pub fn fill_chunk(chunk: &mut StagingChunk, data: &Bytes) -> Result<(), CuObjectError> {
     chunk.append(data)
+}
+
+/// A library channel held for one transfer and returned on drop.
+struct ChannelLease<'a> {
+    server: &'a ffi::Server,
+    id: u16,
+}
+
+impl<'a> ChannelLease<'a> {
+    fn alloc(server: &'a ffi::Server) -> Result<Self, CuObjectError> {
+        let id = server.alloc_channel()?;
+        Ok(Self { server, id })
+    }
+}
+
+impl Drop for ChannelLease<'_> {
+    fn drop(&mut self) {
+        self.server.free_channel(self.id);
+    }
 }
 
 #[cfg(test)]

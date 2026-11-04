@@ -430,6 +430,13 @@ pub const DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: usize = 0;
 pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
 pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
 
+/// Complete cuObject transfers through the library's asynchronous mode: the
+/// write is submitted with a handle and the task waits on the channel's
+/// completion descriptor instead of holding a blocking thread for the whole
+/// transfer. `false` keeps one blocking library call per transfer.
+pub const ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: &str = "RUSTFS_CUOBJECT_ASYNC_TRANSFERS";
+pub const DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: bool = true;
+
 #[cfg(test)]
 mod tests {
     use super::*;

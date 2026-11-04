@@ -876,6 +876,64 @@ per stream the emit is now the cadence and the shared cuObject write path
 is where the aggregate stops. The peer side is quiet throughout (chunk fill
 2.3 ms, open 0.6 ms).
 
+### Asynchronous cuObject transfers (2026-11-04)
+
+Every RDMA write to the client was one blocking library call on the
+blocking pool, holding a channel permit and a thread for the whole transfer
+while the library polled its completion queue; under 16-32 streams the emit
+of a stripe took 9.5 ms against 5.6 single-stream. The server library offers
+an asynchronous mode (a handle at submission, a pollable completion
+descriptor per channel, `processCompletions` to drain it), and the transfer
+functions now use it (`RUSTFS_CUOBJECT_ASYNC_TRANSFERS`, default on): submit
+on a channel of the transfer's own, register the channel's descriptor with
+the runtime, wait for the completion carrying the handle, free the channel.
+The blocking call stays as the fallback when the library offers no
+descriptor, and `false` restores it. A completion's status is 0 for success
+(the byte count only comes back from the synchronous call), which the first
+build got wrong (every write reported as moving 0 bytes).
+
+| Rows (same harness) | blocking (copy-offload build) | asynchronous |
+| --- | --- | --- |
+| single GET, two servers | 10.7-14.1 GB/s | 13.5-15.0 GB/s |
+| 16 x 8 GiB host, two servers | 19.1 | 21.4 |
+| 32 x 8 GiB host, two servers | 23.1 | 24.6 |
+| 16 x 8 GiB host, one server | 15.7 | 18.4 |
+| 32 x 8 GiB host, one server | 14.5 | 20.7 |
+| `emit` per stripe under 16-32 streams | 9.5 ms | 8.1 ms |
+| CPU s/GiB (mixed) | 1.88 | 1.98 |
+
+One server now delivers 18-21 GB/s to the client at 16-32 streams and two
+servers 21-25 GB/s. The GPU-target rows stay at the client's root-complex
+ceiling (12-15 GB/s).
+
+What bounds the 16-32 stream rows, measured afterwards:
+
+- Not the fabric or the client's memory path: `ib_write_bw` (1 MiB writes,
+  8 queue pairs) from one server into the client's host memory over
+  `mlx5_11` runs at 392 Gb/s, and from both servers at once 179 + 179 Gb/s
+  (45 GB/s into the client).
+- Not one client process: two client processes with 8 streams each reach
+  12.7 + 12.3 GB/s, four with 4 streams each about 19 GB/s in total, the
+  same as one process with 16 streams.
+- The rows are short, latency-bound transfers: the "16 x 8 GiB host" row is
+  one 8 GiB object split into 16 ranged streams of 512 MiB (32 streams:
+  256 MiB), each stream gets one producer segment under the fair-share
+  budget (16 per node), and a segment decodes a 128 MiB part in 47 ms under
+  load (2.7 GB/s), so a 512 MiB stream lasts about 0.4 s of which the
+  metadata, reader setup and segment ramp are a visible share (slowest
+  stream 0.42 s against a 0.48 s wall). Per-stream throughput in these
+  rows is therefore the per-segment rate minus setup, not a fabric cap;
+  longer streams and a larger budget per node raise it (measured next).
+
+Byte-exact on all verify checks. The blocking control run on the same build
+(`RUSTFS_CUOBJECT_ASYNC_TRANSFERS=false`, right after the asynchronous rows)
+collapsed to 3.6 GB/s at 16 and 32 host streams, the same failure shape the
+first fan-out pass showed, so the blocking path is also the fragile one
+under load. The KV chunk rows did not change (cold and warm p50 both 31 ms
+for 48 MiB, 1.6 GB/s): the warm GET is not served from the object data
+cache at all on this cluster (no cache-path stages appear), which is the
+next item for the KV use case.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -899,3 +957,4 @@ is where the aggregate stops. The peer side is quiet throughout (chunk fill
 | 7 idle-pool pre-warm (two servers, four drives, 6+2) | (this tree) | 12.0-12.7 GB/s (first GET after restart 6.2, was 0.4) | 0.67 GB/s | 20.4 GB/s | 22.5 GB/s | 1.86 |
 | 7b stream read-ahead (peer chunk 6.5 -> 2 ms) | (this tree) | 11.0-12.2 GB/s | 0.68 GB/s | 21.2 GB/s | 19.6 GB/s | 1.88 |
 | 7c shard copy beside the hash | (this tree) | **10.7-14.2 GB/s** | 0.70 GB/s | 19.1 GB/s | 23.1 GB/s | 1.88 |
+| 7d asynchronous cuObject transfers | (this tree) | **13.5-15.0 GB/s** | 0.68 GB/s | 21.4 GB/s (18.4 from one server) | **24.6 GB/s** (20.7 from one server) | 1.98 |

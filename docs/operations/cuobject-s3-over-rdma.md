@@ -38,6 +38,7 @@ tokens are left untouched, so the client falls back to a normal HTTP GET.
 | `RUSTFS_CUOBJECT_INFLIGHT_WRITES` | `3` | Staging chunks per GET: while one chunk is being RDMA-written the decoder keeps filling the next ones, so the stripe loop never waits for a write. Each costs one chunk of the pool; a busy pool degrades to fewer chunks rather than failing the GET. |
 | `RUSTFS_CUOBJECT_POOL_BYTES` | `1 GiB` | Registered staging pool per server; bounds concurrent RDMA GETs to about `pool / (chunk x inflight)`. |
 | `RUSTFS_CUOBJECT_NUM_DCIS` | `128` | DC initiators the server library opens. |
+| `RUSTFS_CUOBJECT_ASYNC_TRANSFERS` | `true` | Complete transfers through the library's asynchronous mode: the write is submitted with a handle and the task waits on the channel's completion descriptor, so no blocking thread is held per transfer. `false` keeps one blocking library call per transfer. |
 
 Invalid settings or a server library failure stop startup. A node whose
 endpoint host is not an RDMA-capable address logs `cuobject_service_state

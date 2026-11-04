@@ -22,6 +22,7 @@
 use super::CuObjectError;
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::net::IpAddr;
+use std::os::fd::RawFd;
 use std::ptr::{self, NonNull};
 
 #[repr(C)]
@@ -79,6 +80,19 @@ unsafe extern "C" {
         channel: u16,
         verbs_status: *mut c_int,
     ) -> isize;
+    fn rfs_cuobj_get_async(
+        server: *mut RawServer,
+        key: *const c_char,
+        buffer: *mut RawBuffer,
+        local_offset: u64,
+        remote_addr: u64,
+        size: usize,
+        descriptor: *const c_char,
+        channel: u16,
+        handle: *mut c_void,
+    ) -> isize;
+    fn rfs_cuobj_channel_completion_fd(server: *mut RawServer, channel: u16) -> c_int;
+    fn rfs_cuobj_process_completions(server: *mut RawServer, fd: c_int, out: *mut Completion, max: c_int) -> c_int;
     fn rfs_cuobj_version() -> c_int;
 }
 
@@ -210,6 +224,66 @@ impl Server {
         Ok(rc as u64)
     }
 
+    /// Submits a GET on `channel` without waiting for it; the completion
+    /// carries `handle` back through `process_completions`.
+    #[allow(clippy::too_many_arguments, reason = "mirrors the library call")]
+    pub fn get_async(
+        &self,
+        key: &str,
+        buffer: TransferBuffer,
+        local_offset: u64,
+        remote_addr: u64,
+        size: usize,
+        descriptor: &str,
+        channel: u16,
+        handle: usize,
+    ) -> Result<(), CuObjectError> {
+        let key = CString::new(key).map_err(|_| CuObjectError::Token("key contains NUL".to_owned()))?;
+        let descriptor = CString::new(descriptor).map_err(|_| CuObjectError::Token("token contains NUL".to_owned()))?;
+        // SAFETY: `raw` is live; the caller keeps the buffer registered until the completion arrives.
+        let rc = unsafe {
+            rfs_cuobj_get_async(
+                self.raw.as_ptr(),
+                key.as_ptr(),
+                buffer.0.as_ptr(),
+                local_offset,
+                remote_addr,
+                size,
+                descriptor.as_ptr(),
+                channel,
+                handle as *mut c_void,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjectError::Transfer {
+                verbs_status: 0,
+                source: std::io::Error::from_raw_os_error(i32::try_from(-rc).unwrap_or(libc_eio())),
+            });
+        }
+        Ok(())
+    }
+
+    /// The channel's completion descriptor, owned by the library.
+    pub fn completion_fd(&self, channel: u16) -> Option<RawFd> {
+        // SAFETY: `raw` is live.
+        let fd = unsafe { rfs_cuobj_channel_completion_fd(self.raw.as_ptr(), channel) };
+        (fd >= 0).then_some(fd)
+    }
+
+    /// Drains completions behind `fd` into `out` and returns how many landed.
+    pub fn process_completions(&self, fd: RawFd, out: &mut [Completion]) -> Result<usize, CuObjectError> {
+        let max = c_int::try_from(out.len()).unwrap_or(c_int::MAX);
+        if max == 0 {
+            return Ok(0);
+        }
+        // SAFETY: `raw` is live and `out` holds room for `max` entries.
+        let rc = unsafe { rfs_cuobj_process_completions(self.raw.as_ptr(), fd, out.as_mut_ptr(), max) };
+        if rc < 0 {
+            return Err(os_error("process completions", rc));
+        }
+        Ok(rc as usize)
+    }
+
     pub fn alloc_channel(&self) -> Result<u16, CuObjectError> {
         let mut channel = 0u16;
         // SAFETY: `raw` is live; `channel` is a valid out-pointer.
@@ -326,7 +400,31 @@ impl Drop for Server {
     }
 }
 
-/// A registered host buffer owned by the library.
+/// One completed asynchronous transfer, as the library reports it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Completion {
+    /// The handle given at submission (a `void *` in the library; kept as
+    /// an integer so a pending transfer's future stays `Send`).
+    pub handle: usize,
+    /// Bytes moved, or a negative errno.
+    pub status: isize,
+}
+
+impl Completion {
+    pub const EMPTY: Self = Self { handle: 0, status: 0 };
+}
+
+/// A library buffer handle that an asynchronous transfer carries across
+/// awaits; the owning `SgBuffer` or `RegisteredBuffer` must outlive the
+/// transfer.
+#[derive(Clone, Copy, Debug)]
+pub struct TransferBuffer(NonNull<RawBuffer>);
+
+// SAFETY: the handle is only passed back to the library, which owns the
+// buffer registration; the Rust owner keeps it registered for the transfer.
+unsafe impl Send for TransferBuffer {}
+
 /// One (offset, size) range of a registered buffer; layout matches the shim's `rfs_cuobj_sg_entry`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -344,6 +442,12 @@ pub struct SgBuffer {
 
 unsafe impl Send for SgBuffer {}
 unsafe impl Sync for SgBuffer {}
+
+impl SgBuffer {
+    pub fn transfer_buffer(&self) -> TransferBuffer {
+        TransferBuffer(self.raw)
+    }
+}
 
 impl Drop for SgBuffer {
     fn drop(&mut self) {
@@ -404,6 +508,12 @@ impl RegisteredBuffer {
     }
 }
 
+impl RegisteredBuffer {
+    pub fn transfer_buffer(&self) -> TransferBuffer {
+        TransferBuffer(self.raw)
+    }
+}
+
 impl Drop for RegisteredBuffer {
     fn drop(&mut self) {
         // SAFETY: both handles are live; `Server` outlives its buffers by construction
@@ -416,6 +526,25 @@ const fn libc_enomem() -> c_int {
     12
 }
 
-const fn libc_eio() -> c_int {
+pub(crate) const fn libc_eio() -> c_int {
     5
+}
+
+/// A completion descriptor owned by the library; registered with the
+/// reactor for one transfer and never closed here.
+pub struct ChannelFd(RawFd);
+
+impl std::os::fd::AsRawFd for ChannelFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// Registers a channel's completion descriptor with the reactor for reads.
+pub fn register_completion_fd(fd: RawFd) -> std::io::Result<tokio::io::unix::AsyncFd<ChannelFd>> {
+    // SAFETY: the descriptor is owned by the library for the server's
+    // lifetime, is set non-blocking by it, and `ChannelFd` never closes or
+    // replaces it.
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(ChannelFd(fd), tokio::io::Interest::READABLE) }
+        .map_err(|error| error.into_parts().1)
 }

@@ -55,6 +55,27 @@ void rfs_cuobj_sg_buffer_put(struct rfs_cuobj_server *server, struct rfs_cuobj_b
 int rfs_cuobj_channel_alloc(struct rfs_cuobj_server *server, uint16_t *out);
 void rfs_cuobj_channel_free(struct rfs_cuobj_server *server, uint16_t channel);
 
+// One completed asynchronous operation: the handle given at submission and
+// the operation's result (bytes moved, or a negative errno).
+struct rfs_cuobj_completion {
+    void *handle;
+    ssize_t status;
+};
+// Submits a GET (an RDMA write into the client's memory) on `channel` and
+// returns at once; `handle` (non-NULL) comes back through
+// rfs_cuobj_process_completions on the channel's completion descriptor.
+// Returns 0 on submission, or a negative errno.
+ssize_t rfs_cuobj_get_async(struct rfs_cuobj_server *server, const char *key, struct rfs_cuobj_buffer *buffer,
+                            uint64_t local_offset, uint64_t remote_addr, size_t size, const char *descriptor,
+                            uint16_t channel, void *handle);
+// The channel's pollable completion descriptor (owned by the library, never
+// closed by the caller), or -1 when the library offers none.
+int rfs_cuobj_channel_completion_fd(struct rfs_cuobj_server *server, uint16_t channel);
+// Drains the completions behind `fd` into `out`; returns the count filled (call
+// again before waiting when it equals `max`), or a negative errno.
+int rfs_cuobj_process_completions(struct rfs_cuobj_server *server, int fd, struct rfs_cuobj_completion *out,
+                                  int max);
+
 // RDMA-writes `size` bytes from `buffer + local_offset` into the client memory
 // described by `descriptor` starting at `remote_addr`. Blocks until the write
 // completed; returns the byte count or a negative errno (-EPROTO for a
