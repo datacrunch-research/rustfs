@@ -119,6 +119,8 @@ pub(crate) const GET_STAGE_RDMA_SERVE_OPEN: &str = "serve_open";
 pub(crate) const GET_STAGE_RDMA_SERVE_RESERVE: &str = "serve_reserve";
 #[cfg(all(feature = "rdma", target_os = "linux"))]
 pub(crate) const GET_STAGE_RDMA_SERVE_FIRST_FILL: &str = "serve_first_fill";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_SERVE_FILL: &str = "serve_fill";
 pub(crate) const GET_STAGE_READER_MMAP_ACCESS_CHECK: &str = "reader_mmap_access_check";
 #[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_TASK: &str = "reader_mmap_blocking_task";
