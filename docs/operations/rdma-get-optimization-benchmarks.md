@@ -992,6 +992,24 @@ shows the writes themselves are not slow under load: on the staging-copy
 path at 32 host streams the 16 MiB writes complete in 2.3 ms on average,
 471 of 768 under 1 ms, 53 between 5 and 20 ms, none above 20 ms.
 
+Rows after the fix (fan-out 8, asynchronous transfers, two servers):
+
+| Emit path | Single RDMA GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- |
+| staging copy (arena off, the default) | 10.9-12.8 GB/s | 12.9 | 19.1 | 20.4 | 2.04 |
+| shard arena 8 GiB, asynchronous | 1.7-5.8 | 7.8 | 20.0 | 20.3 | 3.11 |
+| shard arena 8 GiB, blocking transfers | 3.9-6.7 | 6.2 | 12.6 | 17.5 | 2.55 |
+
+The zero-copy (arena) path has regressed in this tree, with either transfer
+mode: single GETs run at 0.3-6.6 GB/s with multi-second stalls ("reader
+setup is slow", "Disk operation is still pending"), the average write is
+16.6 MB rather than the 24 MiB stripe batch (most emits are falling back to
+the staging copy), and the per-part decode is 58 ms against 44-47 on the
+staging path, while the writes themselves complete in 2 ms. The earlier
+arena rows (13.9 GB/s single) predate the pool pre-warm, the read-ahead and
+the copy-beside-the-hash change; which of them broke the arena path is not
+yet isolated. The arena stays off by default and is the first item to fix.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
