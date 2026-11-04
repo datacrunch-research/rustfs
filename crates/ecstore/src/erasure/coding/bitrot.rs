@@ -324,11 +324,29 @@ fn join_error(error: tokio::task::JoinError) -> std::io::Error {
 
 /// Verifies an owned frame (`hash || data`) on the blocking pool and returns
 /// the verification time; the caller still owns `frame` through the clone.
-async fn verify_frame_off_thread(hash_algo: &HashAlgorithm, frame: bytes::Bytes) -> std::io::Result<Duration> {
+/// Verifies an owned frame (`hash || data`) on the blocking pool and appends
+/// its data to `out` there, so the 4 MiB copy runs beside the hash on a
+/// blocking thread instead of serializing with the other shards of the
+/// stripe on the reader's task.
+async fn verify_and_append_off_thread<B: ShardAppend>(
+    hash_algo: &HashAlgorithm,
+    frame: bytes::Bytes,
+    hash_size: usize,
+    out: &mut B,
+) -> std::io::Result<Duration> {
     let hash_algo = hash_algo.clone();
-    tokio::task::spawn_blocking(move || split_and_verify(&hash_algo, false, &frame).map(|(_, verify)| verify))
-        .await
-        .map_err(join_error)?
+    let mut taken = std::mem::take(out);
+    let (taken, result) = tokio::task::spawn_blocking(move || {
+        let result = split_and_verify(&hash_algo, false, &frame).map(|(_, verify)| verify);
+        if result.is_ok() {
+            taken.extend_from_slice(&frame[hash_size..]);
+        }
+        (taken, result)
+    })
+    .await
+    .map_err(join_error)?;
+    *out = taken;
+    result
 }
 
 /// Verifies a frame spread over `chunks` followed by `tail` (the chunk handoff
@@ -379,6 +397,36 @@ fn verify_chunked_frame(
 
 impl<R> BitrotReader<R> {
     /// Verifies the frame held in `self.buf[..need]`, off-thread when it is large.
+    /// Verifies the scratch block and appends its data to `out`; both run on
+    /// the blocking pool when the block is large enough to offload.
+    async fn verify_scratch_appending<B: ShardAppend>(
+        &mut self,
+        need: usize,
+        hash_size: usize,
+        out: &mut B,
+    ) -> std::io::Result<Duration> {
+        if !should_offload_verify(self.skip_verify, need) {
+            let verify = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need]).map(|(_, verify)| verify)?;
+            out.extend_from_slice(&self.buf[hash_size..need]);
+            return Ok(verify);
+        }
+        let hash_algo = self.hash_algo.clone();
+        let buf = std::mem::take(&mut self.buf);
+        let mut taken = std::mem::take(out);
+        let (buf, taken, result) = tokio::task::spawn_blocking(move || {
+            let result = split_and_verify(&hash_algo, false, &buf[..need]).map(|(_, verify)| verify);
+            if result.is_ok() {
+                taken.extend_from_slice(&buf[hash_size..need]);
+            }
+            (buf, taken, result)
+        })
+        .await
+        .map_err(join_error)?;
+        self.buf = buf;
+        *out = taken;
+        result
+    }
+
     async fn verify_scratch(&mut self, need: usize) -> std::io::Result<Duration> {
         if !should_offload_verify(self.skip_verify, need) {
             return split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need]).map(|(_, verify)| verify);
@@ -455,11 +503,12 @@ where
 
         if let Some(block) = self.inner.try_take_block(need) {
             let verify = if should_offload_verify(self.skip_verify, block.len()) {
-                verify_frame_off_thread(&self.hash_algo, block.clone()).await?
+                verify_and_append_off_thread(&self.hash_algo, block, hash_size, out).await?
             } else {
-                split_and_verify(&self.hash_algo, self.skip_verify, &block)?.1
+                let verify = split_and_verify(&self.hash_algo, self.skip_verify, &block)?.1;
+                out.extend_from_slice(&block[hash_size..]);
+                verify
             };
-            out.extend_from_slice(&block[hash_size..]);
             self.last_verify_duration = verify;
             return Ok(want);
         }
@@ -535,47 +584,43 @@ where
             if self.chunks.len() == 1 && self.buf.is_empty() {
                 let block = &self.chunks[0];
                 let verify = if should_offload_verify(self.skip_verify, block.len()) {
-                    verify_frame_off_thread(&self.hash_algo, block.clone()).await?
+                    verify_and_append_off_thread(&self.hash_algo, block.clone(), hash_size, out).await?
                 } else {
-                    split_and_verify(&self.hash_algo, self.skip_verify, block)?.1
+                    let verify = split_and_verify(&self.hash_algo, self.skip_verify, block)?.1;
+                    out.extend_from_slice(&block[hash_size..]);
+                    verify
                 };
-                out.extend_from_slice(&block[hash_size..]);
                 self.last_verify_duration = verify;
                 return Ok(want);
             }
 
+            if should_offload_verify(self.skip_verify, need) {
+                // Move the chunks, the tail and the output to the blocking task
+                // and take them back: the copy is as long as the hash, and the
+                // stripe's other shards are doing the same on their own threads.
+                let hash_algo = self.hash_algo.clone();
+                let chunks = std::mem::take(&mut self.chunks);
+                let tail = std::mem::take(&mut self.buf);
+                let mut taken = std::mem::take(out);
+                let (chunks, tail, taken, result) = tokio::task::spawn_blocking(move || {
+                    let result = verify_chunked_frame(&hash_algo, &chunks, &tail, hash_size, want);
+                    if result.is_ok() {
+                        append_chunked_data(&mut taken, &chunks, &tail, hash_size);
+                    }
+                    (chunks, tail, taken, result)
+                })
+                .await
+                .map_err(join_error)?;
+                self.chunks = chunks;
+                self.buf = tail;
+                *out = taken;
+                self.last_verify_duration = result?;
+                return Ok(want);
+            }
             if !self.skip_verify {
-                let verify = if should_offload_verify(self.skip_verify, need) {
-                    // Move the chunks and tail to the blocking task and take them back.
-                    let hash_algo = self.hash_algo.clone();
-                    let chunks = std::mem::take(&mut self.chunks);
-                    let tail = std::mem::take(&mut self.buf);
-                    let (chunks, tail, result) = tokio::task::spawn_blocking(move || {
-                        let result = verify_chunked_frame(&hash_algo, &chunks, &tail, hash_size, want);
-                        (chunks, tail, result)
-                    })
-                    .await
-                    .map_err(join_error)?;
-                    self.chunks = chunks;
-                    self.buf = tail;
-                    result?
-                } else {
-                    verify_chunked_frame(&self.hash_algo, &self.chunks, &self.buf, hash_size, want)?
-                };
-                self.last_verify_duration = verify;
+                self.last_verify_duration = verify_chunked_frame(&self.hash_algo, &self.chunks, &self.buf, hash_size, want)?;
             }
-            let block_chunks = || {
-                self.chunks
-                    .iter()
-                    .map(|chunk| chunk.as_ref())
-                    .chain((!self.buf.is_empty()).then_some(self.buf.as_slice()))
-            };
-            let mut skip = hash_size;
-            for chunk in block_chunks() {
-                let start = skip.min(chunk.len());
-                skip -= start;
-                out.extend_from_slice(&chunk[start..]);
-            }
+            append_chunked_data(out, &self.chunks, &self.buf, hash_size);
             return Ok(want);
         }
 
@@ -583,10 +628,24 @@ where
         // the sink differs (`extend_from_slice` into `out` instead of
         // `copy_from_slice` into a pre-zeroed buffer).
         self.read_scratch_block(need, want).await?;
-        let verify = self.verify_scratch(need).await?;
-        out.extend_from_slice(&self.buf[hash_size..need]);
+        let verify = self.verify_scratch_appending(need, hash_size, out).await?;
         self.last_verify_duration = verify;
         Ok(want)
+    }
+}
+
+/// Appends the data of a chunked frame (`hash || data` spread over `chunks`
+/// and `tail`) to `out`.
+fn append_chunked_data<B: ShardAppend>(out: &mut B, chunks: &[bytes::Bytes], tail: &[u8], hash_size: usize) {
+    let mut skip = hash_size;
+    for chunk in chunks
+        .iter()
+        .map(|chunk| chunk.as_ref())
+        .chain((!tail.is_empty()).then_some(tail))
+    {
+        let start = skip.min(chunk.len());
+        skip -= start;
+        out.extend_from_slice(&chunk[start..]);
     }
 }
 

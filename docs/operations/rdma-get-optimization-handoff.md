@@ -106,6 +106,13 @@ record for the environment, the fabric findings, and the numbers.
   Observed on the way: `RUSTFS_OBJECT_GET_SKIP_BITROT_VERIFY=true` makes
   every remote shard open take 600 ms (0.95 GB/s single stream); not
   investigated, the setting is diagnostic only.
+- Stripe read: the bitrot reader copies a shard into its buffer inside the
+  blocking task that hashes it, so a stripe's eight copies no longer
+  serialize on the decode task. Stripe read 7.9 -> 4.9 ms, single stream
+  13.7-14.6 GB/s (the client's root-complex ceiling), first GET after a
+  restart 10 GB/s. The aggregate rows (19-23 GB/s at 16-32 streams) did not
+  move: there the emit (cuObject RDMA write) is 9.5 ms per stripe against
+  5.6 single-stream, so the shared cuObject write path is the next limiter.
 - Multi-GPU client: four processes into one GPU or into host memory reach
   13-17 GB/s, four processes into four GPUs 5-6 GB/s; concurrent peer-to-peer
   writes into several GPUs through the CPU root complex are the limit, so a
@@ -113,18 +120,18 @@ record for the environment, the fabric findings, and the numbers.
 
 ## Next steps
 
-1. The stripe read on the serving node: 7.9 ms per 24 MiB stripe with the
-   first shard at 4.3 ms, while the peer's chunks arrive in 2 ms and local
-   shards are in memory. Per shard the decode task collects the chunks,
-   waits for the verification round trip on the blocking pool and copies 4
-   MiB into the shard buffer; the eight shard futures share one task, so
-   the copies serialize. Run each shard read of a stripe as its own task
-   (the owned-reader future already exists for the lockstep loop) so copies
-   and verification spread over the workers, then re-measure
-   `stripe_read_first_shard` and the per-segment rate (3.1 GB/s now). What
-   is left of reader setup after that: the local shard's mmap copy at open
-   (9-11 ms, blocking task) inside every part's quorum wait, and a handshake
-   that does not compete with the decode loops for the runtime (50 ms under
+1. The emit under load: with 16-32 streams (one segment each) the cuObject
+   RDMA write of a stripe takes 9.5 ms against 5.6 ms single-stream while
+   the stripe read holds at 5.3 ms, so the per-segment cadence is the emit
+   and the aggregate stays at 19-23 GB/s on two servers. Every transfer is a
+   blocking library call holding a channel permit (128 channels per server,
+   at most four shard writes in flight per segment); the library's
+   asynchronous mode (submit plus poll) and a deeper per-segment write
+   pipeline are the candidates, measured with `emit`, `duplex_backpressure`
+   and the channel wait. Still inside the stripe: the first shard takes 3.3
+   ms (one blocking round trip for hash plus copy), the local shard's mmap
+   copy at open (9-11 ms) sits inside every part's quorum wait, and a dial
+   handshake competes with the decode loops for the runtime (50 ms under
    load, 10 ms idle). Prefetch depth, locality and lockstep settings were
    swept without gain (see the record).
 2. Zero-copy write submissions are batched per stripe (scatter-gather, up to
