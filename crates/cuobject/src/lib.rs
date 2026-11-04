@@ -290,6 +290,23 @@ impl CuObjectServer {
         })
     }
 
+    /// Staging chunks currently free in the pool (a hint; another reservation may win).
+    pub fn available_chunks(&self) -> usize {
+        self.staging.permits.available_permits()
+    }
+
+    /// Reserves one staging chunk without waiting; `None` when the pool is empty.
+    pub fn try_reserve(self: &Arc<Self>) -> Option<StagingChunk> {
+        let permit = self.staging.permits.try_acquire().ok()?;
+        permit.forget();
+        let index = self.staging.free.lock().pop_front()?;
+        Some(StagingChunk {
+            server: Arc::clone(self),
+            index,
+            len: 0,
+        })
+    }
+
     /// RDMA-writes the staged bytes of `chunk` to `token.remote_addr + remote_offset`.
     ///
     /// Blocks a worker thread for the duration of the write; the client's

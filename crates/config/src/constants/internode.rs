@@ -384,6 +384,25 @@ pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES: &str = "RUSTFS_CUOBJECT_INFLIGHT_WRITES";
 pub const DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES: usize = 3;
 
+/// Concurrent erasure-block-aligned segments one cuObject GET is split into
+/// on the server (each segment decodes and RDMA-writes its own stripes), so a
+/// single stream keeps several stripes in flight. 1 disables the fan-out.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT: &str = "RUSTFS_CUOBJECT_GET_FANOUT";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT: usize = 8;
+
+/// Smallest segment worth its own producer (rounded up to whole erasure
+/// blocks): each segment pays a reader setup per part it touches, so short
+/// requests stay sequential.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: &str = "RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: u64 = 192 * 1024 * 1024;
+
+/// Segment producers a node runs across all its cuObject GETs: each new GET
+/// gets a fair share (budget / open GETs, at least 1, at most the fan-out)
+/// and never waits for one, so many-stream load degrades to sequential GETs
+/// instead of a reader-setup storm.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: &str = "RUSTFS_CUOBJECT_GET_FANOUT_BUDGET";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: usize = 16;
+
 pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
 pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
 

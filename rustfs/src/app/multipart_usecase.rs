@@ -1547,8 +1547,15 @@ impl DefaultMultipartUsecase {
 
         // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
         // server-computed part checksum as a raw response header (#1261).
+        #[cfg_attr(
+            not(all(feature = "cuobject", target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
         let mut upload_part_extra_checksum_headers =
             crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        let _ = rdma_put;
+        #[cfg(all(feature = "cuobject", target_os = "linux"))]
         if let Some(moved) = rdma_put {
             upload_part_extra_checksum_headers.push((rustfs_cuobject::RDMA_REPLY_HEADER, "200".to_owned()));
             upload_part_extra_checksum_headers.push((rustfs_cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));

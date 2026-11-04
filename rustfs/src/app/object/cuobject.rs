@@ -28,13 +28,15 @@ use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
 use rustfs_config::{
-    DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
-    DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS, DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES, DEFAULT_RUSTFS_CUOBJECT_PORT,
-    ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_ENABLE, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
-    ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
+    DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT,
+    DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
+    DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS, DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES,
+    DEFAULT_RUSTFS_CUOBJECT_PORT, ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_ENABLE,
+    ENV_RUSTFS_CUOBJECT_GET_FANOUT, ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
+    ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
 };
 use rustfs_cuobject::{CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken, StagingChunk};
-use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u16, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u16, get_env_u64, get_env_usize};
 use s3s::dto::StreamingBlob;
 use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Result};
@@ -61,6 +63,16 @@ static SERVICE: OnceLock<Arc<CuObjectService>> = OnceLock::new();
 pub(crate) struct CuObjectService {
     servers: Vec<Arc<CuObjectServer>>,
     inflight_writes: usize,
+    /// Segments one GET is split into on the server; 1 keeps the body sequential.
+    get_fanout: usize,
+    /// Smallest segment worth its own producer, in bytes.
+    get_fanout_min_bytes: u64,
+    /// Segment producers the node may run across all its cuObject GETs.
+    get_fanout_budget: usize,
+    /// Permits for the extra producers (beyond each GET's first) within that budget.
+    get_fanout_permits: Arc<tokio::sync::Semaphore>,
+    /// cuObject GETs currently open on this node, for the fair share.
+    active_gets: Arc<AtomicUsize>,
     next: AtomicUsize,
 }
 
@@ -145,6 +157,11 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         ));
     }
     let inflight_writes = get_env_usize(ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES).max(1);
+    let get_fanout = get_env_usize(ENV_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT).max(1);
+    let get_fanout_min_bytes =
+        get_env_u64(ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES);
+    let get_fanout_budget = get_env_usize(ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET)
+        .min(tokio::sync::Semaphore::MAX_PERMITS);
     let addrs = resolve_addrs().await?;
     if addrs.is_empty() {
         info!(
@@ -177,12 +194,21 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         port = config.port,
         chunk_bytes = config.chunk_bytes,
         pool_bytes = config.pool_bytes,
+        inflight_writes,
+        get_fanout,
+        get_fanout_min_bytes,
+        get_fanout_budget,
         library = format_args!("{major}.{minor}"),
         "cuobject s3-over-rdma service started"
     );
     let _ = SERVICE.set(Arc::new(CuObjectService {
         servers,
         inflight_writes,
+        get_fanout,
+        get_fanout_min_bytes,
+        get_fanout_budget,
+        get_fanout_permits: Arc::new(tokio::sync::Semaphore::new(get_fanout_budget)),
+        active_gets: Arc::new(AtomicUsize::new(0)),
         next: AtomicUsize::new(0),
     }));
     Ok(())
@@ -510,44 +536,107 @@ pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken) -> S3Res
     Ok((StreamingBlob::new(body), total))
 }
 
-/// Shared state of a [`StagingSink`]: the erasure decoder writes decoded bytes
-/// straight into cuObject staging chunks (no duplex pipe, no consumer copy),
-/// full chunks are RDMA-written on their own tasks, and the GET handler
-/// finishes or aborts the sink once the producer has reported completion.
-struct StagingSinkState {
+/// State shared by the segment writers of one RDMA GET: the server, the
+/// client token, the GET's staging chunks (free list), and the segments that
+/// were opened, so the handler can finish or abort all of them.
+struct SinkShared {
     server: Arc<CuObjectServer>,
     object: String,
     token: RdmaToken,
-    free: Vec<StagingChunk>,
+    inflight_writes: usize,
+    free: std::sync::Mutex<Vec<StagingChunk>>,
+    /// Segments waiting for a chunk; woken one at a time as chunks return.
+    waiters: std::sync::Mutex<Vec<std::task::Waker>>,
+    segments: std::sync::Mutex<Vec<Arc<std::sync::Mutex<SegmentState>>>>,
+}
+
+impl SinkShared {
+    fn lock_free(&self) -> std::sync::MutexGuard<'_, Vec<StagingChunk>> {
+        self.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_segments(&self) -> std::sync::MutexGuard<'_, Vec<Arc<std::sync::Mutex<SegmentState>>>> {
+        self.segments.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Opens a segment whose first byte lands at `remote_offset` in the client buffer.
+    fn open_segment(self: &Arc<Self>, remote_offset: u64) -> StagingSink {
+        let state = Arc::new(std::sync::Mutex::new(SegmentState {
+            current: None,
+            writes: VecDeque::new(),
+            issued: remote_offset,
+            moved: 0,
+        }));
+        self.lock_segments().push(Arc::clone(&state));
+        StagingSink {
+            shared: Arc::clone(self),
+            state,
+        }
+    }
+
+    /// Reserves up to `count` more chunks from the pool without waiting.
+    fn top_up(&self, count: usize) {
+        let mut free = self.lock_free();
+        for _ in 0..count {
+            match self.server.try_reserve() {
+                Some(chunk) => free.push(chunk),
+                None => break,
+            }
+        }
+    }
+
+    /// Returns a chunk to the GET's free list and wakes one waiting segment.
+    fn release(&self, mut chunk: StagingChunk) {
+        chunk.clear();
+        self.lock_free().push(chunk);
+        let waker = self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn park(&self, cx: &Context<'_>) {
+        let mut waiters = self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+    }
+}
+
+/// One segment of the body: the erasure decoder writes decoded bytes straight
+/// into cuObject staging chunks (no duplex pipe, no consumer copy), full chunks
+/// are RDMA-written on their own tasks at the segment's running offset.
+struct SegmentState {
     current: Option<StagingChunk>,
     writes: VecDeque<JoinHandle<Result<(u64, StagingChunk), CuObjectError>>>,
+    /// Client-buffer offset of the next byte this segment stages.
     issued: u64,
     /// Bytes confirmed written by reaped writes.
     moved: u64,
 }
 
-impl StagingSinkState {
-    fn submit_current(&mut self) {
+impl SegmentState {
+    fn submit_current(&mut self, shared: &Arc<SinkShared>) {
         let Some(chunk) = self.current.take() else {
             return;
         };
         if chunk.is_empty() {
-            self.free.push(chunk);
+            shared.lock_free().push(chunk);
             return;
         }
         let len = chunk.len() as u64;
         let offset = self.issued;
         self.issued += len;
-        let server = Arc::clone(&self.server);
-        let object = self.object.clone();
-        let token = self.token.clone();
+        let server = Arc::clone(&shared.server);
+        let object = shared.object.clone();
+        let token = shared.token.clone();
         self.writes.push_back(tokio::spawn(
             async move { server.write_to_client_owned(&object, &token, offset, chunk).await },
         ));
     }
 
-    /// Polls the oldest write; on completion its chunk returns to `free`.
-    fn poll_reap_oldest(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    /// Polls the oldest write; on completion its chunk returns to the GET's free list.
+    fn poll_reap_oldest(&mut self, shared: &SinkShared, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let Some(handle) = self.writes.front_mut() else {
             return Poll::Ready(Ok(()));
         };
@@ -555,30 +644,44 @@ impl StagingSinkState {
             Poll::Pending => Poll::Pending,
             Poll::Ready(joined) => {
                 self.writes.pop_front();
-                let (written, mut chunk) = joined
+                let (written, chunk) = joined
                     .map_err(|error| io::Error::other(format!("rdma get write task: {error}")))?
                     .map_err(|error| io::Error::other(format!("rdma get write: {error}")))?;
                 self.moved += written;
-                chunk.clear();
-                self.free.push(chunk);
+                shared.release(chunk);
                 Poll::Ready(Ok(()))
             }
         }
     }
 }
 
-/// The writer half handed to the storage layer through the GET options.
+/// The writer half handed to the storage layer through the GET options (one
+/// per segment; the sequential sink is the segment at offset 0).
 pub(crate) struct StagingSink {
-    state: Arc<std::sync::Mutex<StagingSinkState>>,
+    shared: Arc<SinkShared>,
+    state: Arc<std::sync::Mutex<SegmentState>>,
 }
 
 /// The handler's half: finishes or aborts the transfer after the producer ends.
 pub(crate) struct StagingSinkHandle {
     sink: crate::app::storage_api::object_usecase::StorageGetObjectSink,
-    state: Arc<std::sync::Mutex<StagingSinkState>>,
+    shared: Arc<SinkShared>,
+    /// Node-wide fan-out permits held for the GET's lifetime (one per extra segment).
+    _fanout_permits: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Counts this GET as active for the fair share until the handle is dropped.
+    _active: ActiveGetGuard,
 }
 
-fn lock_state(state: &std::sync::Mutex<StagingSinkState>) -> std::sync::MutexGuard<'_, StagingSinkState> {
+/// Decrements the node's active cuObject GET count on drop.
+struct ActiveGetGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveGetGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn lock_segment(state: &std::sync::Mutex<SegmentState>) -> std::sync::MutexGuard<'_, SegmentState> {
     state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -587,17 +690,30 @@ impl AsyncWrite for StagingSink {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let mut state = lock_state(&self.state);
+        let shared = Arc::clone(&self.shared);
+        let mut state = lock_segment(&self.state);
         if state.current.is_none() {
-            if state.free.is_empty() {
-                match state.poll_reap_oldest(cx) {
-                    Poll::Ready(Ok(())) if !state.free.is_empty() => {}
-                    Poll::Ready(Ok(())) => return Poll::Pending,
+            let mut chunk = shared.lock_free().pop();
+            if chunk.is_none() {
+                // Nothing free for this GET: reap this segment's oldest write, or
+                // grow from the pool when nothing is in flight. If the pool is
+                // exhausted too, park until another segment returns a chunk.
+                match state.poll_reap_oldest(&shared, cx) {
+                    Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Pending => return Poll::Pending,
                 }
+                chunk = shared.lock_free().pop().or_else(|| shared.server.try_reserve());
+                if chunk.is_none() {
+                    shared.park(cx);
+                    // A chunk may have come back between the pop and the park.
+                    chunk = shared.lock_free().pop();
+                    if chunk.is_none() {
+                        return Poll::Pending;
+                    }
+                }
             }
-            state.current = state.free.pop();
+            state.current = chunk;
         }
         let chunk = state.current.as_mut().expect("a current chunk was just installed");
         let spare = chunk.spare_mut().map_err(io::Error::other)?;
@@ -605,7 +721,7 @@ impl AsyncWrite for StagingSink {
         spare[..n].copy_from_slice(&buf[..n]);
         chunk.advance(n).map_err(io::Error::other)?;
         if chunk.is_full() {
-            state.submit_current();
+            state.submit_current(&shared);
         }
         Poll::Ready(Ok(n))
     }
@@ -620,7 +736,10 @@ impl AsyncWrite for StagingSink {
 }
 
 impl StagingSinkHandle {
-    /// Reserves the staging chunks and builds the sink for one GET.
+    /// Reserves the staging chunks and builds the sink for one GET. With the
+    /// fan-out enabled the sink also offers segment writers; each opened
+    /// segment tops the GET's chunk list up (without waiting) so it can keep
+    /// its own writes in flight.
     pub(crate) async fn new(bucket: &str, key: &str, token: &RdmaToken) -> S3Result<Self> {
         let service = SERVICE
             .get()
@@ -638,20 +757,64 @@ impl StagingSinkHandle {
                 Err(_) => break,
             }
         }
-        let state = Arc::new(std::sync::Mutex::new(StagingSinkState {
+        let shared = Arc::new(SinkShared {
             server,
             object: format!("{bucket}/{key}"),
             token: token.clone(),
-            free,
-            current: None,
-            writes: VecDeque::new(),
-            issued: 0,
-            moved: 0,
-        }));
-        let sink = crate::app::storage_api::object_usecase::StorageGetObjectSink::new(Box::new(StagingSink {
-            state: Arc::clone(&state),
-        }));
-        Ok(Self { sink, state })
+            inflight_writes: service.inflight_writes,
+            free: std::sync::Mutex::new(free),
+            waiters: std::sync::Mutex::new(Vec::new()),
+            segments: std::sync::Mutex::new(Vec::new()),
+        });
+        // The fan-out is bounded by what the pool can give this GET right now
+        // (one segment's worth of chunks each), so under load GETs degrade to
+        // fewer segments instead of all of them waiting on the same chunks.
+        // Fair share of the node's producer budget among the GETs open right
+        // now (this one included): 16 producers give one stream 8 segments,
+        // four streams 4 each, eight streams 2, sixteen or more 1. Running
+        // GETs keep their segments; the permits cap the total so a burst can
+        // never exceed the budget, and nothing waits for a permit.
+        let active = ActiveGetGuard(Arc::clone(&service.active_gets));
+        let streams = active.0.fetch_add(1, Ordering::Relaxed) + 1;
+        let fair_share = (service.get_fanout_budget / streams).clamp(1, service.get_fanout);
+        let affordable_segments = 1 + shared.server.available_chunks() / shared.inflight_writes.max(1);
+        let mut max_segments = fair_share.min(affordable_segments);
+        let mut fanout_permits = None;
+        if max_segments >= 2 {
+            let wanted = u32::try_from(max_segments - 1).unwrap_or(u32::MAX);
+            let available = u32::try_from(service.get_fanout_permits.available_permits()).unwrap_or(u32::MAX);
+            let extra = wanted.min(available);
+            fanout_permits = (extra > 0)
+                .then(|| Arc::clone(&service.get_fanout_permits).try_acquire_many_owned(extra).ok())
+                .flatten();
+            max_segments = 1 + fanout_permits.as_ref().map_or(0, |permits| permits.num_permits());
+        }
+        let writer: crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter = Box::new(shared.open_segment(0));
+        let sink = if max_segments >= 2 {
+            let factory_shared = Arc::clone(&shared);
+            let factory: Arc<
+                dyn Fn(u64, u64) -> crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter + Send + Sync,
+            > = Arc::new(move |offset, _len| {
+                factory_shared.top_up(factory_shared.inflight_writes);
+                Box::new(factory_shared.open_segment(offset))
+            });
+            crate::app::storage_api::object_usecase::StorageGetObjectSink::with_segments(
+                writer,
+                crate::app::storage_api::object_usecase::StorageGetObjectSinkSegments {
+                    factory,
+                    max_segments,
+                    min_segment_bytes: service.get_fanout_min_bytes,
+                },
+            )
+        } else {
+            crate::app::storage_api::object_usecase::StorageGetObjectSink::new(writer)
+        };
+        Ok(Self {
+            sink,
+            shared,
+            _fanout_permits: fanout_permits,
+            _active: active,
+        })
     }
 
     /// The option value to hand to the storage layer.
@@ -664,22 +827,30 @@ impl StagingSinkHandle {
         self.sink.is_taken()
     }
 
-    /// After the producer finished: writes the last partial chunk and waits for
-    /// every write; returns the bytes moved into the client buffer.
+    fn segments(&self) -> Vec<Arc<std::sync::Mutex<SegmentState>>> {
+        self.shared.lock_segments().clone()
+    }
+
+    /// After the producer finished: writes every segment's last partial chunk
+    /// and waits for every write; returns the bytes moved into the client buffer.
     pub(crate) async fn finish(self) -> S3Result<u64> {
-        let mut moved = {
-            let mut state = lock_state(&self.state);
-            state.submit_current();
-            state.moved
-        };
-        loop {
-            let handle = lock_state(&self.state).writes.pop_front();
-            let Some(handle) = handle else { break };
-            let (written, _chunk) = handle
-                .await
-                .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, format!("rdma get write task: {error}")))?
-                .map_err(|error| transfer_error("write", error))?;
-            moved += written;
+        let segments = self.segments();
+        let mut moved = 0;
+        for state in &segments {
+            let mut state = lock_segment(state);
+            state.submit_current(&self.shared);
+            moved += state.moved;
+        }
+        for state in &segments {
+            loop {
+                let handle = lock_segment(state).writes.pop_front();
+                let Some(handle) = handle else { break };
+                let (written, _chunk) = handle
+                    .await
+                    .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, format!("rdma get write task: {error}")))?
+                    .map_err(|error| transfer_error("write", error))?;
+                moved += written;
+            }
         }
         Ok(moved)
     }
@@ -687,10 +858,12 @@ impl StagingSinkHandle {
     /// After a failed GET: waits for the in-flight writes so their chunks are
     /// only released once the DMAs are over.
     pub(crate) async fn abort(self) {
-        loop {
-            let handle = lock_state(&self.state).writes.pop_front();
-            let Some(handle) = handle else { break };
-            let _ = handle.await;
+        for state in self.segments() {
+            loop {
+                let handle = lock_segment(&state).writes.pop_front();
+                let Some(handle) = handle else { break };
+                let _ = handle.await;
+            }
         }
     }
 }
