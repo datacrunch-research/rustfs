@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::erasure::codec::shard_buf::ShardBuf;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RustfsCodecDecodeWorkspace {
     shard_len: usize,
@@ -39,7 +41,7 @@ const BUFFERS_PER_SLOT: usize = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct ShardBufferPool {
-    buffers: Vec<Vec<Vec<u8>>>,
+    buffers: Vec<Vec<ShardBuf>>,
 }
 
 impl ShardBufferPool {
@@ -68,9 +70,9 @@ impl ShardBufferPool {
     /// exists to reuse an allocation, and memsetting it gives that saving straight
     /// back.
     #[inline]
-    pub(crate) fn take(&mut self, index: usize, len: usize) -> Vec<u8> {
+    pub(crate) fn take(&mut self, index: usize, len: usize) -> ShardBuf {
         self.ensure_slots(index + 1);
-        let mut buf = self.buffers[index].pop().unwrap_or_else(|| Vec::with_capacity(len));
+        let mut buf = self.buffers[index].pop().unwrap_or_else(|| ShardBuf::with_capacity(len));
         buf.clear();
         if buf.capacity() < len {
             buf.reserve_exact(len - buf.len());
@@ -81,7 +83,7 @@ impl ShardBufferPool {
     #[inline]
     /// Returns `buf` to the slot; beyond `BUFFERS_PER_SLOT` the smallest
     /// buffer is dropped so a slot never holds more than two generations.
-    pub(crate) fn put(&mut self, index: usize, buf: Vec<u8>) {
+    pub(crate) fn put(&mut self, index: usize, buf: ShardBuf) {
         self.ensure_slots(index + 1);
         let slot = &mut self.buffers[index];
         slot.push(buf);
@@ -105,7 +107,7 @@ impl ShardBufferPool {
 
     #[cfg(test)]
     fn stored_capacity(&self, index: usize) -> Option<usize> {
-        self.buffers.get(index).and_then(|slot| slot.last().map(Vec::capacity))
+        self.buffers.get(index).and_then(|slot| slot.last().map(ShardBuf::capacity))
     }
 }
 
@@ -127,7 +129,7 @@ mod tests {
         assert!(got.contains(&first_ptr) && got.contains(&second_ptr), "both generations are reused");
         pool.put(0, a);
         pool.put(0, b);
-        pool.put(0, Vec::with_capacity(64));
+        pool.put(0, ShardBuf::with_heap_capacity(64));
         assert_eq!(pool.buffers[0].len(), BUFFERS_PER_SLOT, "a third buffer evicts one");
         assert!(pool.buffers[0].iter().any(|buf| buf.capacity() >= 64), "the larger buffer is kept");
     }
@@ -170,7 +172,7 @@ mod tests {
         assert_eq!(workspace.shard_len(), 37);
 
         let mut pool = ShardBufferPool::new(1);
-        pool.put(0, Vec::with_capacity(2));
+        pool.put(0, ShardBuf::with_heap_capacity(2));
         let grown = pool.take(0, 8);
 
         assert_eq!(grown.len(), 0);

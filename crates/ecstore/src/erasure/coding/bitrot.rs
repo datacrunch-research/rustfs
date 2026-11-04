@@ -14,6 +14,7 @@
 
 use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::buffer_pool::{get_ec_buffer, return_ec_buffer};
+use crate::erasure::codec::shard_buf::ShardAppend;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
 use std::future::poll_fn;
@@ -411,7 +412,7 @@ where
     /// did not write is ever observable — the zeroing bought nothing.
     ///
     /// On return `out.len()` has grown by exactly the returned count.
-    pub async fn read_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+    pub async fn read_appending<B: ShardAppend>(&mut self, out: &mut B, want: usize) -> std::io::Result<usize> {
         let start = out.len();
         let count = self.read_appending_frame(out, want).await?;
         if let Some(integrity) = &mut self.integrity
@@ -423,7 +424,7 @@ where
         Ok(count)
     }
 
-    async fn read_appending_frame(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
+    async fn read_appending_frame<B: ShardAppend>(&mut self, out: &mut B, want: usize) -> std::io::Result<usize> {
         use bytes::BufMut as _;
         use tokio::io::AsyncReadExt as _;
 

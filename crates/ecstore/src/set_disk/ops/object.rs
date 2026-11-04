@@ -3629,16 +3629,16 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     drop(wd);
                     LegacyProducerDownstream::Segments(segments, ranges)
                 }
-                None => LegacyProducerDownstream::Writer(Box::new(wd)),
+                None => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
             },
             (Some(sink), None) => match sink.take() {
                 Some(writer) => {
                     drop(wd);
                     LegacyProducerDownstream::Writer(writer)
                 }
-                None => LegacyProducerDownstream::Writer(Box::new(wd)),
+                None => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
             },
-            (None, _) => LegacyProducerDownstream::Writer(Box::new(wd)),
+            (None, _) => LegacyProducerDownstream::Writer(GetObjectSinkWriter::new(Box::new(wd))),
         };
 
         // The producer is otherwise detached from the returned reader. Tie its
@@ -3762,36 +3762,46 @@ async fn run_legacy_producer_segment(
     length: i64,
     downstream: GetObjectSinkWriter,
 ) -> Result<()> {
-    let mut writer = GetObjectDownstreamWriter::new(downstream);
+    let (stream, emitter) = downstream.into_parts();
+    let mut writer = GetObjectDownstreamWriter::new(stream);
     // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
     // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
     // would incorrectly treat downstream backpressure as disk-read latency.
     // Disk read timeouts must be enforced at the actual disk I/O operations.
+    // A sink that can take shards out of arena memory (zero-copy emit) is
+    // offered to the decode loop for the whole read.
+    let read = crate::set_disk::with_get_object_read_policy(
+        context.read_policy,
+        SetDisks::get_object_with_fileinfo(
+            &context.bucket,
+            &context.object,
+            Arc::clone(&context.erasure_cache),
+            offset,
+            length,
+            &mut writer,
+            context.fi.clone(),
+            context.files.clone(),
+            &context.disks,
+            context.set_index,
+            context.pool_index,
+            context.skip_verify,
+            context.suppress_read_repair,
+            false,
+            false,
+            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            context.object_class,
+            context.size_bucket,
+        ),
+    );
+    let read = async move {
+        match emitter {
+            Some(emitter) => crate::erasure::codec::shard_emit::with_shard_emitter(emitter, read).await,
+            None => read.await,
+        }
+    };
     let producer_result = tokio::select! {
         biased;
-        result = crate::set_disk::with_get_object_read_policy(
-            context.read_policy,
-            SetDisks::get_object_with_fileinfo(
-                &context.bucket,
-                &context.object,
-                Arc::clone(&context.erasure_cache),
-                offset,
-                length,
-                &mut writer,
-                context.fi.clone(),
-                context.files.clone(),
-                &context.disks,
-                context.set_index,
-                context.pool_index,
-                context.skip_verify,
-                context.suppress_read_repair,
-                false,
-                false,
-                GET_OBJECT_PATH_LEGACY_DUPLEX,
-                context.object_class,
-                context.size_bucket,
-            ),
-        ) => result,
+        result = read => result,
         _ = async {
             if let Some(cancellation) = context.cancellation.as_ref() {
                 cancellation.cancelled().await;

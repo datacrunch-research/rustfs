@@ -578,12 +578,16 @@ pub mod integrity {
 }
 
 pub mod object {
+    pub use crate::erasure::codec::shard_buf::{
+        ArenaBlock, RegisteredSlabArena, ShardArena, ShardBuf, install_shard_arena, shard_arena,
+    };
+    pub use crate::erasure::codec::shard_emit::ShardEmitter;
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader,
-        GetObjectSink, GetObjectSinkSegmentFactory, GetObjectSinkSegments, GetObjectSinkWriter, NamespaceLockFence,
-        ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader,
-        QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        GetObjectSink, GetObjectSinkSegmentFactory, GetObjectSinkSegments, GetObjectSinkStream, GetObjectSinkWriter,
+        NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions,
+        PutObjReader, QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
         ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCommitGuard, WriteCompletion,
         get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
