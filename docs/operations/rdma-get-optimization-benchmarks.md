@@ -847,6 +847,35 @@ the stripe read grows to 10.6-11 ms, single 10.3 GB/s, 16 x 8 GiB host 16.1,
 memory at open, which the per-stripe reads then get for free; the local
 open stays on it.
 
+### Stripe read: the shard copy moves beside the hash (2026-11-04)
+
+Per shard and stripe the bitrot reader collected the chunks, waited for the
+hash on the blocking pool and then copied 4 MiB into the shard buffer on
+the decode task; the eight shard futures of a stripe share that task, so
+eight copies (32 MiB) ran one after another per stripe. The copy now runs
+inside the blocking task that verifies the shard, for the in-memory block,
+the chunked (remote) frame and the scratch path alike, so a stripe's copies
+and hashes spread over the blocking pool and the decode task only awaits.
+
+| Serving node (avg) | before | after |
+| --- | --- | --- |
+| `stripe_read` (24 MiB stripe) | 7.9 ms | 4.9 ms |
+| `stripe_read_first_shard` | 4.3 ms | 3.3 ms |
+| `decode` per 128 MiB part | 41 ms | 33.6 ms |
+| first GET after restart | 6.2-6.7 GB/s | 10.0 GB/s |
+| later single GETs (same harness) | 11.7-12.0 GB/s | 13.7-14.6 GB/s |
+
+Benchmark rows (fan-out 8, client GPU 4, two servers with four drives):
+single 10.7-14.1 GB/s (verify run 14.2, the root-complex ceiling of this
+client), 16 x 2 GiB GPU 13.3, 16 x 8 GiB host 19.1, 32 x 8 GiB host 23.1,
+CPU 1.88 s/GiB; byte-exact on all verify checks. The aggregate rows did not
+move: under 16-32 streams the stripe read holds at 5.3 ms but `emit` (the
+cuObject RDMA write of a stripe) grows from 5.6 to 9.5 ms per stripe, and
+`duplex_backpressure` shows up (1.6 ms, 12.5k samples), so with one segment
+per stream the emit is now the cadence and the shared cuObject write path
+is where the aggregate stops. The peer side is quiet throughout (chunk fill
+2.3 ms, open 0.6 ms).
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -868,3 +897,5 @@ open stays on it.
 | 5 fan-out 8 + fair-share budget (8 drives 6+2, x16 ports) | (this tree) | 7.18-8.07 GB/s | 0.82 GB/s | 20.86-22.28 GB/s | **26-27 GB/s** | 2.9 |
 | 6 zero-copy emit (shard arena), fan-out 8, client GPU on the NIC's socket | (this tree) | **13.88 GB/s** | 0.82 GB/s | 24.56 GB/s | 24.5-28 GB/s | 3.8 (1.8 sequential) |
 | 7 idle-pool pre-warm (two servers, four drives, 6+2) | (this tree) | 12.0-12.7 GB/s (first GET after restart 6.2, was 0.4) | 0.67 GB/s | 20.4 GB/s | 22.5 GB/s | 1.86 |
+| 7b stream read-ahead (peer chunk 6.5 -> 2 ms) | (this tree) | 11.0-12.2 GB/s | 0.68 GB/s | 21.2 GB/s | 19.6 GB/s | 1.88 |
+| 7c shard copy beside the hash | (this tree) | **10.7-14.2 GB/s** | 0.70 GB/s | 19.1 GB/s | 23.1 GB/s | 1.88 |

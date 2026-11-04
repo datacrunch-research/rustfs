@@ -237,7 +237,7 @@ impl ShardBytes for ShardBuf {
 }
 
 /// A buffer a bitrot reader appends a shard frame to: `Vec<u8>` or [`ShardBuf`].
-pub trait ShardAppend: BufMut + Deref<Target = [u8]> + Send {
+pub trait ShardAppend: BufMut + Deref<Target = [u8]> + Default + Send + 'static {
     fn reserve(&mut self, additional: usize);
     fn truncate(&mut self, len: usize);
     fn extend_from_slice(&mut self, bytes: &[u8]);
