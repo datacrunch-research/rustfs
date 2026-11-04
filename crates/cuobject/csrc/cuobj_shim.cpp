@@ -17,6 +17,7 @@
 #include <cuobjserver.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <exception>
 #include <new>
 #include <string>
@@ -219,6 +220,49 @@ ssize_t rfs_cuobj_put(struct rfs_cuobj_server *server, const char *key, struct r
             *verbs_status = static_cast<int>(status);
         }
         return read;
+    } catch (...) {
+        return -EIO;
+    }
+}
+
+ssize_t rfs_cuobj_get_async(struct rfs_cuobj_server *server, const char *key, struct rfs_cuobj_buffer *buffer,
+                            uint64_t local_offset, uint64_t remote_addr, size_t size, const char *descriptor,
+                            uint16_t channel, void *handle) {
+    if (server == nullptr || buffer == nullptr || descriptor == nullptr || handle == nullptr) {
+        return -EINVAL;
+    }
+    try {
+        ibv_wc_status status = IBV_WC_SUCCESS;
+        return server->server->handleGetObject(std::string(key ? key : ""), buffer->buffer, remote_addr, size,
+                                               std::string(descriptor), channel, local_offset, &status, handle);
+    } catch (...) {
+        return -EIO;
+    }
+}
+
+int rfs_cuobj_channel_completion_fd(struct rfs_cuobj_server *server, uint16_t channel) {
+    if (server == nullptr) {
+        return -1;
+    }
+    try {
+        return server->server->getCompletionFd(channel);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int rfs_cuobj_process_completions(struct rfs_cuobj_server *server, int fd, struct rfs_cuobj_completion *out,
+                                  int max) {
+    if (server == nullptr || out == nullptr || max <= 0) {
+        return -EINVAL;
+    }
+    static_assert(sizeof(cuObjAsyncEvent_t) == sizeof(struct rfs_cuobj_completion),
+                  "rfs_cuobj_completion mirrors cuObjAsyncEvent_t");
+    static_assert(offsetof(cuObjAsyncEvent_t, async_handle) == offsetof(struct rfs_cuobj_completion, handle) &&
+                      offsetof(cuObjAsyncEvent_t, status) == offsetof(struct rfs_cuobj_completion, status),
+                  "rfs_cuobj_completion mirrors cuObjAsyncEvent_t");
+    try {
+        return server->server->processCompletions(reinterpret_cast<cuObjAsyncEvent_t *>(out), max, fd);
     } catch (...) {
         return -EIO;
     }

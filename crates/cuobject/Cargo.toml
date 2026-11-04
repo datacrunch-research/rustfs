@@ -18,7 +18,7 @@ workspace = true
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 
 [build-dependencies]
