@@ -155,6 +155,9 @@ pub struct CuObjectServer {
     staging: Staging,
     addr: IpAddr,
     port: u16,
+    /// One permit per library channel (DC initiator): a transfer waits here
+    /// instead of failing with `EBUSY` when every channel is in use.
+    channels: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for CuObjectServer {
@@ -163,6 +166,78 @@ impl std::fmt::Debug for CuObjectServer {
             .field("addr", &self.addr)
             .field("port", &self.port)
             .field("chunk_bytes", &self.staging.chunk_bytes)
+            .finish()
+    }
+}
+
+/// Most ranges one scatter-gather transfer may carry (the library's `max_sge`).
+pub const MAX_SG_RANGES: usize = 10;
+
+/// Several byte ranges of one [`RegisteredArena`], sent in order as one
+/// RDMA operation (at most [`MAX_SG_RANGES`]).
+pub struct ArenaRanges {
+    pub arena: Arc<RegisteredArena>,
+    /// `(local_offset, len)` pairs, in stream order.
+    pub ranges: Vec<(usize, usize)>,
+}
+
+impl ArenaRanges {
+    pub fn total_len(&self) -> usize {
+        self.ranges.iter().map(|(_, len)| *len).sum()
+    }
+}
+
+/// A byte range of a [`RegisteredArena`] to send from.
+pub struct ArenaRange {
+    pub arena: Arc<RegisteredArena>,
+    pub local_offset: usize,
+    pub len: usize,
+}
+
+/// Host memory registered with one server, owned by the caller (see
+/// [`CuObjectServer::register_arena`]).
+pub struct RegisteredArena {
+    buffer: ffi::RegisteredBuffer,
+    server: Arc<CuObjectServer>,
+    len: usize,
+    id: u64,
+}
+
+impl RegisteredArena {
+    /// Length of the registered memory.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Process-unique id of this registration.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The server this memory is registered with.
+    pub fn server(&self) -> &Arc<CuObjectServer> {
+        &self.server
+    }
+
+    /// Raw pointer to the start of the registered memory. The memory lives as
+    /// long as this arena; callers hand out disjoint ranges of it.
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.buffer
+            .slice_mut(0, self.len)
+            .map(|slice| slice.as_mut_ptr())
+            .unwrap_or(std::ptr::null_mut())
+    }
+}
+
+impl std::fmt::Debug for RegisteredArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredArena")
+            .field("id", &self.id)
+            .field("len", &self.len)
             .finish()
     }
 }
@@ -251,6 +326,7 @@ impl CuObjectServer {
         let chunks = config.pool_bytes / config.chunk_bytes;
         let buffer = raw.register_host_buffer(chunks * config.chunk_bytes)?;
         Ok(Arc::new(Self {
+            channels: Arc::new(Semaphore::new(usize::try_from(config.num_dcis).unwrap_or(1).max(1))),
             raw,
             staging: Staging {
                 buffer,
@@ -293,6 +369,163 @@ impl CuObjectServer {
     /// Staging chunks currently free in the pool (a hint; another reservation may win).
     pub fn available_chunks(&self) -> usize {
         self.staging.permits.available_permits()
+    }
+
+    /// Registers `len` bytes of host memory with this server for callers that
+    /// manage the memory themselves (a shard arena the decoder reads into and
+    /// the server RDMA-writes from without staging).
+    pub fn register_arena(self: &Arc<Self>, len: usize) -> Result<Arc<RegisteredArena>, CuObjectError> {
+        let buffer = self.raw.register_host_buffer(len)?;
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Ok(Arc::new(RegisteredArena {
+            buffer,
+            server: Arc::clone(self),
+            len,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }))
+    }
+
+    /// RDMA-writes `source.len` bytes at `source.local_offset` of
+    /// `source.arena` to `token.remote_addr + remote_offset`, keeping `keep`
+    /// alive until the DMA returned (the caller passes whatever owns the arena
+    /// bytes). The arena must have been registered with this server.
+    pub async fn write_to_client_from_arena_owned<T: Send + 'static>(
+        self: &Arc<Self>,
+        key: &str,
+        token: &RdmaToken,
+        remote_offset: u64,
+        source: ArenaRange,
+        keep: T,
+    ) -> Result<(u64, T), CuObjectError> {
+        let ArenaRange {
+            arena,
+            local_offset,
+            len,
+        } = source;
+        if !Arc::ptr_eq(&arena.server, self) {
+            return Err(CuObjectError::Token("arena is registered with another server".to_owned()));
+        }
+        if len == 0 {
+            return Ok((0, keep));
+        }
+        let len_u64 = len as u64;
+        let end = remote_offset
+            .checked_add(len_u64)
+            .ok_or_else(|| CuObjectError::Token("remote offset overflow".to_owned()))?;
+        if end > token.buffer_len {
+            return Err(CuObjectError::TokenTooSmall {
+                buffer: token.buffer_len,
+                needed: end,
+            });
+        }
+        let remote_addr = token
+            .remote_addr
+            .checked_add(remote_offset)
+            .ok_or_else(|| CuObjectError::Token("remote address overflow".to_owned()))?;
+        let server = Arc::clone(self);
+        let key = key.to_owned();
+        let descriptor = token.raw.clone();
+        let channel_permit = Arc::clone(&self.channels)
+            .acquire_owned()
+            .await
+            .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        tokio::task::spawn_blocking(move || {
+            let _channel_permit = channel_permit;
+            let channel = server.raw.alloc_channel()?;
+            let result = server
+                .raw
+                .get(&key, &arena.buffer, local_offset as u64, remote_addr, len, &descriptor, channel);
+            server.raw.free_channel(channel);
+            let moved = result?;
+            if moved != len_u64 {
+                return Err(CuObjectError::ShortTransfer {
+                    moved,
+                    expected: len_u64,
+                });
+            }
+            // `keep` (and with it the arena bytes) is released only here.
+            Ok((moved, keep))
+        })
+        .await
+        .map_err(|error| CuObjectError::Os {
+            op: "write task",
+            source: std::io::Error::other(error),
+        })?
+    }
+
+    /// RDMA-writes all of `source.ranges` (in order, as one operation) to
+    /// `token.remote_addr + remote_offset`, keeping `keep` alive until the DMA
+    /// returned. The arena must have been registered with this server.
+    pub async fn write_to_client_sg_owned<T: Send + 'static>(
+        self: &Arc<Self>,
+        key: &str,
+        token: &RdmaToken,
+        remote_offset: u64,
+        source: ArenaRanges,
+        keep: T,
+    ) -> Result<(u64, T), CuObjectError> {
+        if !Arc::ptr_eq(&source.arena.server, self) {
+            return Err(CuObjectError::Token("arena is registered with another server".to_owned()));
+        }
+        if source.ranges.len() > MAX_SG_RANGES {
+            return Err(CuObjectError::Token("too many scatter-gather ranges".to_owned()));
+        }
+        let total = source.total_len();
+        if total == 0 {
+            return Ok((0, keep));
+        }
+        let total_u64 = total as u64;
+        let end = remote_offset
+            .checked_add(total_u64)
+            .ok_or_else(|| CuObjectError::Token("remote offset overflow".to_owned()))?;
+        if end > token.buffer_len {
+            return Err(CuObjectError::TokenTooSmall {
+                buffer: token.buffer_len,
+                needed: end,
+            });
+        }
+        let remote_addr = token
+            .remote_addr
+            .checked_add(remote_offset)
+            .ok_or_else(|| CuObjectError::Token("remote address overflow".to_owned()))?;
+        let server = Arc::clone(self);
+        let key = key.to_owned();
+        let descriptor = token.raw.clone();
+        let entries: Vec<ffi::SgEntry> = source
+            .ranges
+            .iter()
+            .map(|(offset, len)| ffi::SgEntry {
+                offset: *offset as u64,
+                size: *len,
+            })
+            .collect();
+        let arena = source.arena;
+        let channel_permit = Arc::clone(&self.channels)
+            .acquire_owned()
+            .await
+            .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
+        tokio::task::spawn_blocking(move || {
+            let _channel_permit = channel_permit;
+            let sg = server.raw.sg_buffer(&arena.buffer, &entries)?;
+            let channel = server.raw.alloc_channel()?;
+            let result = server.raw.get_sg(&key, &sg, remote_addr, &descriptor, channel);
+            server.raw.free_channel(channel);
+            drop(sg);
+            let moved = result?;
+            if moved != total_u64 {
+                return Err(CuObjectError::ShortTransfer {
+                    moved,
+                    expected: total_u64,
+                });
+            }
+            // `keep` (the shard buffers) is released only here, after the DMA.
+            Ok((moved, keep))
+        })
+        .await
+        .map_err(|error| CuObjectError::Os {
+            op: "write task",
+            source: std::io::Error::other(error),
+        })?
     }
 
     /// Reserves one staging chunk without waiting; `None` when the pool is empty.
@@ -340,7 +573,12 @@ impl CuObjectServer {
         let descriptor = token.raw.clone();
         let local_offset = chunk.local_offset();
         let len_usize = chunk.len();
+        let channel_permit = Arc::clone(&self.channels)
+            .acquire_owned()
+            .await
+            .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
         tokio::task::spawn_blocking(move || {
+            let _channel_permit = channel_permit;
             let channel = server.raw.alloc_channel()?;
             let result = server
                 .raw
@@ -392,7 +630,12 @@ impl CuObjectServer {
         let server = Arc::clone(self);
         let key = key.to_owned();
         let descriptor = token.raw.clone();
+        let channel_permit = Arc::clone(&self.channels)
+            .acquire_owned()
+            .await
+            .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
         tokio::task::spawn_blocking(move || {
+            let _channel_permit = channel_permit;
             let local_offset = chunk.local_offset();
             let len_usize = chunk.len();
             let channel = server.raw.alloc_channel()?;
@@ -451,7 +694,12 @@ impl CuObjectServer {
         let server = Arc::clone(self);
         let key = key.to_owned();
         let descriptor = token.raw.clone();
+        let channel_permit = Arc::clone(&self.channels)
+            .acquire_owned()
+            .await
+            .map_err(|_| CuObjectError::Token("server closed".to_owned()))?;
         tokio::task::spawn_blocking(move || {
+            let _channel_permit = channel_permit;
             let local_offset = chunk.local_offset();
             let channel = server.raw.alloc_channel()?;
             let result = server

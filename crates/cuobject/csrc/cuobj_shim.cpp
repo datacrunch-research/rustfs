@@ -117,6 +117,47 @@ void rfs_cuobj_deregister(struct rfs_cuobj_server *server, struct rfs_cuobj_buff
     delete buffer;
 }
 
+int rfs_cuobj_sg_buffer(struct rfs_cuobj_server *server, struct rfs_cuobj_buffer *base,
+                        const struct rfs_cuobj_sg_entry *entries, size_t count, struct rfs_cuobj_buffer **out) {
+    if (server == nullptr || base == nullptr || entries == nullptr || count == 0 || out == nullptr) {
+        return -EINVAL;
+    }
+    try {
+        std::vector<cuObjScatterGatherEntryWithOffset_t> sglist;
+        sglist.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            cuObjScatterGatherEntryWithOffset_t entry;
+            entry.offset = static_cast<loff_t>(entries[i].offset);
+            entry.size = entries[i].size;
+            sglist.push_back(entry);
+        }
+        struct rdma_buffer *buffer = server->server->getRDMABufferFromSgList(base->buffer, sglist);
+        if (buffer == nullptr) {
+            return -ENOMEM;
+        }
+        auto *wrapper = new (std::nothrow) rfs_cuobj_buffer{buffer};
+        if (wrapper == nullptr) {
+            server->server->putRDMABufferFromSgList(buffer);
+            return -ENOMEM;
+        }
+        *out = wrapper;
+        return 0;
+    } catch (...) {
+        return -EIO;
+    }
+}
+
+void rfs_cuobj_sg_buffer_put(struct rfs_cuobj_server *server, struct rfs_cuobj_buffer *sg) {
+    if (server == nullptr || sg == nullptr) {
+        return;
+    }
+    try {
+        server->server->putRDMABufferFromSgList(sg->buffer);
+    } catch (...) {
+    }
+    delete sg;
+}
+
 int rfs_cuobj_channel_alloc(struct rfs_cuobj_server *server, uint16_t *out) {
     if (server == nullptr || out == nullptr) {
         return -EINVAL;

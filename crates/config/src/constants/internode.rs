@@ -415,6 +415,14 @@ pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: u64 = 192 * 1024 * 1024;
 pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: &str = "RUSTFS_CUOBJECT_GET_FANOUT_BUDGET";
 pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: usize = 16;
 
+/// Registered host memory the erasure decoder reads shards into so a
+/// cuObject GET can RDMA-write data shards straight from those buffers
+/// (zero-copy emit); 0 keeps the staging copy. Blocks are
+/// `RUSTFS_ERASURE_SHARD_BYTES` (4 MiB when unset); objects with larger
+/// shards fall back to heap buffers and the staging copy.
+pub const ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: &str = "RUSTFS_CUOBJECT_SHARD_ARENA_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: usize = 0;
+
 pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
 pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
 

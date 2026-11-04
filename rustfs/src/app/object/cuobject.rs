@@ -28,14 +28,19 @@ use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
 use rustfs_config::{
-    DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT,
-    DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
+    DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES, DEFAULT_RUSTFS_CUOBJECT_ENABLE,
+    DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
     DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS, DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES,
-    DEFAULT_RUSTFS_CUOBJECT_PORT, ENV_RUSTFS_CUOBJECT_ADDRS, ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_ENABLE,
-    ENV_RUSTFS_CUOBJECT_GET_FANOUT, ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
-    ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
+    DEFAULT_RUSTFS_CUOBJECT_PORT, DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES, ENV_ERASURE_SHARD_BYTES, ENV_RUSTFS_CUOBJECT_ADDRS,
+    ENV_RUSTFS_CUOBJECT_CHUNK_BYTES, ENV_RUSTFS_CUOBJECT_ENABLE, ENV_RUSTFS_CUOBJECT_GET_FANOUT,
+    ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
+    ENV_RUSTFS_CUOBJECT_NUM_DCIS, ENV_RUSTFS_CUOBJECT_POOL_BYTES, ENV_RUSTFS_CUOBJECT_PORT,
+    ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
 };
-use rustfs_cuobject::{CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken, StagingChunk};
+use rustfs_cuobject::{
+    CuObjectConfig, CuObjectError, CuObjectServer, RDMA_TOKEN_HEADER, RdmaToken, RegisteredArena, StagingChunk,
+};
+use rustfs_ecstore::api::object::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u16, get_env_u64, get_env_usize};
 use s3s::dto::StreamingBlob;
 use s3s::stream::{ByteStream, RemainingLength};
@@ -43,6 +48,7 @@ use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -73,6 +79,9 @@ pub(crate) struct CuObjectService {
     get_fanout_permits: Arc<tokio::sync::Semaphore>,
     /// cuObject GETs currently open on this node, for the fair share.
     active_gets: Arc<AtomicUsize>,
+    /// Registered memory the erasure decoder reads shards into, so GETs can
+    /// RDMA-write data shards straight from the shard buffers (zero-copy emit).
+    shard_arena: Option<Arc<RegisteredArena>>,
     next: AtomicUsize,
 }
 
@@ -184,6 +193,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
             .map_err(|error| io::Error::other(format!("cuobject server on {addr}: {error}")))?;
         servers.push(server);
     }
+    let shard_arena = install_cuobject_shard_arena(&servers).await?;
     let (major, minor) = rustfs_cuobject::library_version();
     info!(
         event = EVENT_CUOBJECT_SERVICE_STATE,
@@ -198,6 +208,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         get_fanout,
         get_fanout_min_bytes,
         get_fanout_budget,
+        shard_arena_bytes = shard_arena.as_ref().map_or(0, |arena| arena.len()),
         library = format_args!("{major}.{minor}"),
         "cuobject s3-over-rdma service started"
     );
@@ -209,9 +220,60 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         get_fanout_budget,
         get_fanout_permits: Arc::new(tokio::sync::Semaphore::new(get_fanout_budget)),
         active_gets: Arc::new(AtomicUsize::new(0)),
+        shard_arena,
         next: AtomicUsize::new(0),
     }));
     Ok(())
+}
+
+/// Registers the shard arena (`RUSTFS_CUOBJECT_SHARD_ARENA_BYTES`) with the
+/// first server and installs it as the process-wide shard buffer source.
+async fn install_cuobject_shard_arena(servers: &[Arc<CuObjectServer>]) -> io::Result<Option<Arc<RegisteredArena>>> {
+    let bytes = get_env_usize(ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES, DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES);
+    let Some(server) = servers.first() else {
+        return Ok(None);
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    let block_len = match get_env_usize(ENV_ERASURE_SHARD_BYTES, DEFAULT_ERASURE_SHARD_BYTES) {
+        0 => 4 * 1024 * 1024,
+        shard => shard,
+    };
+    if bytes < block_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES} is smaller than one shard block ({block_len} bytes)"),
+        ));
+    }
+    let server = Arc::clone(server);
+    // Registration pins the memory; keep it off the runtime threads.
+    let arena = tokio::task::spawn_blocking(move || server.register_arena(bytes))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|error| io::Error::other(format!("cuobject shard arena: {error}")))?;
+    let slab = build_slab_arena(&arena, block_len);
+    if !install_shard_arena(slab) {
+        warn!(
+            event = EVENT_CUOBJECT_SERVICE_STATE,
+            component = LOG_COMPONENT_OBJECT,
+            subsystem = LOG_SUBSYSTEM_CUOBJECT,
+            state = "arena_already_installed",
+            "cuobject shard arena not installed: another shard arena is active"
+        );
+        return Ok(None);
+    }
+    Ok(Some(arena))
+}
+
+/// Wraps the registered memory as a block arena. The arena owns a clone of
+/// the registration, so the memory outlives every block handed out.
+#[allow(unsafe_code)]
+fn build_slab_arena(arena: &Arc<RegisteredArena>, block_len: usize) -> Arc<RegisteredSlabArena> {
+    // SAFETY: `as_mut_ptr` addresses `len` bytes of host memory owned by the
+    // registration, which the slab keeps alive through the boxed clone; the
+    // slab hands out disjoint blocks of it.
+    unsafe { RegisteredSlabArena::new(arena.as_mut_ptr(), arena.len(), block_len, arena.id(), Box::new(Arc::clone(arena))) }
 }
 
 /// The parsed RDMA token of a GET that must be served over RDMA.
@@ -548,6 +610,9 @@ struct SinkShared {
     /// Segments waiting for a chunk; woken one at a time as chunks return.
     waiters: std::sync::Mutex<Vec<std::task::Waker>>,
     segments: std::sync::Mutex<Vec<Arc<std::sync::Mutex<SegmentState>>>>,
+    /// The shard arena registered with this sink's server, if any: data shards
+    /// read into it are RDMA-written in place instead of through staging.
+    arena: Option<Arc<RegisteredArena>>,
 }
 
 impl SinkShared {
@@ -566,11 +631,36 @@ impl SinkShared {
             writes: VecDeque::new(),
             issued: remote_offset,
             moved: 0,
+            pending: Vec::new(),
+            pending_ranges: Vec::new(),
         }));
         self.lock_segments().push(Arc::clone(&state));
         StagingSink {
             shared: Arc::clone(self),
             state,
+        }
+    }
+
+    /// Opens a segment as the writer handed to the storage layer: the staging
+    /// stream, plus the zero-copy shard emitter when the arena is available.
+    fn open_segment_writer(
+        self: &Arc<Self>,
+        remote_offset: u64,
+    ) -> crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter {
+        let sink = self.open_segment(remote_offset);
+        match &self.arena {
+            Some(arena) => {
+                let emitter = StagingShardEmitter {
+                    shared: Arc::clone(self),
+                    state: Arc::clone(&sink.state),
+                    arena: Arc::clone(arena),
+                };
+                crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter::with_emitter(
+                    Box::new(sink),
+                    Box::new(emitter),
+                )
+            }
+            None => crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter::new(Box::new(sink)),
         }
     }
 
@@ -603,19 +693,59 @@ impl SinkShared {
     }
 }
 
+/// An in-flight RDMA write of a segment: bytes moved and, for a staged write,
+/// the chunk to return to the GET's free list.
+type SegmentWrite = JoinHandle<Result<(u64, Option<StagingChunk>), CuObjectError>>;
+
 /// One segment of the body: the erasure decoder writes decoded bytes straight
 /// into cuObject staging chunks (no duplex pipe, no consumer copy), full chunks
 /// are RDMA-written on their own tasks at the segment's running offset.
 struct SegmentState {
     current: Option<StagingChunk>,
-    writes: VecDeque<JoinHandle<Result<(u64, StagingChunk), CuObjectError>>>,
+    /// In-flight RDMA writes in submission order; a staging write returns its
+    /// chunk, a zero-copy shard write returns none (the shard buffer went back
+    /// to the arena when the write task dropped it).
+    writes: VecDeque<SegmentWrite>,
     /// Client-buffer offset of the next byte this segment stages.
     issued: u64,
     /// Bytes confirmed written by reaped writes.
     moved: u64,
+    /// Data shards taken by the emitter and not yet submitted: one
+    /// scatter-gather RDMA write carries a whole stripe's worth.
+    pending: Vec<ShardBuf>,
+    /// `(arena offset, len)` of each pending shard's bytes, in stream order.
+    pending_ranges: Vec<(usize, usize)>,
 }
 
 impl SegmentState {
+    /// Submits the pending shards as one scatter-gather write.
+    fn submit_pending(&mut self, shared: &Arc<SinkShared>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let Some(arena) = shared.arena.as_ref() else {
+            return;
+        };
+        let shards = std::mem::take(&mut self.pending);
+        let ranges = std::mem::take(&mut self.pending_ranges);
+        let len: usize = ranges.iter().map(|(_, len)| *len).sum();
+        let remote_offset = self.issued;
+        self.issued += len as u64;
+        let server = Arc::clone(&shared.server);
+        let object = shared.object.clone();
+        let token = shared.token.clone();
+        let source = rustfs_cuobject::ArenaRanges {
+            arena: Arc::clone(arena),
+            ranges,
+        };
+        self.writes.push_back(tokio::spawn(async move {
+            server
+                .write_to_client_sg_owned(&object, &token, remote_offset, source, shards)
+                .await
+                .map(|(moved, _shards)| (moved, None))
+        }));
+    }
+
     fn submit_current(&mut self, shared: &Arc<SinkShared>) {
         let Some(chunk) = self.current.take() else {
             return;
@@ -630,9 +760,12 @@ impl SegmentState {
         let server = Arc::clone(&shared.server);
         let object = shared.object.clone();
         let token = shared.token.clone();
-        self.writes.push_back(tokio::spawn(
-            async move { server.write_to_client_owned(&object, &token, offset, chunk).await },
-        ));
+        self.writes.push_back(tokio::spawn(async move {
+            server
+                .write_to_client_owned(&object, &token, offset, chunk)
+                .await
+                .map(|(moved, chunk)| (moved, Some(chunk)))
+        }));
     }
 
     /// Polls the oldest write; on completion its chunk returns to the GET's free list.
@@ -648,7 +781,9 @@ impl SegmentState {
                     .map_err(|error| io::Error::other(format!("rdma get write task: {error}")))?
                     .map_err(|error| io::Error::other(format!("rdma get write: {error}")))?;
                 self.moved += written;
-                shared.release(chunk);
+                if let Some(chunk) = chunk {
+                    shared.release(chunk);
+                }
                 Poll::Ready(Ok(()))
             }
         }
@@ -692,6 +827,8 @@ impl AsyncWrite for StagingSink {
         }
         let shared = Arc::clone(&self.shared);
         let mut state = lock_segment(&self.state);
+        // Shards taken before these bytes go out first so the order is kept.
+        state.submit_pending(&shared);
         if state.current.is_none() {
             let mut chunk = shared.lock_free().pop();
             if chunk.is_none() {
@@ -735,6 +872,77 @@ impl AsyncWrite for StagingSink {
     }
 }
 
+/// Batched zero-copy writes in flight per segment before the emitter applies
+/// backpressure (one write per stripe, or per `MAX_SG_RANGES` shards).
+const MAX_INFLIGHT_SHARD_WRITES: usize = 4;
+
+/// The zero-copy half of a segment writer: takes data shards that live in the
+/// registered shard arena and RDMA-writes them in place, in stream order with
+/// the bytes staged through the segment's [`StagingSink`].
+struct StagingShardEmitter {
+    shared: Arc<SinkShared>,
+    state: Arc<std::sync::Mutex<SegmentState>>,
+    arena: Arc<RegisteredArena>,
+}
+
+impl ShardEmitter for StagingShardEmitter {
+    fn poll_emit_shard(
+        &mut self,
+        cx: &mut Context<'_>,
+        shard: &mut Option<ShardBuf>,
+        range: Range<usize>,
+    ) -> Poll<io::Result<bool>> {
+        let Some(block) = shard.as_ref().and_then(ShardBuf::arena_block) else {
+            return Poll::Ready(Ok(false));
+        };
+        if block.registration_id() != self.arena.id() || range.end > block.len() || range.start > range.end {
+            return Poll::Ready(Ok(false));
+        }
+        let len = range.end - range.start;
+        if len == 0 {
+            shard.take();
+            return Poll::Ready(Ok(true));
+        }
+        let local_offset = block.offset() + range.start;
+        let shared = Arc::clone(&self.shared);
+        let mut state = lock_segment(&self.state);
+        if state.pending.len() >= rustfs_cuobject::MAX_SG_RANGES {
+            // The batch is full: submit it (with backpressure) before taking more.
+            while state.writes.len() >= MAX_INFLIGHT_SHARD_WRITES {
+                match state.poll_reap_oldest(&shared, cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            state.submit_pending(&shared);
+        }
+        // Bytes staged so far go out first so the stream order is kept.
+        state.submit_current(&shared);
+        let taken = shard.take().expect("shard checked above");
+        state.pending.push(taken);
+        state.pending_ranges.push((local_offset, len));
+        Poll::Ready(Ok(true))
+    }
+
+    fn poll_flush_shards(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let shared = Arc::clone(&self.shared);
+        let mut state = lock_segment(&self.state);
+        if state.pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        while state.writes.len() >= MAX_INFLIGHT_SHARD_WRITES {
+            match state.poll_reap_oldest(&shared, cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        state.submit_pending(&shared);
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl StagingSinkHandle {
     /// Reserves the staging chunks and builds the sink for one GET. With the
     /// fan-out enabled the sink also offers segment writers; each opened
@@ -745,6 +953,7 @@ impl StagingSinkHandle {
             .get()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma get is not enabled"))?;
         let server = Arc::clone(service.pick());
+        let server_for_arena = Arc::clone(&server);
         let mut free = vec![
             server
                 .reserve(STAGING_RESERVE_TIMEOUT)
@@ -765,6 +974,11 @@ impl StagingSinkHandle {
             free: std::sync::Mutex::new(free),
             waiters: std::sync::Mutex::new(Vec::new()),
             segments: std::sync::Mutex::new(Vec::new()),
+            arena: service
+                .shard_arena
+                .as_ref()
+                .filter(|arena| Arc::ptr_eq(arena.server(), &server_for_arena))
+                .cloned(),
         });
         // The fan-out is bounded by what the pool can give this GET right now
         // (one segment's worth of chunks each), so under load GETs degrade to
@@ -789,14 +1003,14 @@ impl StagingSinkHandle {
                 .flatten();
             max_segments = 1 + fanout_permits.as_ref().map_or(0, |permits| permits.num_permits());
         }
-        let writer: crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter = Box::new(shared.open_segment(0));
+        let writer = shared.open_segment_writer(0);
         let sink = if max_segments >= 2 {
             let factory_shared = Arc::clone(&shared);
             let factory: Arc<
                 dyn Fn(u64, u64) -> crate::app::storage_api::object_usecase::StorageGetObjectSinkWriter + Send + Sync,
             > = Arc::new(move |offset, _len| {
                 factory_shared.top_up(factory_shared.inflight_writes);
-                Box::new(factory_shared.open_segment(offset))
+                factory_shared.open_segment_writer(offset)
             });
             crate::app::storage_api::object_usecase::StorageGetObjectSink::with_segments(
                 writer,
@@ -838,6 +1052,7 @@ impl StagingSinkHandle {
         let mut moved = 0;
         for state in &segments {
             let mut state = lock_segment(state);
+            state.submit_pending(&self.shared);
             state.submit_current(&self.shared);
             moved += state.moved;
         }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::erasure::codec::shard_emit::ShardEmitter;
 use crate::storage_api_contracts::{
     list::VersionMarker,
     object::{
@@ -1038,8 +1039,65 @@ impl DeleteRecoveryWorkBudget {
     }
 }
 
-/// The writer a [`GetObjectSink`] hands to the read pipeline.
-pub type GetObjectSinkWriter = Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>;
+/// The byte-stream half of a sink writer.
+pub type GetObjectSinkStream = Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>;
+
+/// The writer a [`GetObjectSink`] hands to the read pipeline: the byte stream
+/// the decoder writes into, plus an optional [`ShardEmitter`] that takes whole
+/// data shards out of registered arena memory instead (zero-copy emit). Both
+/// halves must share one byte position: bytes written through the stream and
+/// shards taken by the emitter arrive in request order.
+pub struct GetObjectSinkWriter {
+    stream: GetObjectSinkStream,
+    emitter: Option<Box<dyn ShardEmitter>>,
+}
+
+impl GetObjectSinkWriter {
+    pub fn new(stream: GetObjectSinkStream) -> Self {
+        Self { stream, emitter: None }
+    }
+
+    pub fn with_emitter(stream: GetObjectSinkStream, emitter: Box<dyn ShardEmitter>) -> Self {
+        Self {
+            stream,
+            emitter: Some(emitter),
+        }
+    }
+
+    /// Splits the writer into its stream and its emitter.
+    pub fn into_parts(self) -> (GetObjectSinkStream, Option<Box<dyn ShardEmitter>>) {
+        (self.stream, self.emitter)
+    }
+}
+
+impl std::fmt::Debug for GetObjectSinkWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectSinkWriter")
+            .field("emitter", &self.emitter.is_some())
+            .finish()
+    }
+}
+
+impl tokio::io::AsyncWrite for GetObjectSinkWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
 
 /// Builds the writer for one segment of a fanned-out GET: `(offset, len)` are
 /// relative to the start of the requested range, in bytes.

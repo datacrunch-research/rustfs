@@ -47,6 +47,14 @@ unsafe extern "C" {
     fn rfs_cuobj_alloc_host(server: *mut RawServer, size: usize) -> *mut c_void;
     fn rfs_cuobj_register(server: *mut RawServer, ptr: *mut c_void, size: usize, out: *mut *mut RawBuffer) -> c_int;
     fn rfs_cuobj_deregister(server: *mut RawServer, buffer: *mut RawBuffer);
+    fn rfs_cuobj_sg_buffer(
+        server: *mut RawServer,
+        base: *mut RawBuffer,
+        entries: *const SgEntry,
+        count: usize,
+        out: *mut *mut RawBuffer,
+    ) -> c_int;
+    fn rfs_cuobj_sg_buffer_put(server: *mut RawServer, sg: *mut RawBuffer);
     fn rfs_cuobj_channel_alloc(server: *mut RawServer, out: *mut u16) -> c_int;
     fn rfs_cuobj_channel_free(server: *mut RawServer, channel: u16);
     fn rfs_cuobj_get(
@@ -132,6 +140,74 @@ impl Server {
             len,
             server: self.raw,
         })
+    }
+
+    /// Builds a scatter-gather transfer handle over `entries` of `base`.
+    pub fn sg_buffer(&self, base: &RegisteredBuffer, entries: &[SgEntry]) -> Result<SgBuffer, CuObjectError> {
+        if entries.is_empty() {
+            return Err(CuObjectError::Token("empty scatter-gather list".to_owned()));
+        }
+        let mut total = 0usize;
+        for entry in entries {
+            if entry
+                .offset
+                .checked_add(entry.size as u64)
+                .is_none_or(|end| end > base.len as u64)
+            {
+                return Err(CuObjectError::Token("scatter-gather entry exceeds the registered buffer".to_owned()));
+            }
+            total = total
+                .checked_add(entry.size)
+                .ok_or_else(|| CuObjectError::Token("scatter-gather length overflow".to_owned()))?;
+        }
+        let mut out: *mut RawBuffer = ptr::null_mut();
+        // SAFETY: `base` is a live registration of this server and `entries` is a valid slice.
+        let rc = unsafe { rfs_cuobj_sg_buffer(self.raw.as_ptr(), base.raw.as_ptr(), entries.as_ptr(), entries.len(), &mut out) };
+        if rc < 0 {
+            return Err(os_error("scatter-gather buffer", rc));
+        }
+        let raw = NonNull::new(out).ok_or_else(|| CuObjectError::Token("scatter-gather handle missing".to_owned()))?;
+        Ok(SgBuffer {
+            raw,
+            len: total,
+            server: self.raw,
+        })
+    }
+
+    /// Blocking RDMA write of all ranges of `sg`, in order, to `remote_addr`.
+    pub fn get_sg(
+        &self,
+        key: &str,
+        sg: &SgBuffer,
+        remote_addr: u64,
+        descriptor: &str,
+        channel: u16,
+    ) -> Result<u64, CuObjectError> {
+        let key = CString::new(key).map_err(|_| CuObjectError::Token("key contains NUL".to_owned()))?;
+        let descriptor = CString::new(descriptor).map_err(|_| CuObjectError::Token("token contains NUL".to_owned()))?;
+        let mut verbs_status: c_int = 0;
+        // SAFETY: all handles are live; the list's ranges were bounds-checked when it was built,
+        // and the library ignores `local_offset` for a scatter-gather handle.
+        let rc = unsafe {
+            rfs_cuobj_get(
+                self.raw.as_ptr(),
+                key.as_ptr(),
+                sg.raw.as_ptr(),
+                0,
+                remote_addr,
+                sg.len,
+                descriptor.as_ptr(),
+                channel,
+                &mut verbs_status,
+            )
+        };
+        if rc < 0 {
+            return Err(CuObjectError::Transfer {
+                verbs_status,
+                source: std::io::Error::from_raw_os_error(i32::try_from(-rc).unwrap_or(libc_eio())),
+            });
+        }
+        Ok(rc as u64)
     }
 
     pub fn alloc_channel(&self) -> Result<u16, CuObjectError> {
@@ -251,6 +327,31 @@ impl Drop for Server {
 }
 
 /// A registered host buffer owned by the library.
+/// One (offset, size) range of a registered buffer; layout matches the shim's `rfs_cuobj_sg_entry`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SgEntry {
+    pub offset: u64,
+    pub size: usize,
+}
+
+/// A transfer handle over several ranges of one registered buffer; released on drop.
+pub struct SgBuffer {
+    raw: NonNull<RawBuffer>,
+    len: usize,
+    server: NonNull<RawServer>,
+}
+
+unsafe impl Send for SgBuffer {}
+unsafe impl Sync for SgBuffer {}
+
+impl Drop for SgBuffer {
+    fn drop(&mut self) {
+        // SAFETY: both handles are live; the base registration outlives the list by construction.
+        unsafe { rfs_cuobj_sg_buffer_put(self.server.as_ptr(), self.raw.as_ptr()) };
+    }
+}
+
 pub struct RegisteredBuffer {
     raw: NonNull<RawBuffer>,
     base: usize,
