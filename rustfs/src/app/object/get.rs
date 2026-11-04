@@ -4085,7 +4085,15 @@ impl DefaultObjectUsecase {
         let cache_adapter = self.object_data_cache();
         let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         // Extra response headers beyond what `GetObjectOutput` carries.
+        #[cfg_attr(
+            not(all(feature = "cuobject", target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
         let mut extra_headers: Vec<(&'static str, String)> = Vec::new();
+        #[cfg_attr(
+            not(all(feature = "cuobject", target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
         let mut http_content_length = response_content_length;
         #[cfg(all(feature = "cuobject", target_os = "linux"))]
         let rdma_token = super::cuobject::rdma_token_for_request(&req.headers);

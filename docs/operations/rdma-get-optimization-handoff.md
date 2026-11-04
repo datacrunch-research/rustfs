@@ -1,9 +1,9 @@
-# RDMA GET optimization: handoff (2026-11-03)
+# RDMA GET optimization: handoff (2026-11-04)
 
 State of the work on branch `rainj-me/rdma-support`, written for continuing on
 another cluster (Intel CPUs with InfiniBand/RoCE and GPUs).
 
-## Committed (HEAD `24cc25eee`)
+## Committed
 
 | Commit | What |
 | --- | --- |
@@ -17,6 +17,8 @@ another cluster (Intel CPUs with InfiniBand/RoCE and GPUs).
 | `126da9908` | Phase 4c: node-freeze drill, timeout characterization |
 | `6e9233d4e` | abort-path fix, raisable duplex pipe, `[profile.fast]` |
 | `24cc25eee` | cuObject PUT and UploadPart over RDMA |
+| `8d0b192cb` | GET sink: decoded bytes straight into staging (zero-copy emit, step 1) |
+| (this tree) | cold-fill sink fix, cuObject GET fan-out with fair-share budget |
 
 SGLang side (repo /mnt/shared/rain/sglang): `4465e68cb8` NIXL object loader
 with `inflight` ranged GETs. Needs NIXL >= 1.6.0 (source build; the 1.5.2
@@ -27,48 +29,55 @@ Results are in `docs/operations/rdma-get-optimization-benchmarks.md`
 48 MiB KV chunk 12 ms first GET after PUT; RDMA PUT 0.39 GB/s single,
 1.35 GB/s x16, limited by the PUT pipeline).
 
-## Uncommitted work in progress: decoder-to-staging sink (zero-copy emit, step 1)
+## Done on the staging cluster (2026-11-04)
 
-Diff saved at `target/bench/sink-wip.diff` (7 files, +341/-21) and left in the
-working tree. What it does: a `GetObjectSink` option (`ObjectOptions::get_object_sink`)
-lets the legacy duplex GET producer write decoded bytes into a caller sink
-instead of the pipe; the cuObject handler builds a `StagingSink` (an
-`AsyncWrite` over staging chunks that submits full chunks as RDMA writes) and
-finishes it after the producer's terminal. Gated in ecstore to plain objects
-(not compressed, not encrypted). Removes one 48 MiB copy per stripe and the
-pipe stall.
+The work moved to the Kubernetes cluster `llm-inference-staging-euc1`
+(4 x B300 nodes, Intel Xeon 6767P, inbox kernel RDMA stack); see the
+"Staging cluster port" and "Phase 5 (revisited)" sections of the benchmark
+record for the environment, the fabric findings, and the numbers.
 
-Status: compiles, clippy and guards pass, and the last build was verified
-byte-exact with the direct client (`VERIFY=1 driver.py`): 2 GiB object on
-4 MiB shards into GPU memory, the 988 MB model file, a 20 MB range, and a
-1 MiB-block object. Single-stream RDMA GET of the 2 GiB object: **6.33 GB/s**
-(2.8x the Phase 0 baseline, up from 5.48 GB/s) with the default settings,
-before any tuning of prefetch or in-flight writes. The full benchmark chain
-(16- and 32-stream rows, variants) was not run. Next steps:
+- The GET sink (step 1 of zero-copy emit) is committed (`8d0b192cb`). A
+  regression found here is fixed in the same tree: with
+  `RUSTFS_OBJECT_DATA_CACHE_MODE=fill_materialize_enabled`, a cache miss on a
+  cacheable object materialized the body for the cache and the sink swallowed
+  those bytes (`less data available than what was requested` on RDMA GETs of
+  KV chunks). The cold-fill producer now drops the sink.
+- Server-side stripe fan-out for cuObject GETs (Phase 5, revisited): the sink
+  offers a segment factory, the legacy duplex read path runs up to
+  `RUSTFS_CUOBJECT_GET_FANOUT` (default 8) block-aligned segment producers per
+  GET, each with its own staging chunks and RDMA writes; a segment is at least
+  `RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES` (192 MiB), and each node shares a
+  producer budget `RUSTFS_CUOBJECT_GET_FANOUT_BUDGET` (16) fairly among its
+  open GETs (8 / 4 / 2 / 1 segments for 1 / 4 / 8 / 16 streams). Single
+  stream 2 GiB into GPU: 4.4 -> 8.8 GB/s on 16 drives; the 16-stream
+  aggregate needs the budget (first pass without it collapsed to 3.7 GB/s from
+  a reader-setup stampede).
+- Non-cuobject builds of `rustfs` compile again (the PUT-over-RDMA commit had
+  left `rustfs_cuobject` references ungated).
+- Cluster facts that matter for the next steps: the CPU-side RDMA NIC is a
+  bond of two separate CX-7 cards (no RoCE LAG, port groups cannot reach each
+  other over RoCE, rdma_cm picks `mlx5_6` by default); b300-121's PCIe switch
+  above `mlx5_6` and two of its NVMe drives trained at Gen5 x2. RDMA now runs
+  on `mlx5_11` through `devlink ... enable_roce false` on every node (not
+  persistent across reboots) and the cluster uses two drives per node (6+2).
+  cuFile needs `CUFILE_DMABUF_ENABLE=true` (no peermem on the inbox stack).
 
-1. Rebuild on the new cluster (`cargo build --profile fast -p rustfs --features rdma,cuobject`),
-   restart with `RUSTFS_BIN=target/fast/rustfs`, re-run the verification
-   above once.
-2. Benchmark with `scripts/bench/rdma-get/bench4.sh` (variants: defaults,
-   `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=2`, `RUSTFS_CUOBJECT_INFLIGHT_WRITES=6`,
-   `RUSTFS_CUOBJECT_CHUNK_BYTES=33554432`) and add the row to the benchmark
-   record.
-3. Commit as "cuobject: write decoded bytes straight into staging (GET sink)".
+## Next steps
 
-Step 2 of zero-copy emit (the plan's item 3 proper): allocate the shard
-buffer pool from cuObject-registered memory and RDMA-write from the shard
-slots (12 writes of 4 MiB per stripe), refcounting slots until the DMA
-completes. This is also the Phase 6 arena.
-
-## Not done from the plan
-
-- 4 affinity routing and the optional Valkey hint.
-- 4b KV-cache tier with Valkey (2-3 weeks).
-- 4c code: peer circuit breaker (worst stall is 2x the RPC/write-stall budget;
-  moderate timeouts give 10.6 s), lock quorum, full-fan-out audit, capped heal.
-- 5 skipped by its gate; 6 registered cache arena; container-image track.
-- PUT pipeline throughput (0.4 GB/s single, 1.3 GB/s per node aggregate) is
-  the KV write-path ceiling, outside the GET plan.
+1. Zero-copy emit step 2 (the handoff's original item): RDMA-write straight
+   from the shard buffers. The cuObject shim registers arbitrary memory
+   (`rfs_cuobj_register(ptr, len)`), so the practical route is a registered
+   shard-buffer arena behind `ShardBufferPool` with ownership handed to the
+   sink until the DMA completes, rather than copying into staging chunks.
+   This removes the last copy per stripe (about 5 ms of one core per 48 MiB,
+   now overlapped) and is mainly a CPU-per-GiB win; it does not change the
+   stripe-level parallelism the fan-out provides.
+2. Reader setup under load: the stage summary shows `reader_setup` at 80 ms
+   per part with 16 streams (10 ms idle); profile the shard-stream open path
+   (remote opens, lock RPC) before adding more concurrency.
+3. The remaining plan items are unchanged: affinity routing (4), the KV-cache
+   tier (4b), the peer circuit breaker and lock quorum (4c), the registered
+   cache arena (6).
 
 ## Porting to an Intel cluster
 

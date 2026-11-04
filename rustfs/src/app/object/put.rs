@@ -1364,7 +1364,14 @@ impl DefaultObjectUsecase {
             preserve_etag: None,
             origin: PutObjectOrigin::S3 { req: &req, event_name },
         };
+        #[cfg_attr(
+            not(all(feature = "cuobject", target_os = "linux")),
+            allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
+        )]
         let mut committed = self.put_object_core(write, body, start_time).await?;
+        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        let _ = rdma_put;
+        #[cfg(all(feature = "cuobject", target_os = "linux"))]
         if let Some(moved) = rdma_put {
             committed
                 .put_extra_checksum_headers

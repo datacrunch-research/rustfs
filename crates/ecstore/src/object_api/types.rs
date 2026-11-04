@@ -1038,34 +1038,121 @@ impl DeleteRecoveryWorkBudget {
     }
 }
 
-/// A one-shot writer handed to the GET read pipeline through
-/// [`ObjectOptions::get_object_sink`]; the pipeline takes it exactly once.
+/// The writer a [`GetObjectSink`] hands to the read pipeline.
+pub type GetObjectSinkWriter = Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>;
+
+/// Builds the writer for one segment of a fanned-out GET: `(offset, len)` are
+/// relative to the start of the requested range, in bytes.
+pub type GetObjectSinkSegmentFactory = Arc<dyn Fn(u64, u64) -> GetObjectSinkWriter + Send + Sync + 'static>;
+
+/// A sink that can take the body as several concurrently produced segments
+/// (each written at its own offset) instead of one sequential stream.
+#[derive(Clone)]
+pub struct GetObjectSinkSegments {
+    pub factory: GetObjectSinkSegmentFactory,
+    /// Upper bound on concurrent segments; below 2 the sink is sequential.
+    pub max_segments: usize,
+    /// Smallest segment worth its own producer (rounded up to whole erasure
+    /// blocks); shorter requests stay sequential.
+    pub min_segment_bytes: u64,
+}
+
+impl std::fmt::Debug for GetObjectSinkSegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObjectSinkSegments")
+            .field("max_segments", &self.max_segments)
+            .field("min_segment_bytes", &self.min_segment_bytes)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct GetObjectSinkInner {
+    writer: Option<GetObjectSinkWriter>,
+    segments: Option<GetObjectSinkSegments>,
+    taken: bool,
+}
+
+/// A one-shot destination handed to the GET read pipeline through
+/// [`ObjectOptions::get_object_sink`]; the pipeline takes it exactly once,
+/// either as the sequential writer or (when offered and worthwhile) as a set
+/// of segment writers.
 #[derive(Clone, Default)]
 pub struct GetObjectSink {
-    writer: Arc<std::sync::Mutex<Option<Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>>>>,
+    inner: Arc<std::sync::Mutex<GetObjectSinkInner>>,
 }
 
 impl GetObjectSink {
-    pub fn new(writer: Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>) -> Self {
+    pub fn new(writer: GetObjectSinkWriter) -> Self {
         Self {
-            writer: Arc::new(std::sync::Mutex::new(Some(writer))),
+            inner: Arc::new(std::sync::Mutex::new(GetObjectSinkInner {
+                writer: Some(writer),
+                segments: None,
+                taken: false,
+            })),
         }
     }
 
-    /// Takes the writer; `None` once it has been taken (or was never set).
-    pub fn take(&self) -> Option<Box<dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'static>> {
-        self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    /// A sink that also offers segmented delivery.
+    pub fn with_segments(writer: GetObjectSinkWriter, segments: GetObjectSinkSegments) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(GetObjectSinkInner {
+                writer: Some(writer),
+                segments: Some(segments),
+                taken: false,
+            })),
+        }
     }
 
-    /// Whether the pipeline took the writer.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GetObjectSinkInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes the sequential writer; `None` once the sink has been taken in
+    /// either form (or was never set).
+    pub fn take(&self) -> Option<GetObjectSinkWriter> {
+        let mut inner = self.lock();
+        if inner.taken {
+            return None;
+        }
+        let writer = inner.writer.take()?;
+        inner.taken = true;
+        inner.segments = None;
+        Some(writer)
+    }
+
+    /// The segment offer, without taking the sink.
+    pub fn segments(&self) -> Option<GetObjectSinkSegments> {
+        let inner = self.lock();
+        if inner.taken { None } else { inner.segments.clone() }
+    }
+
+    /// Takes the sink in segmented form; `None` if no segments were offered
+    /// or the sink was already taken.
+    pub fn take_segments(&self) -> Option<GetObjectSinkSegments> {
+        let mut inner = self.lock();
+        if inner.taken {
+            return None;
+        }
+        let segments = inner.segments.take()?;
+        inner.taken = true;
+        inner.writer = None;
+        Some(segments)
+    }
+
+    /// Whether the pipeline took the sink (in either form).
     pub fn is_taken(&self) -> bool {
-        self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_none()
+        self.lock().taken
     }
 }
 
 impl std::fmt::Debug for GetObjectSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GetObjectSink").field("taken", &self.is_taken()).finish()
+        let inner = self.lock();
+        f.debug_struct("GetObjectSink")
+            .field("taken", &inner.taken)
+            .field("segments", &inner.segments)
+            .finish()
     }
 }
 

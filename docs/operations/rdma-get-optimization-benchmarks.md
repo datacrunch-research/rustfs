@@ -364,6 +364,134 @@ work (erasure encode and shard write pipelining), which is outside the GET
 plan; this phase gives the KV write path its RDMA transport and the
 cache-hit on first read.
 
+## Staging cluster port (2026-11-04): 4 x B300 on Kubernetes
+
+Cluster: `llm-inference-staging-euc1`, nodes b300-110/121/139/141 (Intel Xeon 6767P, 256 CPUs, 8 x B300, driver 580.178 open kernel modules, Ubuntu 24.04 kernel 7.0 with the inbox RDMA stack). RustFS runs as one hostNetwork, privileged pod per node (namespace `inference-rustfs-rdma`, binary and scripts on a CephFS volume), four local NVMe drives per node under `/data0X/rustfs-rdma`, EC 12+4 over 16 drives, internode transport `rdma`, cuObject enabled, same settings as Phase 3d/4 (4 MiB shards, 8 GiB internode pool, 64 MiB pipe, prefetch 2, cache with fill-on-PUT). Client: a GPU pod on b300-121 (as requested) and one on b300-110; the storage node of the client's host is the endpoint, as on the trays. Binary: HEAD `8d0b192cb` (GET sink) plus the cold-fill fix below, `fast` profile.
+
+Differences from the GB300 trays that matter for the numbers:
+
+- CPU-side RDMA NIC is an 802.3ad bond of two separate CX-7 cards (`enp83s0np0` = `mlx5_6`, `enp204s0np0` = `mlx5_11`, 400 Gb/s each). RoCE over such a bond has no hardware LAG: rdma_cm picks `mlx5_6` for the bond IP on every node, and the two port groups cannot reach each other over RoCE (`ib_write_bw` between `mlx5_6` and `mlx5_11` never completes), so every node must use the same port. `ib_write_bw` node to node: 392 Gb/s on `mlx5_11`, 59 Gb/s on `mlx5_6` whenever b300-121 is one end.
+- b300-121's PCIe switch `48:00.0` (above its `mlx5_6` and the NVMe drives at /data00 and /data01) trained at Gen5 x2 ("downgraded" in `LnkSta`), i.e. about 7.4 GB/s for that NIC and those two drives together; the other three nodes train x16 there. Until RDMA is moved to `mlx5_11` (devlink `enable_roce=false` on `pci/0000:53:00.0` on all four nodes, pending), every stripe read waits on four shards behind that link and a 121-hosted GET loops its cuObject write through it twice.
+- The cuObject client needs cuFile's dmabuf registration (`CUFILE_DMABUF_ENABLE=true`, `rdma_dev_addr_list` under `properties` in `cufile.json`): `nvidia-peermem` cannot load against the inbox `ib_core` (no peer-memory API) and the GPUs report no PCI p2pdma support. Nothing else is needed on the host.
+- b300-139 and b300-141 also serve an inference deployment (all 8 GPUs each) during these runs.
+
+Found and fixed here: with `RUSTFS_OBJECT_DATA_CACHE_MODE=fill_materialize_enabled`, a cache miss on a cacheable object (<= 64 MiB) materializes the body for the cache before replying; the GET-sink build let the sink take those bytes, the materialization came up short and the RDMA GET failed with `less data available than what was requested` (HTTP GETs were unaffected). The cold-fill producer now drops the sink and the RDMA reply is served from the materialized body, like a cache hit. Byte-exact verification after the fix (121 client): 2 GiB on 4 MiB shards into GPU, the 988 MB file into GPU and into pinned host memory, a 20 MB range, and a 48 MiB KV chunk.
+
+Results on the slow port group (before the devlink change), 110 client, best of three, defaults plus prefetch 2 (`benchk.sh`, the k8s port of `bench4.sh`):
+
+| Variant | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| GET sink + cold-fill fix, defaults (prefetch 2) | 4.36 GB/s (3.0-4.4 spread) | 0.82 GB/s | 8.51 GB/s | **14.25 GB/s** | 12.79 GB/s | 2.09 |
+| + `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT=1` | 4.31 | 0.75 | 8.37 | 13.10 | 12.73 | 2.18 |
+| + `RUSTFS_CUOBJECT_INFLIGHT_WRITES=6` | 3.18 | 0.78 | 8.32 | 13.16 | 12.47 | 2.13 |
+| + `RUSTFS_CUOBJECT_CHUNK_BYTES=33554432` | 3.52 | 0.77 | 8.35 | 13.13 | 12.48 | 2.14 |
+
+KV chunks (32 x 48 MiB, one RDMA GET at a time into GPU memory, cold = first GET after a server restart, warm = five more rounds):
+
+| Client | cold p50 | cold p99 | warm p50 | warm p99 | warm per-GET rate |
+| --- | --- | --- | --- | --- | --- |
+| b300-110 (x16 link) | 49.8 ms | 120.4 ms | 15.5 ms | 26.4 ms | 3.25 GB/s |
+| b300-121 (x2 link) | 57.9 ms | 90.5 ms | 20.2 ms | 38.9 ms | 2.49 GB/s |
+
+Reading: none of the handoff's variants moves a single stream (all within the 3.0-4.4 GB/s run-to-run spread), which is expected while the stripe loop waits on the slow link. The 16-stream host aggregate is already above the tray numbers (14.3 vs 9-11 GB/s; 400 Gb/s ports and 16 drives), while a single stream (4.4 GB/s) and the warm KV hit (15.5 ms) trail the trays (6.33 GB/s, 11 ms) because the stripe's four shards from b300-121 cross its Gen5 x2 link and all RDMA still rides `mlx5_6`. A 121-hosted single stream is lower still (2.6-3.1 GB/s), as predicted from the loopback write through the same link. The HTTP column is the direct client's boto3 reader on this pod (0.8 GB/s); a plain streaming GET from the 121 pod reached 2.0 GB/s. CPU per GiB is about twice the Grace figure and needs a per-stage look once the fabric is fixed.
+
+## Phase 5 (revisited): server-side stripe fan-out for cuObject GETs
+
+Phase 5 was skipped on the trays because a model load already ran within 20
+percent of the 100 Gb/s link through the loader; at 400 Gb/s that gate no
+longer holds, and the stage data says why a single stream stalls: one decode
+task handles one 48 MiB stripe at a time (read, verify, reconstruct, emit),
+about 11 ms per stripe at 4.4 GB/s, while 50 GB/s needs a stripe every
+millisecond. cuObject writes land at fixed client offsets, so the server can
+split one GET into erasure-block-aligned segments and decode and write them
+concurrently; only the reply waits for all of them.
+
+`RUSTFS_CUOBJECT_GET_FANOUT` (default 8; 1 = sequential) is the number of
+segments one GET may use. The sink offered to the storage layer carries a
+segment factory; the legacy duplex read path plans at most that many
+contiguous ranges cut only at block boundaries (so no stripe is read twice),
+runs one producer per segment with its own staging chunks and RDMA writes,
+and reports the first error. A GET that spans fewer than two blocks, a
+compressed or encrypted object, a part-number read, or a cache hit stays on
+the sequential path. The fan-out is also bounded by the staging chunks the
+pool can give the GET at that moment, so under load GETs fall back to fewer
+segments rather than thrash.
+
+First pass on the staging cluster (110 client, slow port group, 1 GiB staging
+pool, before the pool-wait fix), same binary with the knob at 1 as the control:
+
+| Variant | Single RDMA GET | Single HTTP GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| fan-out 1 (control) | 3.10 GB/s | 0.76 GB/s | 8.31 GB/s | 13.29 GB/s | 12.84 GB/s | 2.23 |
+| fan-out 8 | **8.79 GB/s** | 0.81 | 6.59 | 3.69 | 3.46 | 2.61 |
+| fan-out 16 | **8.90 GB/s** | 0.81 | 7.00 | 3.24 | 3.60 | 2.59 |
+
+A single stream doubles and crosses the plan's 8 GB/s target even on the slow
+port group (988 MB file: 5.2 GB/s into GPU, 6.8 GB/s into pinned host; all
+byte-exact checks pass with the fan-out). Sixteen segments bring nothing over
+eight, so the next ceiling is outside the stripe loop. The many-stream rows
+collapsed because 16 GETs x 8 segments x 3 chunks exceed the 64 chunks of the
+1 GiB pool, and a segment without a chunk re-polled in a tight loop; the fix
+parks such a segment on a waker and bounds the fan-out by the chunks the pool
+can give the GET (second pass below).
+
+Second pass (segments park on a waker when the GET has no free chunk; fan-out bounded by the chunks the pool can give the GET):
+
+| Variant | Single RDMA GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- |
+| fan-out 8, 8 GiB staging pool | 8.32 GB/s | 6.53 | 3.65 | 3.76 | 2.63 |
+| fan-out 8, 1 GiB pool (default) | 9.17 | 6.75 | 3.65 | 3.76 | 2.73 |
+| fan-out 16, 8 GiB pool | 9.29 | 6.74 | 3.68 | 3.75 | 2.75 |
+
+Same aggregate with an 8x larger pool, so the pool was not the limit. The
+stage summary of the 110 node during the 16 x 8 GiB run says what is:
+`reader_setup` ran 96 times in one 5 s window at 1,155 ms each (about 10 ms
+in a single stream) and `stripe_read` went from 4 to 20 ms. Sixteen ranged
+GETs of 512 MiB spread over four nodes used to be 4 producers per node; with
+8 segments each they became about 32, every one of them opening 16 shard
+streams per part for one or two stripes, so the setups stampede each other.
+Third pass: a segment must be at least `RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES`
+(default 192 MiB, four blocks), and a node-wide budget of extra segment
+producers (`RUSTFS_CUOBJECT_GET_FANOUT_BUDGET`, default 16) is taken without
+waiting and held for the GET, so many-stream load degrades to the sequential
+path instead of multiplying producers.
+
+### Fabric fix and two drives per node
+
+With RoCE disabled on the enp83 function of every node (`devlink dev param
+set pci/0000:53:00.0 name enable_roce value false cmode driverinit` and a
+`devlink dev reload`; `mlx5_6` still lists but rdma_cm lands on `mlx5_11`:
+`ib_write_bw -R` 121 to 110 went from 59 to 369 Gb/s; the setting does not
+survive a reboot), and the cluster rebuilt on two drives per node (/data02 and
+/data03, the x16 side on 121; 8 drives, `RUSTFS_STORAGE_CLASS_STANDARD=EC:2`,
+so 6+2 with 24 MiB blocks; objects re-uploaded), same binary as the second
+pass (fan-out 8, no budget yet), 110 client:
+
+| Variant | Single RDMA GET | 988 MB GPU / host | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | warm KV p50 | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fan-out 8, 8 drives 6+2, RDMA on the x16 ports | 7.49 GB/s (7.1-7.5) | 7.8 / 9.1 GB/s | 5.66 | **20.78 GB/s** | 20.33 | 13.2 ms | 3.07 |
+
+The many-stream aggregate rose by half once no stripe crossed the x2 link,
+even with the producer stampede still in place; the single stream is a little
+below the 16-drive run (8 drives and 24 MiB stripes mean more stripes and
+reader setups per byte).
+
+Third pass (minimum segment 192 MiB, node budget shared fairly among open
+GETs), same fabric and layout as the row above, 110 client:
+
+| Variant | Single RDMA GET | 988 MB GPU / host | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | warm KV p50 | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fan-out 8, budget 16 (defaults) | 7.18 GB/s (7.0-7.2) | 8.4 / 8.8 GB/s | 9.96 | 20.86 | 26.08 | 16.6 ms | 2.98 |
+| fan-out 8, budget 8 | 8.07 (6.7-8.1) | | **10.38** | **22.28** | **26.92** | | 2.94 |
+| fan-out 8, minimum 48 MiB, budget 64 | 8.66 (7.0-8.7) | | 7.94 | 16.82 | 16.37 | | 2.82 |
+
+The fair share restores the many-stream rows (16 x 2 GiB GPU back above the
+pre-fan-out 8.5 GB/s, 32 streams at a new high of 26-27 GB/s) while a single
+stream keeps the fan-out gain; a 48 MiB minimum with a large budget brings
+part of the stampede back. Budget 8 and 16 are within the run-to-run spread
+of each other; the defaults stay at 192 MiB and 16. The warm KV hit is still
+the sequential path (one stripe) and unchanged by the fan-out.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -380,3 +508,6 @@ cache-hit on first read.
 | 4 fill on PUT | 53c178def | first GET after PUT 11.8 ms p50 (was 36.4) | | | | |
 | 4 cuObject PUT | (put) | RDMA PUT 0.39 GB/s single, 1.35 GB/s x16 | | | | |
 | 4c one node frozen (moderate timeouts) | 53c178def | no failures; worst stall 10.6 s (25 s with defaults) | | 2 clients x 32: 17 GB/s | | |
+| staging port, GET sink + cold-fill fix (16 drives, slow port) | (this tree) | 4.36 GB/s | 0.82 GB/s | 14.25 GB/s (8 GiB, host) | 12.79 GB/s | 2.09 |
+| 5 cuObject GET fan-out 8 (16 drives, slow port) | (this tree) | **8.79 GB/s** | 0.81 GB/s | 3.69 GB/s (no budget) | 3.46 GB/s | 2.61 |
+| 5 fan-out 8 + fair-share budget (8 drives 6+2, x16 ports) | (this tree) | 7.18-8.07 GB/s | 0.82 GB/s | 20.86-22.28 GB/s | **26-27 GB/s** | 2.9 |
