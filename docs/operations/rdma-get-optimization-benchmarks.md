@@ -1045,11 +1045,15 @@ emit path, fan-out 8, `nixl-get` from the `rustfs-bench` repository):
 | 2 GiB into host memory (rail mlx5_9) | 13.6 GB/s | byte-exact |
 | 2 GiB into GPU 4 (rail mlx5_9) | 14.2 GB/s | byte-exact |
 | 4 x 2 GiB into GPU 4-7 at once, one server | 12.5-15.9 GB/s per process alone, 3-7 while all four overlap | |
-| 4 x 8 GiB into GPU 4-7 at once, one server | 7.0-8.2 GB/s per process with all four active (about 26-30 aggregate) | |
+| 4 x 8 GiB into GPU 4-7 at once, one server | 7.0-8.2 GB/s per process with all four active | |
+| 4 x 3 x 8 GiB into GPU 4-7, common start (`--start-at`), one server | **17.6 GB/s aggregate** over 5.85 s wall; per process 8.2-15.5 | |
 
 So the GPU target no longer sits at the client's root-complex ceiling and
-four GPUs at once get five times what the cuObject path gave them (5-6
-GB/s); what bounds them now is the serving node's pipeline (the same
+four GPUs at once get three times what the cuObject path gave them (5-6
+GB/s); the per-process rates of unsynchronized runs must not be summed
+(the processes overlap only partly), the synchronized aggregate of one
+server is 17.6 GB/s, the same band as its 16-32 host-stream rows. What
+bounds them now is the serving node's pipeline (the same
 staging-copy emit and per-part decode measured above), not the client or
 the fabric. The UCX inside the wheel reports no accelerated mlx5 transport
 unless `UCX_MODULE_DIR` points at the wheel's `ucx/` modules; with the
