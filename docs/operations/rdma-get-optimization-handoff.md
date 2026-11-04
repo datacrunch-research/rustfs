@@ -141,6 +141,35 @@ record for the environment, the fabric findings, and the numbers.
   writes into several GPUs through the CPU root complex are the limit, so a
   multi-GPU loader at full rate needs the GPUs' own InfiniBand NICs.
 
+## Direction: NIXL/UCX transport (branch `rainj-me/nixl-transport`)
+
+The client side of the production loader is already NIXL (SGLang
+`--load-format rdma` uses the NIXL `OBJ` plugin), but that plugin speaks the
+cuObject protocol underneath, which is IP-addressed and therefore bound to
+the CPU-side RoCE NIC and the root-complex ceiling. A NIXL transport with
+the UCX backend reaches the GPU-side InfiniBand rails without IPoIB or a
+subnet administrator: 58.8 GB/s into one GPU and 228 GB/s into four from
+one server (see the record). The move replaces `libcuobjserver` on the
+server with a NIXL agent (C API `libnixl_capi.so`, or the `nixl-sys` Rust
+binding from the NIXL repository) and the `x-amz-rdma-token` exchange with
+a NIXL one:
+
+1. Request: the client's serialized agent metadata and transfer descriptor
+   list (its registered GPU or host buffer, one or more ranges) travel in
+   headers or a small body with the GET; the reply carries the server's
+   agent metadata and the transfer result, mirroring `x-amz-rdma-reply`.
+2. Server: one NIXL agent per node with the UCX backend on every rail
+   (`UCX_NET_DEVICES`), the staging pool and shard arena registered with it,
+   and the existing sink, fan-out and segment pipeline issuing WRITE
+   transfers (batched per stripe) with completion notifications instead of
+   cuObject writes; the per-write stages stay.
+3. Client: a loader path that creates a UCX-backed NIXL agent, registers
+   the model buffer per GPU and binds to the GPU's rail; the benchmark
+   harness gets the same path. The NIXL `OBJ` plugin remains for cuObject
+   clients during the transition, selected per request by the token header.
+4. Measure: single GPU, four and eight GPUs, host memory, 16-32 streams;
+   then the CPU-side RoCE ports as two additional rails.
+
 ## Next steps
 
 1. The zero-copy (shard arena) emit path regressed in this tree: with
