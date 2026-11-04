@@ -31,8 +31,8 @@ use super::conn::{Event, RdmaConn};
 use super::error::RdmaError;
 use super::proto::{Message, WindowDescriptor};
 use crate::diagnostics::get::{
-    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FIRST_FILL, GET_STAGE_RDMA_SERVE_RESERVE, get_stage_timer,
-    record_get_stage_duration_if_enabled,
+    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FILL, GET_STAGE_RDMA_SERVE_FIRST_FILL, GET_STAGE_RDMA_SERVE_RESERVE,
+    get_stage_timer, record_get_stage_duration_if_enabled,
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -186,10 +186,12 @@ async fn push_into_window<S: ChunkSource>(
     loop {
         while !exhausted {
             let Some(index) = free.pop() else { break };
+            let fill = get_stage_timer();
             let filled = source
                 .fill(staging[index].as_mut_slice(slot_size)?)
                 .await
                 .map_err(RdmaError::Source)?;
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FILL, fill);
             record_get_stage_duration_if_enabled(
                 GET_OBJECT_PATH_RDMA_TRANSPORT,
                 GET_STAGE_RDMA_SERVE_FIRST_FILL,

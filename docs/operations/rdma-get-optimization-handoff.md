@@ -95,6 +95,17 @@ record for the environment, the fabric findings, and the numbers.
   16; pool default 64), and remote disks warm their peer when created. See
   "Reader setup: the remote open is the connection dial" in the benchmark
   record for the numbers before and after.
+- Peer chunk read-ahead: a ranged file stream queues page-cache read-ahead
+  in front of its position (`RUSTFS_OBJECT_STREAM_READ_AHEAD_BYTES`, 16
+  MiB) and reads 4 MiB per blocking call; the peer's per-chunk read fell
+  from 6.5 to 2 ms, but throughput did not move and the serving node's
+  stripe cadence stayed at 8 ms per 24 MiB stripe, so the stripe read is
+  client-side work per shard (chunk copies into the shard buffer, the
+  verification round trip) serialized on the decode task. Streaming the
+  local shards instead of the mmap copy is slower (16 GB/s at 16 streams).
+  Observed on the way: `RUSTFS_OBJECT_GET_SKIP_BITROT_VERIFY=true` makes
+  every remote shard open take 600 ms (0.95 GB/s single stream); not
+  investigated, the setting is diagnostic only.
 - Multi-GPU client: four processes into one GPU or into host memory reach
   13-17 GB/s, four processes into four GPUs 5-6 GB/s; concurrent peer-to-peer
   writes into several GPUs through the CPU root complex are the limit, so a
@@ -102,14 +113,20 @@ record for the environment, the fabric findings, and the numbers.
 
 ## Next steps
 
-1. Reader setup under load, what is left after the pool pre-warm: the
-   peer's first chunk (6.5 ms, a 4 MiB read through the file-cache-reclaiming
-   reader) and the local shard's mmap copy at open (8-11 ms for the part's
-   shard range, on a blocking task); both sit inside the quorum wait of every
-   part. A streaming local open that reads the first chunk only, and a
-   handshake that does not compete with the decode loops for the runtime
-   (dials on a dedicated thread), are the next candidates. Prefetch depth,
-   locality and lockstep settings were swept without gain (see the record).
+1. The stripe read on the serving node: 7.9 ms per 24 MiB stripe with the
+   first shard at 4.3 ms, while the peer's chunks arrive in 2 ms and local
+   shards are in memory. Per shard the decode task collects the chunks,
+   waits for the verification round trip on the blocking pool and copies 4
+   MiB into the shard buffer; the eight shard futures share one task, so
+   the copies serialize. Run each shard read of a stripe as its own task
+   (the owned-reader future already exists for the lockstep loop) so copies
+   and verification spread over the workers, then re-measure
+   `stripe_read_first_shard` and the per-segment rate (3.1 GB/s now). What
+   is left of reader setup after that: the local shard's mmap copy at open
+   (9-11 ms, blocking task) inside every part's quorum wait, and a handshake
+   that does not compete with the decode loops for the runtime (50 ms under
+   load, 10 ms idle). Prefetch depth, locality and lockstep settings were
+   swept without gain (see the record).
 2. Zero-copy write submissions are batched per stripe (scatter-gather, up to
    10 ranges per RDMA operation) and every library transfer waits on a
    channel permit (`RUSTFS_CUOBJECT_NUM_DCIS`, 128): the first zero-copy

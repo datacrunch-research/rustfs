@@ -776,9 +776,8 @@ Three findings.
   use, under the pool lock, and 108 opens waited 33 s in total behind that
   one registration (`open_reserve` 307 ms average).
 - Turning the mmap read path off on both nodes (`2srv4d-nommap` rows above)
-  did not remove `reader_mmap_copy_buffer` from the local opens and made
-  throughput worse (5.6-7.4 GB/s single, 14 GB/s at 16 streams); the setting
-  is not the lever here and the local open stays on the mmap copy.
+  made throughput worse (5.6-7.4 GB/s single, 14 GB/s at 16 streams); the
+  setting is not the lever here and the local open stays on the mmap copy.
 
 The change in this tree: the listener registers the pool on its device at
 startup; the idle pool keeps a minimum per peer
@@ -812,6 +811,41 @@ remaining 9 ms per remote open is the peer's first chunk (7.5 ms) and the
 remaining quorum wait is that plus the local mmap copy; the aggregate rows
 move little because 16 or 32 streams already overlapped the setup, and the
 deeper pool adds nothing once the minimum covers a part's burst.
+
+### Peer chunk read-ahead (2026-11-04)
+
+With the pool pre-warmed, a remote open is 9 ms of which 7.5 ms is the
+peer's first chunk: a ranged file stream reads 4 MiB chunks one after
+another through tokio's file (two 2 MiB reads per chunk, each a blocking
+round trip) with only the kernel's own read-ahead, so every chunk waits for
+its own device round trips (`serve_fill`, now timed for every chunk, 6.5 ms
+per 4 MiB; a stream delivered 600 MB/s). The ranged stream now queues
+`posix_fadvise(WILLNEED)` in front of its position
+(`RUSTFS_OBJECT_STREAM_READ_AHEAD_BYTES`, 16 MiB, topped up past the half
+mark, on the blocking pool) and hands tokio a 4 MiB read buffer.
+
+| Peer stage (avg) | read-ahead off | read-ahead 16 MiB |
+| --- | --- | --- |
+| `serve_fill` (every 4 MiB chunk) | 6.5 ms | 1.8-2.9 ms |
+| `serve_first_fill` | 6.5-7.5 ms | 2.6-4.0 ms |
+| `reader_open_stream` on the serving node | 9.3 ms | 10.1-13.8 ms (first build advised synchronously at open, 4-6 ms; now off-thread) |
+
+Throughput did not move (same build, read-ahead on vs off: single 12.2 vs
+12.5 GB/s, 16 x 2 GiB GPU 12.6 vs 11.7, 16 x 8 GiB host 21.2 vs 18.3, 32 x
+8 GiB host 19.6 vs 22.1; all within the run-to-run spread), and the stripe
+cadence on the serving node stayed at 7.9 ms per 24 MiB stripe
+(`stripe_read_first_shard` 4.3 ms, quorum 7.9 ms) with the peer's chunks
+now arriving in 2 ms. So the peer is not the limiter; the stripe read is
+client-side work per shard (chunk copies into the shard buffer and the
+bitrot verification round trip), serialized on the decode task. That is the
+next item. Byte-exact on all verify checks.
+
+Streaming the local shards too (mmap copy off, read-ahead on) is slower
+again: every local open becomes a stream (162 opens per GET, 9-10 ms each),
+the stripe read grows to 10.6-11 ms, single 10.3 GB/s, 16 x 8 GiB host 16.1,
+32 x 8 GiB host 16.8. The mmap copy front-loads a local shard's bytes into
+memory at open, which the per-stripe reads then get for free; the local
+open stays on it.
 
 ## Results by phase
 

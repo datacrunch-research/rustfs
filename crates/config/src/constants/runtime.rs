@@ -114,6 +114,14 @@ pub const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_
 pub const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: bool = false;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: bool = true;
+
+/// Bytes of page-cache read-ahead a ranged file stream keeps queued in front
+/// of its read position (`posix_fadvise(WILLNEED)`, Linux only; `0` disables).
+/// A shard stream served to a peer reads 4 MiB chunks one after another; the
+/// kernel's own read-ahead window ramps up slowly for large reads, so without
+/// this each chunk waits for its own device round trips.
+pub const ENV_OBJECT_STREAM_READ_AHEAD_BYTES: &str = "RUSTFS_OBJECT_STREAM_READ_AHEAD_BYTES";
+pub const DEFAULT_OBJECT_STREAM_READ_AHEAD_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Threshold for small object seek support in bytes.
