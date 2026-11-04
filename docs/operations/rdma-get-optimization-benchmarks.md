@@ -1057,6 +1057,32 @@ modules a concurrent four-GPU run once stalled on one transfer (not
 reproduced since), so a transfer timeout now fails such a GET instead of
 hanging it.
 
+The same transport on the CPU-side RoCE ports (RoCE re-enabled on
+53:00.0, agent on `mlx5_6,mlx5_11`, client naming both devices,
+`UCX_MAX_RMA_RAILS=2` on both ends):
+
+| GET over RoCE | rate | ports used (server `port_xmit_data`) |
+| --- | --- | --- |
+| 2 GiB into GPU 4, one port (mlx5_11) | 16.0 GB/s, byte-exact | one |
+| 2 GiB into host memory, two ports | 14.2-15.2 GB/s, byte-exact | |
+| 2 GiB into GPU 4, two ports | 15.2-15.8 GB/s, byte-exact | |
+| 8 GiB into host memory, two ports | 15.6 GB/s | **4160 MiB on mlx5_6 + 4167 MiB on mlx5_11** |
+| 8 GiB into GPU 4, two ports | 16.8 GB/s | 0 on mlx5_6, 8329 MiB on mlx5_11 |
+| 4 x 8 GiB into GPU 4-7, one or two ports | 7-17 GB/s per process | |
+
+UCX pairs the two RoCE ports correctly (port A with the peer's port A) and
+stripes large puts into host memory 50/50 across them once
+`UCX_MAX_RMA_RAILS` is 2 (its default is 1; the protocol table shows
+"ucp_put*(multi) ... 50% on mlx5_11 and 50% on mlx5_6"), but puts into CUDA
+memory stay on one lane in this UCX, so GPU targets do not gain a second
+port here. Through the root complex, the NIXL path into one GPU is 16 GB/s
+where cuObject sat at 13-14, and four GPUs over one port reach the same
+26-30 GB/s as over the GPU-side rails: the serving pipeline is the limit
+in every configuration. The server's UCX runs the `rc_verbs` transport
+(NIXL warns that accelerated mlx5 support is missing) while the client,
+from the same libraries, runs `rc_mlx5`; not yet understood, and worth
+fixing before the pipeline gets faster.
+
 One rail into one GPU delivers four times the cuObject root-complex path,
 four GPUs scale linearly (228 GB/s out of one server's host memory), and no
 subnet administrator, IPoIB address or RoCE setting is involved. UCX can
