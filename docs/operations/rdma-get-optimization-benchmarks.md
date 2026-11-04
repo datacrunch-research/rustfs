@@ -1010,6 +1010,39 @@ arena rows (13.9 GB/s single) predate the pool pre-warm, the read-ahead and
 the copy-beside-the-hash change; which of them broke the arena path is not
 yet isolated. The arena stays off by default and is the first item to fix.
 
+## NIXL/UCX on the GPU-side InfiniBand rails (2026-11-04)
+
+The cuObject path (NVIDIA `libcuobjserver` on the server, `libcuobjclient`
+or the NIXL `OBJ` plugin on the client) selects its device by IP, so it is
+confined to the CPU-side RoCE NIC, and every write into a GPU crosses the
+CPU root complex (13-14 GB/s per client, 5-6 GB/s for four GPUs at once).
+The GPU-side InfiniBand NICs (eight XDR ports per node, one on each GPU's
+PCIe switch) carry no IP: IPoIB cannot come up on this fabric because the
+subnet manager refuses the broadcast multicast join (`status -22`) and the
+subnet administrator does not answer queries at all, which also rules out
+rdma_cm on those ports. NCCL and UCX work there because they exchange
+LIDs, GIDs and queue-pair numbers out of band.
+
+NIXL 1.5.2 (`nixl-cu13` wheel, Python module `nixl_cu13`, UCX backend)
+installed on the client pod and both server pods; raw agent-to-agent
+WRITE transfers of 1 GiB, 32 per pair, server host memory to the client,
+`UCX_NET_DEVICES` pinned to the rail of the target GPU (mlx5_9/10/12/13
+for GPU 4-7), start barrier shared through `/shared`:
+
+| Transfer | per pair | aggregate |
+| --- | --- | --- |
+| one server -> GPU 4 (its rail) | 58.8 GB/s | 58.8 GB/s |
+| one server -> GPU 4, 5, 6, 7 each on its rail | 57.8-58.8 | **228 GB/s** |
+| two servers -> GPU 4-7 (two rails each) | 57.8-58.8 | 96 (start skew between the two servers; per-pair rate is the full rail) |
+| two servers -> client host memory, 8 streams over 4 rails | 43.6-55.6 | 165 |
+
+One rail into one GPU delivers four times the cuObject root-complex path,
+four GPUs scale linearly (228 GB/s out of one server's host memory), and no
+subnet administrator, IPoIB address or RoCE setting is involved. UCX can
+use the CPU-side RoCE ports the same way (devices named, GIDs exchanged
+out of band), which would also make both bonded ports usable as two rails
+once RoCE is re-enabled on 53:00.0; not yet measured.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
