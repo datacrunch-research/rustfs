@@ -734,6 +734,85 @@ path when enabled) before the RDMA write. So the remote open latency is the
 peer's first-chunk latency under load, and the local open latency is the
 mmap copy; the next row turns the mmap path off on both sides.
 
+### Reader setup: the remote open is the connection dial (2026-11-04)
+
+The "20 ms open request on the peer" conclusion above was wrong; it came from
+averages that mixed a warm pool with the first GET after a restart. Stage
+timers inside the transport (`rdma_transport` path in the stage summary:
+`dial_resolve`, `dial_setup`, `dial_establish`, `checkout_idle`,
+`open_reserve`, `open_first_event` on the client; `serve_open`,
+`serve_reserve`, `serve_first_fill` on the peer) split a remote shard open on
+the two-server cluster (fan-out 8, 2 GiB object, 108 remote opens per GET):
+
+| Stage (per remote open, avg) | first GET after restart | later GETs |
+| --- | --- | --- |
+| `dial_resolve` (address and route, blocking) | 12-25 ms | 8-12 ms |
+| `dial_setup` (queue pair, control region) | 3 ms | 3 ms |
+| `dial_establish` (connection-manager handshake) | 0.7-2.7 s | 47-57 ms (p50 57, most 20-100; 10-12 ms on an idle node) |
+| peer accept (request event to established) | up to 5 s | 5 ms p50, 11 ms p90 |
+| `open_reserve` (window slots and pool keys) | 307 ms | 0 |
+| `open_first_event` (request to first chunk landed) | | 8 ms |
+| peer `serve_open` (shard file open) | 527 ms | 0.4-0.7 ms |
+| peer `serve_first_fill` (first 4 MiB from disk) | 6 ms | 6.5 ms |
+| `reader_open_stream` (the whole open) | 1.5-2.0 s | 27-33 ms |
+| `reader_setup_wait_quorum` | 1.5-2.0 s | 39-44 ms |
+
+Three findings.
+
+- Steady state: 32-40 of the 108 opens per GET dial a fresh connection (the
+  pool held 16 idle connections per peer and a part opens 32 remote shards at
+  once: 8 segments x 4 remote shards), and a dial costs 60-70 ms on a loaded
+  node, of which the handshake itself is 50 ms (10 ms when the node is idle:
+  the connection-manager events compete with the decode loops for the
+  runtime). The peer's part is small: it opens the file in under a millisecond
+  and reads the first chunk in 6.5 ms. So the open is the dial, and the
+  quorum wait (6 of 8 shards) inherits it.
+- First GET after a restart: 32 dials start at once; the peer's accepts of 31
+  of them timed out at the 2 s connect timeout, the client saw
+  `rdma connection establishment failed` five seconds in and put the peer on
+  the 10 s TCP fallback, so the first GET ran at 0.3-0.4 GB/s. With a 15 s
+  connect timeout no dial fails but each takes 1.7-2.7 s. The same GET also
+  paid the registered pool: its 8 GiB are registered on the device at first
+  use, under the pool lock, and 108 opens waited 33 s in total behind that
+  one registration (`open_reserve` 307 ms average).
+- Turning the mmap read path off on both nodes (`2srv4d-nommap` rows above)
+  did not remove `reader_mmap_copy_buffer` from the local opens and made
+  throughput worse (5.6-7.4 GB/s single, 14 GB/s at 16 streams); the setting
+  is not the lever here and the local open stays on the mmap copy.
+
+The change in this tree: the listener registers the pool on its device at
+startup; the idle pool keeps a minimum per peer
+(`RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER`, default 16) and refills it with at
+most eight background dials whenever a stream takes a connection, remote
+disks dial that minimum when they are created, and the pool default grows
+to 64. A shard open therefore finds an idle connection unless the burst
+exceeds the pool, and a dial storm no longer forms at the first GET.
+
+With the pre-warm build (same harness, default pool 64 / minimum 16,
+connect timeout 2 s):
+
+| GET after restart | before | after |
+| --- | --- | --- |
+| first (cold pool) | 0.3-0.4 GB/s, 31 accept timeouts, TCP fallback | 6.2 GB/s, 44 dials, none failed |
+| second, third | 7.3-8.2 GB/s | 11.7-11.8 GB/s |
+| `reader_open_stream` avg (later GETs) | 27-33 ms | 9.3 ms |
+| `reader_setup_wait_quorum` avg | 39-44 ms | 15-18 ms |
+| dials inside a shard open | 32-40 per GET | 0 after the first GET (16 background refills per GET) |
+
+Benchmark rows (fan-out 8, client GPU 4, two servers with four drives):
+
+| Pool / minimum | Single RDMA GET | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- |
+| 16 / none (before) | 9.8-10.9 GB/s | 9.0 | 18-19 | 20-21 | 2.4-2.6 |
+| 64 / 16 (new defaults) | 12.0-12.7 (one round 6.2) | 12.9 | 20.4 | 22.5 | 1.86 |
+| 256 / 64 | 12.0-12.5 | 12.1 | 20.8 | 20.7 | 1.86 |
+
+Byte-exact on all verify checks (13.0 GB/s on the 2 GiB GPU GET). The
+remaining 9 ms per remote open is the peer's first chunk (7.5 ms) and the
+remaining quorum wait is that plus the local mmap copy; the aggregate rows
+move little because 16 or 32 streams already overlapped the setup, and the
+deeper pool adds nothing once the minimum covers a part's burst.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -754,3 +833,4 @@ mmap copy; the next row turns the mmap path off on both sides.
 | 5 cuObject GET fan-out 8 (16 drives, slow port) | (this tree) | **8.79 GB/s** | 0.81 GB/s | 3.69 GB/s (no budget) | 3.46 GB/s | 2.61 |
 | 5 fan-out 8 + fair-share budget (8 drives 6+2, x16 ports) | (this tree) | 7.18-8.07 GB/s | 0.82 GB/s | 20.86-22.28 GB/s | **26-27 GB/s** | 2.9 |
 | 6 zero-copy emit (shard arena), fan-out 8, client GPU on the NIC's socket | (this tree) | **13.88 GB/s** | 0.82 GB/s | 24.56 GB/s | 24.5-28 GB/s | 3.8 (1.8 sequential) |
+| 7 idle-pool pre-warm (two servers, four drives, 6+2) | (this tree) | 12.0-12.7 GB/s (first GET after restart 6.2, was 0.4) | 0.67 GB/s | 20.4 GB/s | 22.5 GB/s | 1.86 |
