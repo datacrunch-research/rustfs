@@ -740,10 +740,13 @@ impl SegmentState {
             ranges,
         };
         self.writes.push_back(tokio::spawn(async move {
-            server
+            let started = std::time::Instant::now();
+            let result = server
                 .write_to_client_sg_owned(&object, &token, remote_offset, source, shards)
                 .await
-                .map(|(moved, _shards)| (moved, None))
+                .map(|(moved, _shards)| (moved, None));
+            record_emit_write_latency(len, started.elapsed());
+            result
         }));
     }
 
@@ -762,10 +765,13 @@ impl SegmentState {
         let object = shared.object.clone();
         let token = shared.token.clone();
         self.writes.push_back(tokio::spawn(async move {
-            server
+            let started = std::time::Instant::now();
+            let result = server
                 .write_to_client_owned(&object, &token, offset, chunk)
                 .await
-                .map(|(moved, chunk)| (moved, Some(chunk)))
+                .map(|(moved, chunk)| (moved, Some(chunk)));
+            record_emit_write_latency(len as usize, started.elapsed());
+            result
         }));
     }
 
@@ -793,6 +799,27 @@ impl SegmentState {
 
 /// The writer half handed to the storage layer through the GET options (one
 /// per segment; the sequential sink is the segment at offset 0).
+/// Stage path and buckets for one zero-copy RDMA write (submit to completion),
+/// recorded through the GET stage summary so the distribution under load is
+/// visible next to the decode-loop stages.
+const EMIT_STAGE_PATH: &str = "cuobject_emit";
+
+fn record_emit_write_latency(bytes: usize, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    let bucket = match elapsed.as_millis() {
+        0..=1 => "write_le_1ms",
+        2..=5 => "write_le_5ms",
+        6..=20 => "write_le_20ms",
+        21..=50 => "write_le_50ms",
+        _ => "write_gt_50ms",
+    };
+    rustfs_io_metrics::record_get_object_stage_duration(EMIT_STAGE_PATH, "write_total", secs);
+    rustfs_io_metrics::record_get_object_stage_duration(EMIT_STAGE_PATH, bucket, secs);
+    // Bytes per write as a stage whose "duration" is the byte count, so the
+    // summary shows the average write size next to its latency.
+    rustfs_io_metrics::record_get_object_stage_duration(EMIT_STAGE_PATH, "write_bytes", bytes as f64);
+}
+
 pub(crate) struct StagingSink {
     shared: Arc<SinkShared>,
     state: Arc<std::sync::Mutex<SegmentState>>,

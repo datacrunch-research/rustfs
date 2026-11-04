@@ -125,6 +125,13 @@ record for the environment, the fabric findings, and the numbers.
   four client processes total the same); they are short ranged streams
   (512 or 256 MiB each) with one producer segment per stream, so each
   stream runs at the per-segment rate (2.7 GB/s under load) minus setup.
+- Listener drain fix: the runs that collapsed to 0.9 / 3.5 GB/s were the
+  peer's RDMA listener failing every accept after a stale event (or a failed
+  accept) cleared its edge-triggered readiness with requests still queued;
+  each request was then handled after the dialer's 2 s timeout and the
+  serving node fell back to TCP. The loop now drains everything before
+  clearing readiness. Per-write timing (`cuobject_emit` stages) shows the
+  cuObject writes complete in about 2 ms even at 32 streams.
 - KV chunks: cold and warm p50 are both 31 ms for 48 MiB; the warm GET does
   not reach the object data cache (no `body_cache` or `direct_memory`
   stages are recorded for the RDMA GETs). Finding out why is the first step
