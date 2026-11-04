@@ -143,14 +143,26 @@ record for the environment, the fabric findings, and the numbers.
 
 ## Next steps
 
-1. The KV warm hit: RDMA GETs of 48 MiB KV chunks never hit the object
+1. The zero-copy (shard arena) emit path regressed in this tree: with
+   `RUSTFS_CUOBJECT_SHARD_ARENA_BYTES` set, single GETs run at 0.3-6.6 GB/s
+   with multi-second stalls, most emits fall back to the staging copy
+   (average write 16.6 MB, not the 24 MiB stripe batch) and the per-part
+   decode grows to 58 ms, in both transfer modes; the staging path on the
+   same build does 11-13 / 19 / 20 GB/s. Suspects, in order: the copy
+   beside the hash takes the shard buffer out of the reader with
+   `std::mem::take` (an arena block leaves and returns through the blocking
+   task), the pool pre-warm (arena blocks or staging chunks waited on
+   across the segment pipeline), and the read-ahead. Instrument arena block
+   and staging chunk availability per segment and the emit decision counts,
+   then bisect those three commits on the cluster.
+2. The KV warm hit: RDMA GETs of 48 MiB KV chunks never hit the object
    data cache on the staging cluster (cold and warm p50 both 31 ms), so the
    registered cache arena (item 6 of the plan) starts with the lookup: trace
    why the cuObject GET path misses (`rustfs_object_data_cache=debug`, the
    cache plan and the cold-fill producer with the sink), then serve warm
    hits from memory registered with the cuObject server so the write goes
    straight from the cache.
-2. Per-stream rate at 16-32 streams: each stream holds one producer
+3. Per-stream rate at 16-32 streams: each stream holds one producer
    segment (budget 16 per node) and a segment decodes a 128 MiB part in 47
    ms under load, so a stream moves 2.7 GB/s at best. A larger budget (64,
    128) does not raise the node's 20 GB/s, so the shared per-node cost is
@@ -166,7 +178,7 @@ record for the environment, the fabric findings, and the numbers.
    competes with the decode loops for the runtime (50 ms under load, 10 ms
    idle). Prefetch depth, locality and lockstep settings were swept without
    gain (see the record).
-3. Zero-copy write submissions are batched per stripe (scatter-gather, up to
+4. Zero-copy write submissions are batched per stripe (scatter-gather, up to
    10 ranges per RDMA operation) and every library transfer waits on a
    channel permit (`RUSTFS_CUOBJECT_NUM_DCIS`, 128): the first zero-copy
    build issued one blocking call per 4 MiB shard with thirteen in flight per
@@ -174,11 +186,11 @@ record for the environment, the fabric findings, and the numbers.
    raised CPU per GiB (3.8 vs 2.4 s/GiB). Still open: the library's
    asynchronous mode (submit plus poll) to avoid a blocking thread per
    transfer, and the multi-GPU client numbers with the batched build.
-4. Internode zero-copy: receive remote shards straight into the arena block
+5. Internode zero-copy: receive remote shards straight into the arena block
    (register the arena with the transport's protection domain, carry the
    bitrot hash separately) and read local shards from disk into registered
    memory; a CPU-per-GiB refinement once the producer pipeline is fast.
-5. The remaining plan items are unchanged: affinity routing (4), the KV-cache
+6. The remaining plan items are unchanged: affinity routing (4), the KV-cache
    tier (4b), the peer circuit breaker and lock quorum (4c), the registered
    cache arena (6) for the warm KV hit.
 
