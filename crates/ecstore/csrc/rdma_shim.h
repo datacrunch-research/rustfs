@@ -82,6 +82,8 @@ int rfs_rdma_conn_comp_fd(const struct rfs_rdma_conn *conn);
 // Drains completion-channel events, re-arms notification, and polls the CQ.
 int rfs_rdma_conn_poll_completions(struct rfs_rdma_conn *conn, struct rfs_rdma_wc *out, int max);
 struct rfs_rdma_device *rfs_rdma_conn_device(const struct rfs_rdma_conn *conn);
+// The device a listener bound to a specific address resolved to, or NULL for a wildcard bind.
+struct rfs_rdma_device *rfs_rdma_listener_device(const struct rfs_rdma_listener *listener);
 int rfs_rdma_conn_post_recv(struct rfs_rdma_conn *conn, uint32_t lkey, uint64_t addr, uint32_t len, uint64_t wr_id);
 int rfs_rdma_conn_post_send(struct rfs_rdma_conn *conn, uint32_t lkey, uint64_t addr, uint32_t len, uint64_t wr_id);
 int rfs_rdma_conn_post_write(struct rfs_rdma_conn *conn, uint32_t lkey, uint64_t addr, uint32_t len,

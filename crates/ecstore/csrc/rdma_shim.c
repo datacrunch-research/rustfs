@@ -544,6 +544,13 @@ struct rfs_rdma_device *rfs_rdma_conn_device(const struct rfs_rdma_conn *conn) {
     return conn->device;
 }
 
+struct rfs_rdma_device *rfs_rdma_listener_device(const struct rfs_rdma_listener *listener) {
+    if (listener == NULL || listener->id == NULL || listener->id->verbs == NULL) {
+        return NULL;
+    }
+    return device_for(listener->id->verbs);
+}
+
 int rfs_rdma_conn_post_recv(struct rfs_rdma_conn *conn, uint32_t lkey, uint64_t addr, uint32_t len, uint64_t wr_id) {
     struct ibv_sge sge;
     sge.addr = addr;

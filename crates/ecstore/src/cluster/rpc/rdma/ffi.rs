@@ -86,6 +86,7 @@ unsafe extern "C" {
     fn rfs_rdma_listener_fd(listener: *const RawListener) -> c_int;
     fn rfs_rdma_listener_accept(listener: *mut RawListener, limits: *const QpLimits, out: *mut *mut RawConn) -> c_int;
     fn rfs_rdma_listener_destroy(listener: *mut RawListener);
+    fn rfs_rdma_listener_device(listener: *const RawListener) -> *mut RawDevice;
     fn rfs_rdma_client_create(
         ip: *const c_char,
         port: u16,
@@ -174,6 +175,13 @@ impl Listener {
     pub fn fd(&self) -> RawFd {
         // SAFETY: `raw` is live until `Drop`.
         unsafe { rfs_rdma_listener_fd(self.raw.as_ptr()) }
+    }
+
+    /// The device behind a listener bound to a specific address; `None` for a wildcard bind.
+    pub fn device(&self) -> Option<DeviceId> {
+        // SAFETY: `raw` is live until `Drop`; the device pointer outlives the process.
+        let device = unsafe { rfs_rdma_listener_device(self.raw.as_ptr()) };
+        (!device.is_null()).then_some(DeviceId(device as usize))
     }
 
     /// Accepts one pending connection request without blocking.

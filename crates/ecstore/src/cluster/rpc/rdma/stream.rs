@@ -30,6 +30,10 @@ use super::buffer::{RegisteredPool, Slot};
 use super::conn::{Event, RdmaConn};
 use super::error::RdmaError;
 use super::proto::{Message, WindowDescriptor};
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FIRST_FILL, GET_STAGE_RDMA_SERVE_RESERVE, get_stage_timer,
+    record_get_stage_duration_if_enabled,
+};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::future::Future;
@@ -143,6 +147,7 @@ pub async fn push_stream<S: ChunkSource>(
         conn.abort();
         return Err(RdmaError::Protocol("peer slot size is incompatible with the local pool".to_owned()));
     }
+    let stage = get_stage_timer();
     let mut staging = match pool.reserve(window.addrs.len()).await {
         Ok(staging) => staging,
         Err(error) => {
@@ -150,6 +155,7 @@ pub async fn push_stream<S: ChunkSource>(
             return Err(error);
         }
     };
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_RESERVE, stage);
     let result = push_into_window(conn, pool, stream, window, slot_size, &mut staging, source, on_progress).await;
     if result.is_err() {
         // No DMA may reference the staging slots once they return to the pool.
@@ -175,6 +181,7 @@ async fn push_into_window<S: ChunkSource>(
     let mut inflight = 0usize;
     let mut exhausted = false;
     let mut total = 0u64;
+    let mut first_fill = get_stage_timer();
 
     loop {
         while !exhausted {
@@ -183,6 +190,11 @@ async fn push_into_window<S: ChunkSource>(
                 .fill(staging[index].as_mut_slice(slot_size)?)
                 .await
                 .map_err(RdmaError::Source)?;
+            record_get_stage_duration_if_enabled(
+                GET_OBJECT_PATH_RDMA_TRANSPORT,
+                GET_STAGE_RDMA_SERVE_FIRST_FILL,
+                first_fill.take(),
+            );
             if filled < slot_size {
                 exhausted = true;
             }

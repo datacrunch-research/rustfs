@@ -62,6 +62,9 @@ fn settings() -> Arc<RdmaSettings> {
         chunk_size: 64 * 1024,
         stream_slots: 3,
         pool_bytes: 64 * 64 * 1024,
+        idle_conns_per_peer: 4,
+        // No background refills: the tests count connections and dials themselves.
+        min_idle_conns_per_peer: 0,
         fallback_tcp: true,
         connect_timeout: Duration::from_secs(2),
         stall_timeout: Duration::from_secs(5),

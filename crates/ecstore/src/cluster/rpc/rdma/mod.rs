@@ -38,10 +38,11 @@ pub use server::{RdmaBodyStream, RdmaReadRequest, RdmaReject, RdmaRequestHandler
 use crate::cluster::rpc::internode_data_transport::InternodeDataTransport;
 use rustfs_config::{
     DEFAULT_RUSTFS_RDMA_CHUNK_SIZE, DEFAULT_RUSTFS_RDMA_CONNECT_TIMEOUT_MS, DEFAULT_RUSTFS_RDMA_FALLBACK_TCP,
-    DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER, DEFAULT_RUSTFS_RDMA_POOL_BYTES, DEFAULT_RUSTFS_RDMA_PORT_OFFSET,
-    DEFAULT_RUSTFS_RDMA_STALL_TIMEOUT_SECS, DEFAULT_RUSTFS_RDMA_STREAM_SLOTS, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT,
-    ENV_RUSTFS_RDMA_CHUNK_SIZE, ENV_RUSTFS_RDMA_CONNECT_TIMEOUT_MS, ENV_RUSTFS_RDMA_FALLBACK_TCP,
-    ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER, ENV_RUSTFS_RDMA_LISTEN_ADDRS, ENV_RUSTFS_RDMA_POOL_BYTES, ENV_RUSTFS_RDMA_PORT_OFFSET,
+    DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER, DEFAULT_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER, DEFAULT_RUSTFS_RDMA_POOL_BYTES,
+    DEFAULT_RUSTFS_RDMA_PORT_OFFSET, DEFAULT_RUSTFS_RDMA_STALL_TIMEOUT_SECS, DEFAULT_RUSTFS_RDMA_STREAM_SLOTS,
+    ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_RDMA_CHUNK_SIZE, ENV_RUSTFS_RDMA_CONNECT_TIMEOUT_MS,
+    ENV_RUSTFS_RDMA_FALLBACK_TCP, ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER, ENV_RUSTFS_RDMA_LISTEN_ADDRS,
+    ENV_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER, ENV_RUSTFS_RDMA_POOL_BYTES, ENV_RUSTFS_RDMA_PORT_OFFSET,
     ENV_RUSTFS_RDMA_SERVER_ENABLE, ENV_RUSTFS_RDMA_STALL_TIMEOUT_SECS, ENV_RUSTFS_RDMA_STREAM_SLOTS,
     INTERNODE_DATA_TRANSPORT_RDMA,
 };
@@ -70,6 +71,8 @@ pub struct RdmaSettings {
     pub pool_bytes: usize,
     /// Idle connections kept per peer (`RUSTFS_RDMA_IDLE_CONNS_PER_PEER`).
     pub idle_conns_per_peer: usize,
+    /// Idle connections refilled in the background per peer (`RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER`).
+    pub min_idle_conns_per_peer: usize,
     /// Reissue a request over TCP when RDMA setup fails before any payload moved.
     pub fallback_tcp: bool,
     pub connect_timeout: Duration,
@@ -95,6 +98,16 @@ impl RdmaSettings {
                 io::ErrorKind::InvalidInput,
                 format!(
                     "{ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER}={idle_conns_per_peer} must be between 1 and {MAX_IDLE_CONNS_PER_PEER}"
+                ),
+            ));
+        }
+        let min_idle_conns_per_peer =
+            get_env_usize(ENV_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER, DEFAULT_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER);
+        if min_idle_conns_per_peer > idle_conns_per_peer {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{ENV_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER}={min_idle_conns_per_peer} must not exceed {ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER}={idle_conns_per_peer}"
                 ),
             ));
         }
@@ -151,6 +164,7 @@ impl RdmaSettings {
             stream_slots,
             pool_bytes,
             idle_conns_per_peer,
+            min_idle_conns_per_peer,
             fallback_tcp: get_env_bool(ENV_RUSTFS_RDMA_FALLBACK_TCP, DEFAULT_RUSTFS_RDMA_FALLBACK_TCP),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             stall_timeout: Duration::from_secs(stall_timeout_secs),
