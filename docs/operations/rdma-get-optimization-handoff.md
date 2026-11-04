@@ -82,8 +82,19 @@ record for the environment, the fabric findings, and the numbers.
 
 - b300-121's PCIe fault was confirmed as a hardware error; the storage
   cluster is now b300-139 and b300-141 with four drives each (6+2), client on
-  b300-110. The idle-connection pool depth (64, 256) changed nothing and the
-  dial counter stayed low, so connection dials are not the stripe-read cost.
+  b300-110.
+- Reader setup: stage timers inside the RDMA transport showed that a remote
+  shard open is the connection dial (60-70 ms on a loaded node, 50 ms of it
+  the connection-manager handshake; the peer opens the file in under a
+  millisecond), that a third of the opens per GET dialed because the pool
+  held fewer connections than a part opens at once, and that the first GET
+  after a restart lost five seconds to a 32-dial storm (31 accepts timed out,
+  the peer went to the TCP fallback) plus the lazy 8 GiB pool registration.
+  The listener now registers the pool at startup, the idle pool keeps a
+  background-refilled minimum per peer (`RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER`,
+  16; pool default 64), and remote disks warm their peer when created. See
+  "Reader setup: the remote open is the connection dial" in the benchmark
+  record for the numbers before and after.
 - Multi-GPU client: four processes into one GPU or into host memory reach
   13-17 GB/s, four processes into four GPUs 5-6 GB/s; concurrent peer-to-peer
   writes into several GPUs through the CPU root complex are the limit, so a
@@ -91,12 +102,14 @@ record for the environment, the fabric findings, and the numbers.
 
 ## Next steps
 
-1. Reader setup and stripe read under load (10 -> 80 ms per part, 4 -> 20
-   ms per stripe with 16 producers per node): profile the shard-stream open
-   path and the remote read RPC; connection dials are excluded. Also try
-   `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT` above 2 now that stripes are 24
-   MiB and buffers come from the arena (the Gen5 drives sit at a quarter of
-   their rate, a queue-depth symptom).
+1. Reader setup under load, what is left after the pool pre-warm: the
+   peer's first chunk (6.5 ms, a 4 MiB read through the file-cache-reclaiming
+   reader) and the local shard's mmap copy at open (8-11 ms for the part's
+   shard range, on a blocking task); both sit inside the quorum wait of every
+   part. A streaming local open that reads the first chunk only, and a
+   handshake that does not compete with the decode loops for the runtime
+   (dials on a dedicated thread), are the next candidates. Prefetch depth,
+   locality and lockstep settings were swept without gain (see the record).
 2. Zero-copy write submissions are batched per stripe (scatter-gather, up to
    10 ranges per RDMA operation) and every library transfer waits on a
    channel permit (`RUSTFS_CUOBJECT_NUM_DCIS`, 128): the first zero-copy
