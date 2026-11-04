@@ -99,8 +99,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    type Taken = Arc<Mutex<Vec<(usize, Range<usize>)>>>;
+
     struct Recording {
-        taken: Arc<Mutex<Vec<(usize, Range<usize>)>>>,
+        taken: Taken,
         accept: bool,
     }
 

@@ -32,6 +32,10 @@ use crate::cluster::rpc::internode_data_transport::{
     PutFileAuthWriter, ReadStreamRequest, TcpHttpInternodeDataTransport, WalkDirStreamRequest, WriteStreamRequest,
     reject_put_file_server_epoch,
 };
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_CHECKOUT_IDLE, GET_STAGE_RDMA_OPEN_FIRST_EVENT, GET_STAGE_RDMA_OPEN_RESERVE,
+    get_stage_timer, record_get_stage_duration_if_enabled,
+};
 use crate::disk::error::{DiskError, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::NsScannerCapabilityResponse;
@@ -64,6 +68,7 @@ const LOG_SUBSYSTEM_RDMA_TRANSPORT: &str = "rdma_transport";
 const EVENT_RDMA_TRANSPORT_FALLBACK: &str = "rdma_transport_fallback";
 const EVENT_RDMA_STREAM_FAILED: &str = "rdma_stream_failed";
 const EVENT_RDMA_FRESH_CONNECT: &str = "rdma_fresh_connect";
+const EVENT_RDMA_REFILL_FAILED: &str = "rdma_refill_failed";
 const FALLBACK_CLASSIFICATION: &str = "tcp_fallback";
 
 /// How long a peer stays on the TCP path after an RDMA setup failure.
@@ -75,16 +80,82 @@ struct IdlePool {
     conns: parking_lot::Mutex<HashMap<SocketAddr, Vec<(RdmaConn, Instant)>>>,
     /// Idle connections kept per peer; see `RUSTFS_RDMA_IDLE_CONNS_PER_PEER`.
     max_idle_per_peer: usize,
+    /// Idle connections refilled in the background; see `RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER`.
+    min_idle_per_peer: usize,
+    /// Refill dials in flight per peer, counted toward the minimum so a burst
+    /// of takes does not fan out into a burst of dials.
+    refilling: parking_lot::Mutex<HashMap<SocketAddr, usize>>,
     /// Connections dialed because no idle one was available (diagnostics).
     fresh_connects: std::sync::atomic::AtomicU64,
 }
 
+/// Refill dials in flight per peer at most; a dial storm makes every
+/// handshake slow (tens of parallel dials took seconds each on a busy node).
+const REFILL_DIAL_CONCURRENCY: usize = 8;
+
 impl IdlePool {
-    fn new(max_idle_per_peer: usize) -> Self {
+    fn new(max_idle_per_peer: usize, min_idle_per_peer: usize) -> Self {
+        let max_idle_per_peer = max_idle_per_peer.max(1);
         Self {
             conns: parking_lot::Mutex::new(HashMap::new()),
-            max_idle_per_peer: max_idle_per_peer.max(1),
+            max_idle_per_peer,
+            min_idle_per_peer: min_idle_per_peer.min(max_idle_per_peer),
+            refilling: parking_lot::Mutex::new(HashMap::new()),
             fresh_connects: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn idle_len(&self, addr: SocketAddr) -> usize {
+        self.conns.lock().get(&addr).map_or(0, Vec::len)
+    }
+
+    /// Idle connections missing below the minimum once in-flight refills land.
+    fn deficit(&self, addr: SocketAddr, refilling: usize) -> usize {
+        self.min_idle_per_peer
+            .saturating_sub(self.idle_len(addr).saturating_add(refilling))
+    }
+
+    /// Reserves up to `REFILL_DIAL_CONCURRENCY` refill dials for `addr` and
+    /// returns how many the caller must start; each one ends with
+    /// `continue_refill` or `release_refill`.
+    fn claim_refills(&self, addr: SocketAddr) -> usize {
+        let mut refilling = self.refilling.lock();
+        let in_flight = refilling.get(&addr).copied().unwrap_or(0);
+        let claimed = self
+            .deficit(addr, in_flight)
+            .min(REFILL_DIAL_CONCURRENCY.saturating_sub(in_flight));
+        if claimed > 0 {
+            refilling.insert(addr, in_flight + claimed);
+        }
+        claimed
+    }
+
+    /// Whether a refill dialer that just landed a connection should dial again;
+    /// releases its reservation when the minimum is covered.
+    fn continue_refill(&self, addr: SocketAddr) -> bool {
+        let mut refilling = self.refilling.lock();
+        let in_flight = refilling.get(&addr).copied().unwrap_or(0);
+        let others = in_flight.saturating_sub(1);
+        if self.deficit(addr, others) > 0 {
+            return true;
+        }
+        if others == 0 {
+            refilling.remove(&addr);
+        } else {
+            refilling.insert(addr, others);
+        }
+        false
+    }
+
+    fn release_refill(&self, addr: SocketAddr) {
+        let mut refilling = self.refilling.lock();
+        match refilling.get(&addr).copied().unwrap_or(0) {
+            0 | 1 => {
+                refilling.remove(&addr);
+            }
+            in_flight => {
+                refilling.insert(addr, in_flight - 1);
+            }
         }
     }
 
@@ -148,12 +219,12 @@ impl std::fmt::Debug for RdmaInternodeDataTransport {
 
 impl RdmaInternodeDataTransport {
     pub fn new(settings: Arc<RdmaSettings>, pool: Arc<RegisteredPool>) -> Self {
-        let idle_conns_per_peer = settings.idle_conns_per_peer;
+        let idle = IdlePool::new(settings.idle_conns_per_peer, settings.min_idle_conns_per_peer);
         Self {
             tcp: TcpHttpInternodeDataTransport,
             settings,
             pool,
-            idle: Arc::new(IdlePool::new(idle_conns_per_peer)),
+            idle: Arc::new(idle),
             resolved: parking_lot::Mutex::new(HashMap::new()),
             backoff: parking_lot::Mutex::new(HashMap::new()),
         }
@@ -198,7 +269,10 @@ impl RdmaInternodeDataTransport {
 
     async fn checkout(&self, endpoint: &str, fresh: bool) -> std::result::Result<(SocketAddr, RdmaConn), RdmaError> {
         let addr = self.resolve(endpoint).await?;
-        if !fresh && let Some(conn) = self.idle.take(addr) {
+        let idle = if fresh { None } else { self.idle.take(addr) };
+        self.refill_idle(addr);
+        if let Some(conn) = idle {
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_CHECKOUT_IDLE, get_stage_timer());
             return Ok((addr, conn));
         }
         let conn = RdmaConn::connect(addr, self.settings.connect_timeout, self.settings.qp_limits()).await?;
@@ -215,6 +289,40 @@ impl RdmaInternodeDataTransport {
             );
         }
         Ok((addr, conn))
+    }
+
+    /// Starts background dials until `addr` holds the configured minimum of
+    /// idle connections, bounded by `REFILL_DIAL_CONCURRENCY` in flight.
+    fn refill_idle(&self, addr: SocketAddr) {
+        let claimed = self.idle.claim_refills(addr);
+        for _ in 0..claimed {
+            let idle = Arc::clone(&self.idle);
+            let timeout = self.settings.connect_timeout;
+            let limits = self.settings.qp_limits();
+            tokio::spawn(async move {
+                loop {
+                    match RdmaConn::connect(addr, timeout, limits).await {
+                        Ok(conn) => idle.put(addr, conn),
+                        Err(error) => {
+                            idle.release_refill(addr);
+                            debug!(
+                                event = EVENT_RDMA_REFILL_FAILED,
+                                component = LOG_COMPONENT_INTERNODE_RPC,
+                                subsystem = LOG_SUBSYSTEM_RDMA_TRANSPORT,
+                                peer = %addr,
+                                result = "failed",
+                                error = %error,
+                                "rdma idle pool refill dial failed"
+                            );
+                            return;
+                        }
+                    }
+                    if !idle.continue_refill(addr) {
+                        return;
+                    }
+                }
+            });
+        }
     }
 
     pub(super) fn peer_backing_off(&self, endpoint: &str) -> bool {
@@ -263,6 +371,7 @@ impl RdmaInternodeDataTransport {
     async fn rdma_read(&self, request: &ReadStreamRequest, fresh: bool) -> std::result::Result<ChunkReaderBox, RdmaError> {
         let operation = INTERNODE_OPERATION_READ_FILE_STREAM;
         let (addr, mut conn) = self.checkout(&request.endpoint, fresh).await?;
+        let stage = get_stage_timer();
         let slots = match self.pool.try_reserve(self.settings.stream_slots) {
             Ok(slots) => slots,
             Err(error) => {
@@ -272,6 +381,7 @@ impl RdmaInternodeDataTransport {
         };
         let (_, rkey) = self.pool.keys_for(conn.raw())?;
         let window = window_descriptor(&slots, rkey)?;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_OPEN_RESERVE, stage);
         let op = StreamOp::Read(ReadRequest {
             disk: request.disk.clone(),
             volume: request.volume.clone(),
@@ -285,6 +395,7 @@ impl RdmaInternodeDataTransport {
         metrics.record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_RDMA);
         let started = Instant::now();
         let stall = request.stall_timeout.or(Some(self.settings.stall_timeout));
+        let stage = get_stage_timer();
         let opened = async {
             conn.send_message(&Message::Request(Box::new(StreamRequest {
                 version: RDMA_PROTOCOL_VERSION,
@@ -297,6 +408,7 @@ impl RdmaInternodeDataTransport {
             next_event_with_stall(&mut conn, stall).await
         }
         .await;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_OPEN_FIRST_EVENT, stage);
         let first = match opened {
             Ok(first) => first,
             Err(error) => {
@@ -536,6 +648,15 @@ impl InternodeDataTransport for RdmaInternodeDataTransport {
         self.read_with_fallback(request, true).await
     }
 
+    async fn warm_peer(&self, endpoint: &str) {
+        if self.peer_backing_off(endpoint) {
+            return;
+        }
+        if let Ok(addr) = self.resolve(endpoint).await {
+            self.refill_idle(addr);
+        }
+    }
+
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
         if self.peer_backing_off(&request.endpoint) {
             return self.tcp.open_write(request).await;
@@ -731,5 +852,49 @@ impl AsyncWrite for RdmaFileWriter {
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr() -> SocketAddr {
+        "10.0.0.1:10000".parse().expect("socket address")
+    }
+
+    #[test]
+    fn refill_claims_are_bounded_by_the_minimum_and_the_dial_concurrency() {
+        let pool = IdlePool::new(64, 20);
+        // The first claim starts the concurrency cap, not the whole deficit.
+        assert_eq!(pool.claim_refills(addr()), REFILL_DIAL_CONCURRENCY);
+        // In-flight dials count toward the minimum, so a second claim adds nothing.
+        assert_eq!(pool.claim_refills(addr()), 0);
+        // A failed dial frees one reservation and the next claim restarts exactly one.
+        pool.release_refill(addr());
+        assert_eq!(pool.claim_refills(addr()), 1);
+    }
+
+    #[test]
+    fn refill_dialer_stops_once_the_minimum_is_covered() {
+        let pool = IdlePool::new(64, 2);
+        assert_eq!(pool.claim_refills(addr()), 2);
+        // Two dialers in flight and nothing idle: each keeps dialing while the
+        // other alone cannot cover the minimum.
+        assert!(pool.continue_refill(addr()));
+        // With the pool still empty and one reservation left after this call,
+        // the deficit is one, so the dialer continues again.
+        assert!(pool.continue_refill(addr()));
+        let pool = IdlePool::new(64, 0);
+        assert_eq!(pool.claim_refills(addr()), 0);
+        assert!(!pool.continue_refill(addr()));
+        assert!(pool.refilling.lock().is_empty());
+    }
+
+    #[test]
+    fn minimum_never_exceeds_the_pool_size() {
+        let pool = IdlePool::new(4, 16);
+        assert_eq!(pool.min_idle_per_peer, 4);
+        assert_eq!(pool.claim_refills(addr()), 4);
     }
 }

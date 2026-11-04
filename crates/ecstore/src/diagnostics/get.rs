@@ -27,6 +27,9 @@ pub(crate) const GET_OBJECT_PATH_INLINE_DIRECT: &str = "inline_direct";
 pub(crate) const GET_OBJECT_PATH_INTERNAL_META: &str = "internal_meta";
 pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
 pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
+/// Internode RDMA transport stages; not a GET path, but summarized by the same sink.
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_OBJECT_PATH_RDMA_TRANSPORT: &str = "rdma_transport";
 pub(crate) const GET_OBJECT_PATH_SET_DISK: &str = "set_disk";
 pub(crate) const GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS: &str = "disk_data_blocks";
 pub(crate) const GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED: &str = "inline_buffered";
@@ -98,6 +101,24 @@ pub(crate) const GET_STAGE_READER_SETUP_WAIT_QUORUM: &str = "reader_setup_wait_q
 pub(crate) const GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK: &str = "reader_open_mmap_copy_fallback";
 pub(crate) const GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS: &str = "reader_open_mmap_copy_success";
 pub(crate) const GET_STAGE_READER_OPEN_STREAM: &str = "reader_open_stream";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_DIAL_RESOLVE: &str = "dial_resolve";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_DIAL_SETUP: &str = "dial_setup";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_DIAL_ESTABLISH: &str = "dial_establish";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_CHECKOUT_IDLE: &str = "checkout_idle";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_OPEN_RESERVE: &str = "open_reserve";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_OPEN_FIRST_EVENT: &str = "open_first_event";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_SERVE_OPEN: &str = "serve_open";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_SERVE_RESERVE: &str = "serve_reserve";
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) const GET_STAGE_RDMA_SERVE_FIRST_FILL: &str = "serve_first_fill";
 pub(crate) const GET_STAGE_READER_MMAP_ACCESS_CHECK: &str = "reader_mmap_access_check";
 #[cfg(unix)]
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_TASK: &str = "reader_mmap_blocking_task";
@@ -353,6 +374,12 @@ pub(crate) fn get_stage_timer_if_enabled(stage_metrics_enabled: bool) -> Option<
 }
 
 #[inline(always)]
+/// A stage start when either stage sink is on, so disabled stages cost one load.
+#[cfg(all(feature = "rdma", target_os = "linux"))]
+pub(crate) fn get_stage_timer() -> Option<Instant> {
+    (rustfs_io_metrics::get_stage_metrics_enabled() || rustfs_io_metrics::get_stage_local_summary_enabled()).then(Instant::now)
+}
+
 pub(crate) fn record_get_stage_duration_if_enabled(path: &'static str, stage: &'static str, started_at: Option<Instant>) {
     if let Some(started_at) = started_at {
         rustfs_io_metrics::record_get_object_stage_duration(path, stage, started_at.elapsed().as_secs_f64());

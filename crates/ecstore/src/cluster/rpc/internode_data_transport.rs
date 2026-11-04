@@ -293,6 +293,9 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     }
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
+    /// Prepares the transport for streams to `endpoint`, such as dialing idle
+    /// connections ahead of the first shard read; a no-op by default.
+    async fn warm_peer(&self, _endpoint: &str) {}
     async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
         Err(Error::MethodNotAllowed)
     }

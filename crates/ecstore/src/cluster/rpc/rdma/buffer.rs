@@ -127,7 +127,15 @@ impl RegisteredPool {
     /// Local and remote keys for this pool on the connection's device,
     /// registering the mapping on first use.
     pub fn keys_for(&self, conn: &Connection) -> Result<(u32, u32), RdmaError> {
-        let device = conn.device();
+        self.register_device(conn.device())
+    }
+
+    /// Registers the pool on `device` unless already done and returns its keys.
+    ///
+    /// Registering a multi-gigabyte pool pins every page and takes seconds; a
+    /// listener registers its device at startup so the first stream after a
+    /// restart does not serialize every open behind that one registration.
+    pub fn register_device(&self, device: DeviceId) -> Result<(u32, u32), RdmaError> {
         // Registration runs under the lock: a losing racer must never hand out keys of a
         // region that is deregistered when the winner's entry is kept.
         let mut regions = self.regions.lock();

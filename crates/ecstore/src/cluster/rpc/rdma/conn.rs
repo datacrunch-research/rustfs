@@ -16,6 +16,10 @@ use super::buffer::ControlRegion;
 use super::error::RdmaError;
 use super::ffi::{CmStatus, Connection, QpLimits, RawFdHandle, WC_SUCCESS, WorkCompletion, async_fd, wc_status_name};
 use super::proto::{MESSAGE_BYTES, Message};
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_DIAL_ESTABLISH, GET_STAGE_RDMA_DIAL_RESOLVE, GET_STAGE_RDMA_DIAL_SETUP,
+    get_stage_timer, record_get_stage_duration_if_enabled,
+};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -87,17 +91,23 @@ impl std::fmt::Debug for RdmaConn {
 impl RdmaConn {
     /// Connects to `peer`, bounded by `timeout` for resolution and establishment.
     pub async fn connect(peer: SocketAddr, timeout: Duration, limits: QpLimits) -> Result<Self, RdmaError> {
+        let stage = get_stage_timer();
         let raw = tokio::task::spawn_blocking(move || Connection::connect_client(peer, timeout, &limits))
             .await
             .map_err(|err| RdmaError::Protocol(format!("rdma connect task failed: {err}")))??;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_DIAL_RESOLVE, stage);
+        let stage = get_stage_timer();
         let conn = Self::new(raw)?;
         conn.raw.start_connect()?;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_DIAL_SETUP, stage);
+        let stage = get_stage_timer();
         tokio::time::timeout(timeout, conn.wait_established())
             .await
             .map_err(|_| RdmaError::ConnectTimeout {
                 peer: peer.to_string(),
                 timeout,
             })??;
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_DIAL_ESTABLISH, stage);
         Ok(conn)
     }
 

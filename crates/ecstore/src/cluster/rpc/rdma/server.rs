@@ -32,6 +32,9 @@ use super::proto::{
 };
 use super::stream::{ReaderSource, push_stream, receive_stream, window_descriptor};
 use crate::cluster::rpc::http_auth::{check_and_record_signed_rpc_nonce, tonic_rpc_auth_failure_reason, verify_rpc_signature};
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_OPEN, get_stage_timer, record_get_stage_duration_if_enabled,
+};
 use crate::disk::FileReader;
 use crate::disk::error::DiskError;
 use async_trait::async_trait;
@@ -164,6 +167,12 @@ impl RdmaServer {
         let mut bound = Vec::with_capacity(listen.len());
         for addr in listen {
             let listener = Listener::bind(*addr, LISTEN_BACKLOG)?;
+            if let Some(device) = listener.device() {
+                let pool = Arc::clone(&ctx.pool);
+                tokio::task::spawn_blocking(move || pool.register_device(device))
+                    .await
+                    .map_err(|err| RdmaError::Protocol(format!("rdma pool registration task failed: {err}")))??;
+            }
             let fd = async_fd("register listener fd", listener.fd())?;
             bound.push(BoundListener { fd, listener });
         }
@@ -454,6 +463,7 @@ async fn serve_read(
     target: String,
     window: WindowDescriptor,
 ) -> std::result::Result<Served, ServeError> {
+    let stage = get_stage_timer();
     let reader = ctx
         .handler
         .read(RdmaReadRequest {
@@ -466,6 +476,7 @@ async fn serve_read(
             target,
         })
         .await?;
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_OPEN, stage);
     let limit = if request.length == 0 { u64::MAX } else { request.length };
     let source = ReaderSource::new(reader.take(limit));
     let metrics = global_internode_metrics();

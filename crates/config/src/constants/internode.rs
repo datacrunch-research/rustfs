@@ -346,7 +346,15 @@ pub const DEFAULT_RUSTFS_RDMA_STREAM_SLOTS: usize = 4;
 /// down, so under many concurrent shard reads a small pool turns into a
 /// connect per read. Size it for the concurrent streams per peer expected.
 pub const ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: &str = "RUSTFS_RDMA_IDLE_CONNS_PER_PEER";
-pub const DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: usize = 16;
+pub const DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: usize = 64;
+
+/// Idle RDMA connections the transport keeps ready per peer. Whenever a
+/// stream takes a connection and fewer than this many remain, background
+/// dials refill the pool, so a dial (QP creation plus the connection-manager
+/// handshake, tens of milliseconds on a busy node) leaves the shard-open path.
+/// Must not exceed `RUSTFS_RDMA_IDLE_CONNS_PER_PEER`; `0` disables refills.
+pub const ENV_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER: &str = "RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER";
+pub const DEFAULT_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER: usize = 16;
 
 /// Total pinned, registered memory per process shared by all RDMA streams.
 pub const ENV_RUSTFS_RDMA_POOL_BYTES: &str = "RUSTFS_RDMA_POOL_BYTES";
