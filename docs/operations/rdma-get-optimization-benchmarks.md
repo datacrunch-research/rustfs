@@ -492,6 +492,248 @@ part of the stampede back. Budget 8 and 16 are within the run-to-run spread
 of each other; the defaults stay at 192 MiB and 16. The warm KV hit is still
 the sequential path (one stripe) and unchanged by the fan-out.
 
+## Zero-copy emit, step 2: RDMA writes straight from the shard buffers
+
+Step 1 (the GET sink) removed the duplex pipe; the decoder still copied each
+stripe into cuObject staging chunks before the RDMA write. Step 2 removes
+that copy for data shards:
+
+- The erasure read path's shard buffers are a `ShardBuf` instead of a
+  `Vec<u8>`: heap memory, or a block of a registered arena when one is
+  installed and the shard fits (`RUSTFS_CUOBJECT_SHARD_ARENA_BYTES`, default
+  0 = off; blocks of `RUSTFS_ERASURE_SHARD_BYTES`, registered with the first
+  cuObject server at startup). Shards that do not fit, reconstruction
+  scratch, and every non-cuObject path keep the heap.
+- A sink writer can carry a shard emitter. The legacy duplex producer offers
+  it to the decode loop for the whole read (task-local), and the emit stage
+  hands over any data shard that lives in the arena instead of writing its
+  bytes into the stream; the emitter RDMA-writes the shard in place, in
+  stream order with any staged bytes, and the shard buffer goes back to the
+  arena when the DMA returns. Shards that were emitted are not recycled into
+  the decoder's pool; the next stripe takes fresh arena blocks.
+- Partial shards at range edges, cache hits, compressed or encrypted objects
+  and reconstruction output still go through staging, so the path is
+  byte-exact by construction: the same bytes are sent, from a different
+  address.
+
+### Client GPU placement
+
+The 16 x 2 GiB GPU rows above (about 10 GB/s, 0.6 GB/s per stream) and the
+single-stream GPU rows were limited on the client, not in RustFS: the
+storage NIC (`mlx5_11`, PCI cc:00.0) is on NUMA node 1 while the benchmark
+allocated on GPU 0, which is on socket 0, so every RDMA write into VRAM
+crossed the UPI link as a PCIe peer-to-peer transaction. With the buffer on
+a socket-local GPU (`CUDA_VISIBLE_DEVICES=4`; `nvidia-smi topo -m` shows GPUs
+4-7 under the same socket as the NIC) and the same servers:
+
+| Client GPU | Single 2 GiB RDMA GET | 16 x 2 GiB GPU |
+| --- | --- | --- |
+| GPU 0 (other socket) | 5.4-6.8 GB/s | 8.85 GB/s |
+| GPU 4 (NIC's socket) | **10.8-10.9 GB/s** | **12.9 GB/s** |
+
+(Measured while the build pod was loading the same node; relative, not
+best-of-three.) The runners now default to the socket-local GPU; GPU rows
+below use it. A model loader should likewise register the receiving buffer on
+a GPU under the NIC's socket, or use that GPU's own NIC.
+
+### Stream sweep (fair-share budget 16, x16 ports, 2 drives per node, client GPU 4)
+
+`n` ranged RDMA GETs of one object in flight, spread over the four nodes, best
+of two (`sweep.sh`). The 8 GiB object cannot be split into fewer than four
+registrations (a cuObject registration stays under 4 GiB), so its 1- and
+2-stream points are missing.
+
+| Streams | Segments per GET (budget 16) | 8 GiB into pinned host, aggregate (per stream) | 2 GiB into GPU 4, aggregate (per stream) |
+| --- | --- | --- | --- |
+| 1 | 8 | | 9.5 GB/s (9.5) |
+| 2 | 8 | | 13.1 (6.6) |
+| 4 | 4 | 21.4 GB/s (5.4) | 14.0 (3.5) |
+| 8 | 2 | 20.8 (2.6) | 13.0 (1.6) |
+| 16 | 1 | 24.1 (1.5) | 12.6 (0.8) |
+
+The host aggregate reaches its plateau (about 21 GB/s) at four streams
+already, because the fair share keeps 16 producers per node busy from two
+streams up; the ceiling is the per-node producer pipeline (see the
+reader-setup and remote shard-read latencies under load above), not the
+client or the link. The GPU rows plateau at 13-14 GB/s for a different
+reason: the storage NIC and the GPUs are not under one PCIe switch
+(`nvidia-smi topo -m` shows `NODE`), so every RDMA write into VRAM is a
+peer-to-peer transaction through the CPU root complex, which on this platform
+tops out around that figure. Full-rate GPU-direct needs the GPU's own NIC
+(the InfiniBand HCA that shares its PCIe switch, `PXB`), which is the
+IPoIB/IB variant discussed in the handoff, not a RustFS change.
+
+Results (same binary, x16 ports, 2 drives per node 6+2 with 4 MiB shards, 110
+client on GPU 4, best of three; `RUSTFS_CUOBJECT_SHARD_ARENA_BYTES=8 GiB`
+versus 0):
+
+| Variant | Single 2 GiB RDMA GET into GPU | 988 MB GPU / host | 16 x 2 GiB GPU | 16 x 8 GiB host | 32 x 8 GiB host | warm KV p50 | CPU s/GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fan-out 8, arena off | 10.32 GB/s (9.1-10.3) | | 11.97 | 21.56 | 25.98 | | 2.43 |
+| fan-out 8, arena on | **13.88 GB/s** (10.7-13.9) | 11.5 / 12.2 GB/s | 13.0 | **24.56** | 24.46 | 15.3 ms | 3.84 |
+| fan-out 1, arena on | 5.67 (4.6-5.7) | | 12.06 | 24.91 | **27.95** | | **1.83** |
+
+Reading: zero-copy emit adds about a third to a single stream (10.3 -> 13.9
+GB/s, 6.2x the Phase 0 baseline) and a seventh to the 16-stream host
+aggregate, and all byte-exact checks pass with the arena on. The GPU
+aggregate rows stay at the client's PCIe peer-to-peer ceiling (13 GB/s, see
+above). The warm KV hit is unchanged: a cache hit is served from the object
+cache through staging, not from shard buffers (the cache arena of Phase 6).
+Two things to look at next in this path: CPU per GiB rises with arena plus
+fan-out 8 (3.8 s/GiB against 2.4) although it is lowest with arena plus
+fan-out 1 (1.8), which points at the per-shard write submissions (one
+blocking library call per 4 MiB shard instead of per 16 MiB chunk, thirteen
+in flight per segment) rather than the copy itself; and the fan-out 1 rows
+show the 32-stream aggregate highest when each GET is sequential, i.e. the
+per-node producer pipeline, not the fan-out, sets the many-stream ceiling.
+
+Found in this pass: the cuObject server library has `RUSTFS_CUOBJECT_NUM_DCIS`
+(128) channels and every blocking transfer holds one; with thirteen
+zero-copy shard writes in flight per segment, enough segments exhaust them
+and the library returns `EBUSY` (`cuobject channel alloc failed: Device or
+resource busy`), which failed the segment, cancelled its siblings and
+surfaced to the client as `Operation canceled` (41 failures on one node
+during the 32-stream rows, hidden by client retries, and a failed GET in the
+first multi-GPU run). Transfers now wait on a permit per channel instead of
+failing, and the emitter now batches a stripe's data shards into one
+scatter-gather RDMA write (the library's `getRDMABufferFromSgList`, up to 10
+ranges per operation): one library call and one channel per stripe for 6+2,
+two for 12+4, instead of one per 4 MiB shard. The multi-GPU rows below are
+from those builds.
+
+### Internode idle-connection pool depth (refuted)
+
+`RUSTFS_RDMA_IDLE_CONNS_PER_PEER` at 64 and 256 (batched zero-copy build,
+fan-out 8, 110 client) changed nothing: single stream 11.3 / 11.5 GB/s, 16 x 8
+GiB host 21.2 / 20.8 GB/s, 32 streams 24.7 / 25.3 GB/s, the same as the
+default 16 on healthy rows, and the `rdma_fresh_connect` counter stayed under
+128 dials for the whole run. The setting stays (it is the right knob for
+clusters with more producers per peer), but the stripe-read slowdown under
+load on this cluster was not connection dials.
+
+### b300-121 removed
+
+b300-121's PCIe fault was confirmed as a hardware error; several erratic rows
+in this section (a 0.95 GB/s single-stream row, 60 s stalls in the
+multi-GPU runs) line up with it holding two of every stripe's eight shards.
+From here the storage cluster is b300-139 and b300-141 with four drives each
+(8 drives, 6+2, 24 MiB stripes; objects re-uploaded) and the client stays on
+b300-110, so every GET is served by a node that is not the client's.
+
+### Two servers, four drives each (b300-139, b300-141), batched zero-copy
+
+| Metric | Value |
+| --- | --- |
+| Byte-exact checks | 5 of 5 |
+| Single 2 GiB RDMA GET into GPU 4 | 9.8 GB/s (7.9-9.8) |
+| 988 MB into GPU / pinned host | 6.6 / 7.1 GB/s |
+| 16 x 2 GiB GPU | 10.1 GB/s |
+| 16 x 8 GiB host | 18.2 GB/s |
+| 32 x 8 GiB host | 17.8 GB/s |
+| 48 MiB KV hit, cold / warm p50 | 39 / 36 ms |
+| CPU s/GiB | 1.96 |
+
+Two serving nodes instead of three or four, each also hosting a running
+inference deployment, so the aggregate rows are lower; the per-node figures
+(about 9 GB/s each) match the earlier runs.
+
+### Multi-GPU client (four processes, 2 GiB each, two servers)
+
+| Destination | Aggregate (3 rounds) |
+| --- | --- |
+| four processes, all into GPU 4 | 13.0-17.5 GB/s |
+| four processes, pinned host memory | 13.0-17.1 GB/s |
+| four processes, one into each of GPUs 4-7 | **5.2-6.3 GB/s** |
+
+Several client processes are fine and the servers are fine; concurrent
+peer-to-peer writes from the storage NIC into several GPUs (each under its
+own PCIe switch) through the CPU root complex run at a third of the
+single-GPU rate. Together with the single-GPU ceiling of 13-14 GB/s this
+means multi-GPU model loading at full rate needs each GPU's own InfiniBand
+NIC (or one landing GPU plus NVLink), not a RustFS change.
+
+Stream sweep on the two servers (`n` ranged GETs spread over 139 and 141,
+best of two; the 8 GiB object cannot be split into fewer than four
+registrations):
+
+| Streams | 8 GiB into pinned host, aggregate (per stream) | 2 GiB into GPU 4, aggregate (per stream) |
+| --- | --- | --- |
+| 1 | | 10.6 GB/s |
+| 2 | | 13.1 (6.6) |
+| 4 | 15.9 GB/s (4.0) | 11.5 (2.9) |
+| 8 | 11.9 (1.5) | 9.8 (1.2) |
+| 16 | 18.1 (1.1) | 9.3 (0.6) |
+
+With two serving nodes the host aggregate plateaus at 16-18 GB/s (about 9
+GB/s per node, as before); the GPU rows sit at the client's peer-to-peer
+ceiling.
+
+Decode-loop settings on the two servers (batched zero-copy, fan-out 8):
+
+| Variant | Single RDMA GET | 16 x 8 GiB host | 32 x 8 GiB host | CPU s/GiB |
+| --- | --- | --- | --- | --- |
+| defaults (prefetch 2) | 9.8 GB/s | 18.2 | 17.8 | 1.96 |
+| prefetch 4 | 9.1 | 16.5 | 15.2 | 1.90 |
+| prefetch 8 | 9.3 | 15.0 | 15.0 | 1.99 |
+| `RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=true` | 8.0 | 15.7 | 17.5 | 1.95 |
+| `RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE=true` | 8.0 | 16.4 | 18.1 | 1.93 |
+| prefetch 4 + locality | 10.2 | 14.4 | 15.6 | 1.95 |
+
+None of the stripe-loop knobs moves the numbers, which matches the stage
+summary: under load a producer spends about 120 ms per part in
+`reader_setup` against 6 ms per stripe read and 5 ms per emit, so the next
+work is the per-part shard-stream open, not the loop. On the two-server
+cluster the serving nodes dial hundreds of fresh internode connections per
+run (the `rdma_fresh_connect` counter on b300-139 passed 512): with one peer
+per node, 64 concurrent remote shard streams outrun 16 idle connections every
+stripe round. The earlier pool-depth test read the counter on the
+client-facing node of the four-node cluster, which did not see this.
+
+With the legacy read path now recording the reader-setup sub-stages (a
+single-stream window on b300-139, 181 stripes in 5 s):
+
+| Sub-stage (per shard open unless noted) | n | avg |
+| --- | --- | --- |
+| `reader_setup` (per part) | 53 | 48.8 ms |
+| `reader_setup_wait_quorum` (per part) | 53 | 48.7 ms |
+| `reader_task_file_open` | 318 | 30.1 ms |
+| `reader_open_stream` (remote shard) | 212 | 38.1 ms |
+| `reader_stream_first_read` (remote, after open) | 212 | 0.7 ms |
+| `reader_open_mmap_copy_success` (local shard) | 106 | 14.1 ms |
+| `reader_mmap_copy_buffer` (local, blocking copy) | 106 | 10.6 ms |
+| `stripe_read` | 181 | 8.7 ms |
+| `emit` | 181 | 4.7 ms |
+
+Two costs stand out. A remote shard open takes 38 ms while its first data
+arrives 0.7 ms later, so it is the open (connection dial and accept, request
+round trip) and not the read; and a local shard is opened through the mmap
+copy path (`RUSTFS_OBJECT_MMAP_READ_ENABLE`, default on), which copies the
+part's shard bytes into a heap buffer on a blocking task at open time, 10.6
+ms per open, before the arena ever sees them. Both are measured next
+(deeper idle pool on this cluster; mmap read off). Changing part size (96 ->
+480 MiB) did not change throughput (8.8-9.9 GB/s single, 18.7 GB/s at 16
+streams), so per-part setup is overlapped and the loop's remaining cost is
+inside these opens plus emit.
+
+Pool depth on the two servers:
+
+| `RUSTFS_RDMA_IDLE_CONNS_PER_PEER` | Single RDMA GET | 16 x 8 GiB host | 32 x 8 GiB host | remote open avg | quorum wait avg |
+| --- | --- | --- | --- | --- | --- |
+| 16 (default) | 9.8 GB/s | 18.2 | 17.8 | 38 ms | 49 ms |
+| 64 | 10.9 (9.6-10.9) | 19.0 | 20.7 | 38 ms | 49 ms |
+| 256 | 9.4 (3.9-9.4) | 18.7 | 20.2 | 20 ms | 27 ms |
+
+A deeper pool halves the remote open and the quorum wait but moves
+throughput by 5-10 percent at most, and the dial counters stay low, so the
+remaining 20 ms per remote open is the open request itself on the peer, not
+the connection. What that "open" measures, from the transport code: the
+client reserves a window, sends the stream request and waits for the first
+event, which is the first 4 MiB chunk landing; the peer meanwhile opens the
+part file and reads that chunk from its disk (through the same mmap copy
+path when enabled) before the RDMA write. So the remote open latency is the
+peer's first-chunk latency under load, and the local open latency is the
+mmap copy; the next row turns the mmap path off on both sides.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
@@ -511,3 +753,4 @@ the sequential path (one stripe) and unchanged by the fan-out.
 | staging port, GET sink + cold-fill fix (16 drives, slow port) | (this tree) | 4.36 GB/s | 0.82 GB/s | 14.25 GB/s (8 GiB, host) | 12.79 GB/s | 2.09 |
 | 5 cuObject GET fan-out 8 (16 drives, slow port) | (this tree) | **8.79 GB/s** | 0.81 GB/s | 3.69 GB/s (no budget) | 3.46 GB/s | 2.61 |
 | 5 fan-out 8 + fair-share budget (8 drives 6+2, x16 ports) | (this tree) | 7.18-8.07 GB/s | 0.82 GB/s | 20.86-22.28 GB/s | **26-27 GB/s** | 2.9 |
+| 6 zero-copy emit (shard arena), fan-out 8, client GPU on the NIC's socket | (this tree) | **13.88 GB/s** | 0.82 GB/s | 24.56 GB/s | 24.5-28 GB/s | 3.8 (1.8 sequential) |
