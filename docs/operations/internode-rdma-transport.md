@@ -28,6 +28,7 @@ Set every variable on every node and restart. Values are read once at startup.
 | `RUSTFS_RDMA_LISTEN_ADDRS` | hosts of the local endpoints | Comma-separated IP addresses to bind instead of resolving the local endpoint hosts. Use it when the RDMA NIC address differs from the endpoint host. |
 | `RUSTFS_RDMA_CHUNK_SIZE` | `1048576` | Bytes per registered slot and per RDMA write (4 KiB to 16 MiB). |
 | `RUSTFS_RDMA_STREAM_SLOTS` | `4` | Slots per stream window on each side (1 to 64). The window bounds the bytes in flight per stream. |
+| `RUSTFS_RDMA_IDLE_CONNS_PER_PEER` | `16` | Idle connections kept per peer for reuse (1 to 4096). Every shard read is one stream on its own connection; a stream that finds no idle connection dials a fresh one and a returning connection beyond this count is torn down, so size it for the concurrent streams per peer expected (`rdma_fresh_connect` debug events count the dials). |
 | `RUSTFS_RDMA_POOL_BYTES` | `268435456` | Pinned, registered memory per process shared by all streams. Must hold at least two windows. It bounds concurrent RDMA streams; a stream that cannot reserve a window falls back to TCP. |
 | `RUSTFS_RDMA_FALLBACK_TCP` | `true` | Reissue a request over `tcp-http` when RDMA setup fails before any payload byte moved. With `false` such requests fail. |
 | `RUSTFS_RDMA_CONNECT_TIMEOUT_MS` | `2000` | Address and route resolution plus connection establishment timeout. |

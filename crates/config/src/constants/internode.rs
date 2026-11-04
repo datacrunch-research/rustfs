@@ -340,6 +340,14 @@ pub const DEFAULT_RUSTFS_RDMA_CHUNK_SIZE: usize = 1024 * 1024;
 pub const ENV_RUSTFS_RDMA_STREAM_SLOTS: &str = "RUSTFS_RDMA_STREAM_SLOTS";
 pub const DEFAULT_RUSTFS_RDMA_STREAM_SLOTS: usize = 4;
 
+/// Idle RDMA connections kept per peer for reuse. Every shard read is one
+/// stream on its own connection; a stream that finds no idle connection
+/// dials a fresh one and a returning connection beyond this count is torn
+/// down, so under many concurrent shard reads a small pool turns into a
+/// connect per read. Size it for the concurrent streams per peer expected.
+pub const ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: &str = "RUSTFS_RDMA_IDLE_CONNS_PER_PEER";
+pub const DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: usize = 16;
+
 /// Total pinned, registered memory per process shared by all RDMA streams.
 pub const ENV_RUSTFS_RDMA_POOL_BYTES: &str = "RUSTFS_RDMA_POOL_BYTES";
 pub const DEFAULT_RUSTFS_RDMA_POOL_BYTES: usize = 256 * 1024 * 1024;
