@@ -4086,21 +4086,21 @@ impl DefaultObjectUsecase {
         let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         // Extra response headers beyond what `GetObjectOutput` carries.
         #[cfg_attr(
-            not(all(feature = "cuobject", target_os = "linux")),
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
             allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
         )]
         let mut extra_headers: Vec<(&'static str, String)> = Vec::new();
         #[cfg_attr(
-            not(all(feature = "cuobject", target_os = "linux")),
+            not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")),
             allow(unused_mut, reason = "mutated only by the cuObject RDMA branch")
         )]
         let mut http_content_length = response_content_length;
-        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let rdma_token = super::cuobject::rdma_token_for_request(&req.headers);
-        #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+        #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
         let rdma_token: Option<std::convert::Infallible> = None;
         let body = match rdma_token {
-            #[cfg(all(feature = "cuobject", target_os = "linux"))]
+            #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
             Some(token) => {
                 // S3-over-RDMA: the object bytes go straight into the client's
                 // registered (GPU or host) memory; the HTTP response carries no body.
@@ -4133,14 +4133,17 @@ impl DefaultObjectUsecase {
                     }
                 };
                 lifecycle.finish_ok();
-                extra_headers.push((rustfs_cuobject::RDMA_REPLY_HEADER, if rs.is_some() { "206" } else { "200" }.to_owned()));
+                extra_headers.push((
+                    crate::app::object::cuobject::RDMA_REPLY_HEADER,
+                    if rs.is_some() { "206" } else { "200" }.to_owned(),
+                ));
                 if moved > 0 {
-                    extra_headers.push((rustfs_cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
+                    extra_headers.push((crate::app::object::cuobject::RDMA_BYTES_TRANSFERRED_HEADER, moved.to_string()));
                 }
                 http_content_length = 0;
                 StreamingBlob::from(s3s::Body::empty())
             }
-            #[cfg(not(all(feature = "cuobject", target_os = "linux")))]
+            #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
             Some(never) => match never {},
             None => {
                 Self::build_get_object_body_with_cache(
@@ -4586,7 +4589,7 @@ impl DefaultObjectUsecase {
         // cuObject S3-over-RDMA: hand the storage layer a sink that writes decoded
         // bytes straight into registered staging (no pipe, no consumer copy). The
         // handle rides in the request extensions until the body is built.
-        #[cfg(all(feature = "cuobject", target_os = "linux"))]
+        #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let opts = match super::cuobject::rdma_token_for_request(&req.headers) {
             Some(token) => {
                 let handle = super::cuobject::StagingSinkHandle::new(&bucket, &key, &token).await?;

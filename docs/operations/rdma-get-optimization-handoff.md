@@ -170,6 +170,18 @@ a NIXL one:
 4. Measure: single GPU, four and eight GPUs, host memory, 16-32 streams;
    then the CPU-side RoCE ports as two additional rails.
 
+The server side of that design is in this branch: the `rustfs-nixl` crate
+(agent, UCX backend, registered staging pool and arena, the three request
+headers, WRITE and READ transfers with a timeout), selected at compile time
+by the `nixl` feature in place of cuObject behind the unchanged pipeline, and
+documented in [nixl-s3-over-rdma.md](nixl-s3-over-rdma.md). The Rust client
+`nixl-get` lives in the `rustfs-bench` repository. First results: 13.6 GB/s
+into host memory and 14.2 GB/s into GPU 4, byte-exact, and four GPUs at
+once at 26-30 GB/s from one server. Next for this path: the zero-copy emit
+(arena ranges as one scatter-gather transfer, after the arena regression is
+fixed), the per-part decode cost that now bounds every target, and the NIXL
+plugin for the loader (separate repository).
+
 ## Next steps
 
 1. The zero-copy (shard arena) emit path regressed in this tree: with
