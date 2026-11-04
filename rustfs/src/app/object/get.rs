@@ -3016,7 +3016,13 @@ impl DefaultObjectUsecase {
                     let range = range.clone();
                     let bucket = bucket.to_owned();
                     let key = key.to_owned();
-                    let opts = opts.clone();
+                    let mut opts = opts.clone();
+                    // The cold-fill producer materializes the body it reads, so it
+                    // must drain the pipeline itself: a caller sink (cuObject
+                    // S3-over-RDMA) would swallow the bytes and leave the
+                    // materialization short. The RDMA reply is then served from
+                    // the materialized body like any cache hit.
+                    opts.get_object_sink = None;
                     let object_traffic_health = object_traffic_health.as_ref().map(Arc::clone);
                     async move {
                         let producer_deadline = producer.deadline();
