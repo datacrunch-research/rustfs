@@ -177,10 +177,15 @@ by the `nixl` feature in place of cuObject behind the unchanged pipeline, and
 documented in [nixl-s3-over-rdma.md](nixl-s3-over-rdma.md). The Rust client
 `nixl-get` lives in the `rustfs-bench` repository. First results: 13.6 GB/s
 into host memory and 14.2 GB/s into GPU 4, byte-exact, and four GPUs at
-once at 26-30 GB/s from one server. Next for this path: the zero-copy emit
-(arena ranges as one scatter-gather transfer, after the arena regression is
-fixed), the per-part decode cost that now bounds every target, and the NIXL
-plugin for the loader (separate repository).
+once at 26-30 GB/s from one server. The CPU-side RoCE ports work too
+(16 GB/s into GPU 4 over one port; both ports stripe host-memory puts with
+`UCX_MAX_RMA_RAILS=2`, CUDA targets stay on one lane), so RoCE is enabled
+again on 53:00.0 on 110, 139 and 141. Next for this path: the server's UCX
+falls back to `rc_verbs` (no accelerated mlx5 transport, unlike the client
+with the same libraries), the zero-copy emit (arena ranges as one
+scatter-gather transfer, after the arena regression is fixed), the per-part
+decode cost that now bounds every target, and the NIXL plugin for the
+loader (separate repository).
 
 ## Next steps
 
