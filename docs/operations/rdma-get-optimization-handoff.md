@@ -200,6 +200,15 @@ loader (separate repository).
 
 ## Next steps
 
+0. Status 2026-11-05, evening: four servers (110, 121, 139, 141) on four
+   healthy XDR rails each, internode reads over NIXL
+   (`RUSTFS_INTERNODE_DATA_TRANSPORT=nixl`), deliver 77-87 GB/s of GETs into
+   host memory and 98-112 GB/s into GPUs from one client node; NIXL PUTs work
+   and verify but stop near 9 GB/s because shard writes between servers are
+   still TCP/HTTP. Next: NIXL internode writes, the per-part reader setup
+   and the 50 ms client-write tail; replace or recable the flapping rails
+   (110 `mlx5_8`, `mlx5_9`, `mlx5_12`; 139 `mlx5_5`, `mlx5_12`). See the
+   benchmark record, "Four servers on the GPU-side InfiniBand rails".
 0. Status 2026-11-05, end of day: the NIXL transport is byte-exact (post
    result fixed), the arena emit works again (`Erasure::decode_data` no
    longer copies complete stripes to the heap), served internode streams

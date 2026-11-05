@@ -43,6 +43,11 @@ also enabled.
 | `RUSTFS_NIXL_POOL_BYTES` | `1 GiB` | Registered staging memory. |
 | `RUSTFS_NIXL_MAX_INFLIGHT` | `256` | Transfers in flight per node. |
 | `RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS` | `60` | A transfer that has not completed by then fails the request instead of hanging it. |
+| `RUSTFS_NIXL_DEVICE_CHECK` | `true` | Check the devices at startup and leave out unhealthy ones (see below). |
+| `RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS` | `16` | Leave out a device whose link dropped this many times more since boot than the quietest device of its link layer; `0` skips this test. |
+| `RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS` | `3000` | How long the startup check watches the link counters; `0` skips the watch. |
+| `RUSTFS_INTERNODE_DATA_TRANSPORT` | `tcp-http` | `nixl` moves internode shard reads over NIXL too (see below). |
+| `RUSTFS_NIXL_INTERNODE_DEPTH` | `4` | Internode chunk requests in flight per remote shard stream. |
 
 The pipeline settings `RUSTFS_CUOBJECT_GET_FANOUT`,
 `RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES`, `RUSTFS_CUOBJECT_GET_FANOUT_BUDGET`,
@@ -64,6 +69,68 @@ transfer could not run), `x-amz-rdma-bytes-transferred`. The HTTP body is
 empty; the reply is sent after the last transfer completed, so the client may
 read its buffer as soon as the response arrives. The server never needs the
 client to load the server's metadata.
+
+## Device health check
+
+UCX keeps using a device whose link is down or flapping, and a transfer
+striped over that lane fails; NIXL then drops the whole peer. Before the
+agent is created the server reads `/sys/class/infiniband/<dev>/ports/1` for
+every device in `RUSTFS_NIXL_UCX_DEVICES` (every RDMA device on the node
+when the list is empty) and leaves out a device that
+
+1. is missing, or whose port is not `ACTIVE` with physical state `LinkUp`;
+2. runs below the best rate of the candidates of its link layer;
+3. lost its link more than `RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS` times more
+   often since boot than the quietest device of its link layer (a rail
+   that flaps every few minutes rarely drops inside a short watch, and
+   comparing with the quietest peer ignores events that hit every rail,
+   such as a switch reboot);
+4. loses its link during the watch window.
+
+One log line (`event=cuobject_service_state state=device_check`) lists the
+kept devices and every excluded one with its reason, as a warning when any
+is excluded. If no device passes, startup fails. The check runs once; a
+device that fails later stays in use until the next restart. Clients choose
+their own devices.
+
+## Internode reads over NIXL
+
+With `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl` the shard reads between servers
+also move over NIXL, so a cluster can run its whole data plane on the
+GPU-side InfiniBand rails, which have no IP addresses. The control request
+stays on the internode HTTP connection; only the data moves over the rails.
+
+- For each chunk of a remote shard stream the reading node sends a signed
+  `GET /rustfs/rpc/read_file_nixl` with the usual disk, volume, path, offset
+  and length, plus its agent name (`nixl_agent`), one buffer registered with
+  its agent (`nixl_buffer`, same format as `x-rustfs-nixl-buffer`) and the
+  SHA-256 of its agent metadata (`nixl_md`). The metadata itself travels in
+  `x-rustfs-nixl-metadata` and must hash to the signed digest, so a replayed
+  request cannot point the transfer at another endpoint.
+- The serving node reads the range with `pread` into one of its registered
+  staging chunks, writes it into the named buffer with a NIXL WRITE and
+  answers `200` with `x-rustfs-nixl-bytes` (fewer than asked means end of
+  file). The buffer reaches the decoder as a zero-copy `Bytes`.
+- `RUSTFS_NIXL_INTERNODE_DEPTH` (default `4`) chunk requests run per stream;
+  a chunk is one staging chunk (`RUSTFS_NIXL_CHUNK_BYTES`).
+- Writes, directory walks, unbounded reads and any stream whose first chunk
+  fails use TCP/HTTP, which also keeps its typed errors (file not found and
+  so on). A build without the `nixl` feature answers the route with `404`,
+  which the reader treats the same way.
+- A receive buffer whose request was abandoned (a dropped reader, chunks past
+  the end of the file) stays out of the pool for two minutes, longer than
+  the serving node's transfer timeout, because the peer may still write it.
+- Every node's agent runs NIXL's progress thread. A node that is the target
+  of RDMA writes must keep answering UCX connection handshakes and
+  keepalives even with no transfer of its own in flight; without it peers
+  declare the node dead and NIXL drops the agent ("remote agent ... was
+  disconnected after transfer request creation"). After any failed
+  transfer the server forgets the peer and reloads its metadata on the next
+  request.
+
+Rails: name every rail of the node in `RUSTFS_NIXL_UCX_DEVICES`, minus any
+that is down, and set `UCX_MAX_RMA_RAILS=8` so host-memory transfers stripe
+across them; GPU clients register only their GPU's rail.
 
 ## Implementation notes
 
