@@ -248,6 +248,10 @@ struct Landed {
     want: usize,
 }
 
+/// A positional read in flight: stream position, the slot it fills, the
+/// read's result and the fill stage timer.
+type PositionalFill = tokio::task::JoinHandle<(u64, Landed, io::Result<usize>, Option<std::time::Instant>)>;
+
 #[allow(clippy::too_many_arguments, reason = "internal engine step with one call site")]
 async fn push_positional_into_window(
     conn: &mut RdmaConn,
@@ -261,8 +265,7 @@ async fn push_positional_into_window(
 ) -> Result<u64, RdmaError> {
     let (lkey, _) = pool.keys_for(conn.raw())?;
     let mut free: Vec<usize> = (0..staging.len()).rev().collect();
-    let mut reads: FuturesUnordered<tokio::task::JoinHandle<(u64, Landed, io::Result<usize>, Option<std::time::Instant>)>> =
-        FuturesUnordered::new();
+    let mut reads: FuturesUnordered<PositionalFill> = FuturesUnordered::new();
     // Completed reads waiting for their turn, by stream position.
     let mut landed: BTreeMap<u64, Landed> = BTreeMap::new();
     let end = source.offset.saturating_add(source.length);
