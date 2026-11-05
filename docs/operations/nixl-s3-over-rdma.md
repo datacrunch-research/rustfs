@@ -37,7 +37,7 @@ also enabled.
 |---|---|---|
 | `RUSTFS_NIXL_ENABLE` | `false` | Serve requests that carry the NIXL headers over NIXL. |
 | `RUSTFS_NIXL_AGENT_NAME` | `rustfs-<first local endpoint host>` | This node's agent name; must be unique in the cluster. |
-| `RUSTFS_NIXL_UCX_DEVICES` | all devices | Comma-separated UCX device names (`mlx5_9,mlx5_10`; NIXL adds the port); pin the agent to the rails that reach the clients. |
+| `RUSTFS_NIXL_UCX_DEVICES` | all devices | Comma-separated UCX device names (`mlx5_9,mlx5_10`; NIXL adds the port); pin the agent to the rails that reach the clients. With `UCX_MAX_RMA_RAILS=2` in the server's environment, UCX stripes every write across two of these ports and the client must have registered its buffer on both of them, or the transfer fails and the GET is declined. |
 | `RUSTFS_NIXL_NUM_WORKERS` | `1` | UCX progress workers of the agent. |
 | `RUSTFS_NIXL_CHUNK_BYTES` | `16 MiB` | Staging chunk, one transfer descriptor at most. |
 | `RUSTFS_NIXL_POOL_BYTES` | `1 GiB` | Registered staging memory. |
@@ -65,16 +65,41 @@ empty; the reply is sent after the last transfer completed, so the client may
 read its buffer as soon as the response arrives. The server never needs the
 client to load the server's metadata.
 
+## Implementation notes
+
+- `Agent::post_xfer_req` in the `nixl-sys` binding returns `true` while the
+  transfer is still in progress and `false` when it completed before
+  returning. The server polls `get_xfer_status` only in the first case. The
+  opposite reading treats every transfer as complete at post time, refills
+  the staging chunk before the NIC has read it, and the client receives the
+  next chunk's bytes at the earlier offset; the reply also arrives before the
+  data. Repeated rounds of the same object hide that, so a verification run
+  uses one round into a zeroed buffer.
+- A client that never polls its agent needs NIXL's progress thread (the
+  binding's `Agent::new` enables it; `new_configured` only with
+  `enable_prog_thread`), because the server's endpoint finishes its UCX
+  connection handshake only when the client's worker progresses. Without it
+  every transfer to that client stays in progress until the timeout.
+- The binding serializes every agent call with a lock of its own; the agent
+  is nevertheless created with reader-writer synchronization so correctness
+  does not rest on that detail.
+- `nixl-reuse` in the `rustfs-bench` repository is a RustFS-free check of the
+  chunk-reuse contract: a writer fills a remote buffer from a small pool of
+  chunks, refilling each as soon as NIXL reports its transfer complete, and
+  the target verifies every word against its offset.
+
 ## Validation
 
 `nixl-get` in the `rustfs-bench` repository fetches an object into GPU or
 host memory through this contract and, with `--verify`, compares it with a
-plain HTTP GET:
+plain HTTP GET and lists which object block each wrong 1 MiB block holds.
+Verify with a single round: later rounds rewrite the same bytes and mask a
+transfer that completed early:
 
 ```bash
 export LD_LIBRARY_PATH=$NIXL_PREFIX/lib:/usr/local/cuda/lib64 NIXL_PLUGIN_DIR=$NIXL_PREFIX/lib/plugins
 nixl-get --endpoint http://10.20.9.57:9000 --bucket models --key bench/rand-2g-s4m.bin \
-  --mem gpu --gpu 4 --devices mlx5_9 --rounds 3 --verify
+  --mem gpu --gpu 4 --devices mlx5_9 --rounds 1 --verify
 ```
 
 Results on the staging cluster are in the benchmark record

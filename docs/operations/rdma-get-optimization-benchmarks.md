@@ -1012,6 +1012,13 @@ yet isolated. The arena stays off by default and is the first item to fix.
 
 ## NIXL/UCX on the GPU-side InfiniBand rails (2026-11-04)
 
+Caveat for every row in this section and the RoCE section after it: the
+server build they were taken with reported each transfer complete at post
+time (see "Transfer completion fix" below), so the reply preceded the last
+in-flight chunks and the "byte-exact" checks passed only because they ran
+three rounds of the same object. The rates are at most a few hundred MiB
+per GET optimistic; the corrected single-round numbers are in that section.
+
 The cuObject path (NVIDIA `libcuobjserver` on the server, `libcuobjclient`
 or the NIXL `OBJ` plugin on the client) selects its device by IP, so it is
 confined to the CPU-side RoCE NIC, and every write into a GPU crosses the
@@ -1093,6 +1100,49 @@ subnet administrator, IPoIB address or RoCE setting is involved. UCX can
 use the CPU-side RoCE ports the same way (devices named, GIDs exchanged
 out of band), which would also make both bonded ports usable as two rails
 once RoCE is re-enabled on 53:00.0; not yet measured.
+
+## Transfer completion fix: the NIXL post result was read inverted (2026-11-05)
+
+Single-round verification of NIXL GETs into a fresh buffer failed on every
+transport configuration (verbs and mlx5, bundled and system rdma-core, one
+or two paths, agent synchronization off, reader-writer or strict), while
+three rounds of the same object passed. The `nixl-get` provenance
+diagnostic showed each wrong 1 MiB block holding the object's data from 16,
+32 or 48 MiB later, one to three staging chunks ahead, and with the client
+registered on two RoCE ports against a one-port server half the buffer
+stayed zero. A RustFS-free harness (`nixl-reuse` in `rustfs-bench`: a writer
+fills a remote 2 GiB buffer from eight 16 MiB chunks, refilling each as soon
+as NIXL reports its transfer complete; the target checks every 8-byte word
+against its offset) reproduced it and reported 94-127 GB/s on a 400 Gb/s
+port with every transfer "completed at post". The cause is the `nixl-sys`
+binding's `post_xfer_req`, which returns `true` while the transfer is still
+in progress; the server and the harness read it as "completed" and never
+polled. With that one boolean fixed (and the harness target given NIXL's
+progress thread, which a passive client needs for the server's endpoint to
+finish its UCX handshake):
+
+| after the fix | result |
+| --- | --- |
+| `nixl-reuse`, 1 thread, 8 chunks, one RoCE port | 20.1 GB/s, every word correct, completion latency 0.35-15 ms |
+| `nixl-reuse`, 8 threads, 8 or 64 chunks | 30.7-35.4 GB/s, every word correct |
+| GET 2 GiB into host memory, one port, single round | 11.9-13.6 GB/s, byte-exact (x3) |
+| GET 2 GiB into GPU 4, one port, single round | 9.9-11.9 GB/s, byte-exact (x3) |
+| GET 2 GiB into host memory or GPU 4, server and client on both ports, single round | 10.7-12.0 GB/s, byte-exact (x4) |
+| GET 8 GiB into host memory / GPU 4, both ports, 3 rounds | 16.2 / 17.3 GB/s |
+| GET 8 GiB into GPU 4 over rail mlx5_9 | 17.3 GB/s |
+| 4 x 8 GiB into GPU 4-7 over the four rails, synchronized | 19.0 GB/s aggregate |
+| 4 x 8 GiB into GPU 4-7 over the two RoCE ports, synchronized | 9.2 GB/s aggregate (one process at 3.4) |
+
+So the pipeline numbers stand within their error (one server still delivers
+17-19 GB/s), but every earlier NIXL row was taken with replies that preceded
+the data. Two constraints surfaced on the way: with `UCX_MAX_RMA_RAILS=2`
+the server stripes each write across both ports and a client registered on
+one port fails the transfer (the GET is now declined with reply 501 instead
+of landing half a buffer), and the client's agent must run NIXL's progress
+thread. The transport-level theories tested and refuted on the way (the two
+libibverbs copies and the rdma-core 48/50 ABI skew, UCX multi-path, TX CQ
+moderation, the zero-copy threshold, protocol v1, agent synchronization,
+an endpoint warm-up read) are recorded in the harness scripts, not here.
 
 ## Results by phase
 
