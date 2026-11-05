@@ -1269,6 +1269,44 @@ emit at 0.8 ms per stripe, `reader_setup` is back to 30-33 ms per part
 Pipelining the next part's reader setup inside a segment and the fan-out
 budget are the next levers toward 80 GB/s.
 
+### Two front-end servers, both RoCE ports (2026-11-05)
+
+Clients on b300-110 split their streams round-robin over b300-139 and
+b300-141, every server and client on `mlx5_6,mlx5_11` with
+`UCX_MAX_RMA_RAILS=2`, shard arena on, page-cache reclaim off, 8 GiB
+objects, two rounds, aggregate over the window (two repetitions after a
+restart, plus one earlier run on servers that had been up for a day):
+
+| streams | one server (139) | two servers (139 + 141) |
+| --- | --- | --- |
+| 8 host | 38.6 / 39.7 GB/s (22.2 on the long-running servers) | 25.2 / 35.2 / 43.2 GB/s |
+| 16 host | 39.7 / 44.4 GB/s (21.9) | 34.8 / 50.0 / 49.2 GB/s |
+| 24 host | | 31.1 / 28.6 GB/s |
+| 8 GPU (4-7) | | 32.5 / 31.2 / 39.6 GB/s |
+
+Every single-round check through either server is byte-exact and no
+transfer timed out. Two front-ends peak at 50 GB/s but more often land
+below one server, and get worse with more streams. 32 clients exceed the
+client pod's 256 GiB memory limit (32 x 8 GiB buffers) and are killed.
+
+The client and the fabric are not the limit. `nixl-reuse` writers into the
+client's two ports move 94.0 GB/s from 139 alone, 93.7 GB/s from 141 alone
+and 48.0 + 45.8 = 93.8 GB/s from both at once (ECN marks and CNPs appear,
+throughput holds).
+
+The likely cause is rail imbalance on the servers. UCX stripes each client
+write 50/50 over the two ports and the write completes when its slower half
+lands, but the internode shard traffic (rdma_cm on the bond IP) uses
+`mlx5_11` only. With two front-ends every node sends its peer half the data
+shards over `mlx5_11` on top of its share of client writes: during a 16-stream
+run 139 sent 118.7 GB on `mlx5_11` and 69.8 GB on `mlx5_6`, 141 sent 168.2 GB
+and 69.8 GB. With one front-end, 139's `mlx5_11` carries only client writes
+(the internode traffic arrives on it) and the two halves stay even. The
+two-server runs also show 12-20% of NIXL writes over 50 ms against 3% with
+one server. Next: put the internode transport on both ports or on the
+port the client stripe uses less, or weight the client stripe, and rerun
+this table.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
