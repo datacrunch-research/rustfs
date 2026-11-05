@@ -1253,6 +1253,22 @@ to let the request task drop its arena blocks while the NIC could still
 read them; the buffers now travel with the transfer on the completion
 thread and stay there until the library completes it.
 
+Full matrix with that build (8 GiB objects, two rounds, aggregate over the
+window, no transfer timeout in either variant):
+
+| server ports | 1 stream | 4 | 8 | 16 | 4 GPU | 8 GPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| one (`mlx5_11`) | 28.1 GB/s (31.7 last round) | 28.2 | 37.6 | 39.4 | 25.5 | 35.2 |
+| two (`mlx5_6,mlx5_11`, `UCX_MAX_RMA_RAILS=2`, clients on both) | 30.7 | 28.3 | 36.7 | 36.2 | 25.0 | 35.0 |
+
+One port is at the 40 GB/s goal with 16 streams; the second port adds
+nothing because the serving pipeline, not the NIC, is the limit: with the
+emit at 0.8 ms per stripe, `reader_setup` is back to 30-33 ms per part
+(the part's readers open while the previous part is already done) and
+`stripe_read` 5.8-6.0 ms, and 946 of 30780 writes still take over 50 ms.
+Pipelining the next part's reader setup inside a segment and the fan-out
+budget are the next levers toward 80 GB/s.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
