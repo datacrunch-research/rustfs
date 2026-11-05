@@ -35,7 +35,9 @@ use crate::diagnostics::get::{
     get_stage_timer, record_get_stage_duration_if_enabled,
 };
 use bytes::Bytes;
+use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
@@ -163,6 +165,211 @@ pub async fn push_stream<S: ChunkSource>(
     }
     drop(staging);
     result
+}
+
+/// A file the server reads positionally: every free slot of the peer's window
+/// is filled by its own blocking `pread`, so the reads of one stream overlap
+/// each other and the RDMA writes instead of running one at a time through
+/// an `AsyncRead`.
+pub struct PositionalRead {
+    pub file: Arc<std::fs::File>,
+    /// First byte to serve.
+    pub offset: u64,
+    /// Bytes to serve at most; a shorter file ends the stream early.
+    pub length: u64,
+}
+
+/// A slot's memory handed to a blocking read. The slot stays reserved and is
+/// touched by nothing else until the read's result has been consumed.
+struct SlotTarget(*mut u8, usize);
+
+// SAFETY: the pointer addresses registered pool memory that outlives the
+// stream, and the serve loop gives each slot to one read at a time.
+#[allow(unsafe_code)]
+unsafe impl Send for SlotTarget {}
+
+#[allow(unsafe_code)]
+fn read_slot_at(file: &std::fs::File, target: SlotTarget, pos: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    // SAFETY: see `SlotTarget`; `len` is within the slot.
+    let dst = unsafe { std::slice::from_raw_parts_mut(target.0, target.1) };
+    let mut filled = 0;
+    while filled < dst.len() {
+        let read = file.read_at(&mut dst[filled..], pos + filled as u64)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
+/// `push_stream` for a positional source: reads for every free slot run
+/// concurrently on the blocking pool, and the landed chunks are announced in
+/// offset order because the peer consumes them in message order.
+pub async fn push_positional(
+    conn: &mut RdmaConn,
+    pool: &Arc<RegisteredPool>,
+    stream: u64,
+    window: &WindowDescriptor,
+    source: PositionalRead,
+    on_progress: impl FnMut(usize),
+) -> Result<u64, RdmaError> {
+    if window.addrs.is_empty() || window.addrs.len() > usize::from(u16::MAX) {
+        conn.abort();
+        return Err(RdmaError::Protocol("peer window has an invalid slot count".to_owned()));
+    }
+    let slot_size = usize::try_from(window.slot_size).unwrap_or(usize::MAX);
+    if slot_size == 0 || slot_size > pool.chunk_size() {
+        conn.abort();
+        return Err(RdmaError::Protocol("peer slot size is incompatible with the local pool".to_owned()));
+    }
+    let stage = get_stage_timer();
+    let mut staging = match pool.reserve(window.addrs.len()).await {
+        Ok(staging) => staging,
+        Err(error) => {
+            conn.abort();
+            return Err(error);
+        }
+    };
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_RESERVE, stage);
+    let result = push_positional_into_window(conn, pool, stream, window, slot_size, &mut staging, source, on_progress).await;
+    if result.is_err() {
+        // No DMA may reference the staging slots once they return to the pool.
+        conn.abort();
+    }
+    drop(staging);
+    result
+}
+
+struct Landed {
+    index: usize,
+    filled: usize,
+    want: usize,
+}
+
+#[allow(clippy::too_many_arguments, reason = "internal engine step with one call site")]
+async fn push_positional_into_window(
+    conn: &mut RdmaConn,
+    pool: &Arc<RegisteredPool>,
+    stream: u64,
+    window: &WindowDescriptor,
+    slot_size: usize,
+    staging: &mut [Slot],
+    source: PositionalRead,
+    mut on_progress: impl FnMut(usize),
+) -> Result<u64, RdmaError> {
+    let (lkey, _) = pool.keys_for(conn.raw())?;
+    let mut free: Vec<usize> = (0..staging.len()).rev().collect();
+    let mut reads: FuturesUnordered<tokio::task::JoinHandle<(u64, Landed, io::Result<usize>, Option<std::time::Instant>)>> =
+        FuturesUnordered::new();
+    // Completed reads waiting for their turn, by stream position.
+    let mut landed: BTreeMap<u64, Landed> = BTreeMap::new();
+    let end = source.offset.saturating_add(source.length);
+    let mut next_read = source.offset;
+    let mut next_send = source.offset;
+    let mut inflight = 0usize;
+    let mut exhausted = next_read >= end;
+    let mut total = 0u64;
+    let mut first_fill = get_stage_timer();
+
+    loop {
+        while !exhausted {
+            let Some(index) = free.pop() else { break };
+            let want = usize::try_from(end - next_read).unwrap_or(usize::MAX).min(slot_size);
+            let pos = next_read;
+            next_read += want as u64;
+            if next_read >= end {
+                exhausted = true;
+            }
+            let target = {
+                let slice = staging[index].as_mut_slice(want)?;
+                SlotTarget(slice.as_mut_ptr(), slice.len())
+            };
+            let file = Arc::clone(&source.file);
+            let fill = get_stage_timer();
+            reads.push(tokio::task::spawn_blocking(move || {
+                let result = read_slot_at(&file, target, pos);
+                (pos, Landed { index, filled: 0, want }, result, fill)
+            }));
+        }
+
+        // Announce landed chunks in stream order.
+        while let Some(entry) = landed.first_entry()
+            && *entry.key() == next_send
+        {
+            let (pos, chunk) = entry.remove_entry();
+            if chunk.filled == 0 {
+                free.push(chunk.index);
+                exhausted = true;
+                landed.clear();
+                break;
+            }
+            conn.post_write(
+                lkey,
+                staging[chunk.index].addr(),
+                chunk.filled,
+                window.addrs[chunk.index],
+                window.rkey,
+                chunk.index as u64,
+            )?;
+            conn.send_message(&Message::Data {
+                stream,
+                slot: u16::try_from(chunk.index).map_err(|_| RdmaError::Protocol("slot index overflow".to_owned()))?,
+                len: u32::try_from(chunk.filled).map_err(|_| RdmaError::Protocol("chunk length overflow".to_owned()))?,
+            })
+            .await?;
+            inflight += 1;
+            total += chunk.filled as u64;
+            on_progress(chunk.filled);
+            next_send = pos + chunk.filled as u64;
+            if chunk.filled < chunk.want {
+                // The file ended early: later reads (if any) hold nothing to send.
+                exhausted = true;
+                landed.clear();
+                break;
+            }
+        }
+
+        if exhausted && reads.is_empty() && landed.is_empty() && inflight == 0 {
+            // Every write was credited back, so no staging slot is referenced by the device.
+            conn.send_message(&Message::Eof { stream, total }).await?;
+            return Ok(total);
+        }
+
+        tokio::select! {
+            biased;
+            Some(joined) = reads.next(), if !reads.is_empty() => {
+                let (pos, mut chunk, result, fill) =
+                    joined.map_err(|error| RdmaError::Source(io::Error::other(error)))?;
+                record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FILL, fill);
+                record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_FIRST_FILL, first_fill.take());
+                chunk.filled = result.map_err(RdmaError::Source)?;
+                if exhausted && pos >= next_send && landed.is_empty() && chunk.filled == 0 {
+                    free.push(chunk.index);
+                    continue;
+                }
+                landed.insert(pos, chunk);
+            }
+            event = conn.next_event() => {
+                match event? {
+                    Event::Message(Message::Credit { stream: credited, slot }) if credited == stream => {
+                        let slot = usize::from(slot);
+                        if slot >= staging.len() || free.contains(&slot) {
+                            return Err(RdmaError::Protocol("peer credited an unknown or idle slot".to_owned()));
+                        }
+                        free.push(slot);
+                        inflight = inflight.saturating_sub(1);
+                    }
+                    Event::Message(Message::Error { stream: failed, code, message }) if failed == stream => {
+                        return Err(RdmaError::Remote { code, message });
+                    }
+                    Event::Message(other) => debug!(stream, got = other.stream(), "ignoring stale rdma control message"),
+                    Event::WriteDone => {}
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, reason = "internal engine step with one call site")]

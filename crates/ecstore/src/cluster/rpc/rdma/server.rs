@@ -30,7 +30,7 @@ use super::proto::{
     Auth, ErrorCode, Message, RDMA_PROTOCOL_VERSION, RDMA_PUT_FILE_STREAM_PATH, ReadRequest, StreamOp, StreamRequest,
     WindowDescriptor, WriteRequest,
 };
-use super::stream::{ReaderSource, push_stream, receive_stream, window_descriptor};
+use super::stream::{PositionalRead, ReaderSource, push_positional, push_stream, receive_stream, window_descriptor};
 use crate::cluster::rpc::http_auth::{check_and_record_signed_rpc_nonce, tonic_rpc_auth_failure_reason, verify_rpc_signature};
 use crate::diagnostics::get::{
     GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_OPEN, get_stage_timer, record_get_stage_duration_if_enabled,
@@ -122,6 +122,11 @@ impl RdmaReject {
 #[async_trait]
 pub trait RdmaRequestHandler: Send + Sync + 'static {
     async fn read(&self, request: RdmaReadRequest) -> std::result::Result<FileReader, RdmaReject>;
+    /// The file behind `request` for positional, concurrent reads; `None`
+    /// serves the request through `read` one chunk at a time.
+    async fn read_positional(&self, _request: &RdmaReadRequest) -> std::result::Result<Option<PositionalRead>, RdmaReject> {
+        Ok(None)
+    }
     async fn write(&self, request: RdmaWriteRequest, body: RdmaBodyStream) -> std::result::Result<u64, RdmaReject>;
 }
 
@@ -475,22 +480,32 @@ async fn serve_read(
     window: WindowDescriptor,
 ) -> std::result::Result<Served, ServeError> {
     let stage = get_stage_timer();
-    let reader = ctx
-        .handler
-        .read(RdmaReadRequest {
-            disk: request.disk,
-            volume: request.volume,
-            path: request.path,
-            offset: request.offset,
-            length: request.length,
-            background,
-            target,
+    let request = RdmaReadRequest {
+        disk: request.disk,
+        volume: request.volume,
+        path: request.path,
+        offset: request.offset,
+        length: request.length,
+        background,
+        target,
+    };
+    let metrics = global_internode_metrics();
+    if let Some(positional) = ctx.handler.read_positional(&request).await? {
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_OPEN, stage);
+        push_positional(conn, &ctx.pool, stream, &window, positional, |bytes| {
+            metrics.record_sent_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_READ_FILE_STREAM,
+                INTERNODE_TRANSPORT_BACKEND_RDMA,
+                bytes,
+            );
         })
         .await?;
+        return Ok(Served::Read);
+    }
+    let reader = ctx.handler.read(request.clone()).await?;
     record_get_stage_duration_if_enabled(GET_OBJECT_PATH_RDMA_TRANSPORT, GET_STAGE_RDMA_SERVE_OPEN, stage);
     let limit = if request.length == 0 { u64::MAX } else { request.length };
     let source = ReaderSource::new(reader.take(limit));
-    let metrics = global_internode_metrics();
     push_stream(conn, &ctx.pool, stream, &window, source, |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_READ_FILE_STREAM,

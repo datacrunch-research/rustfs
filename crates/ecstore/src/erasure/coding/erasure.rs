@@ -297,6 +297,12 @@ impl LegacyReedSolomonEncoder {
         if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
             return Ok(());
         }
+        // Every data shard present: nothing to rebuild. The conversions
+        // below would copy each shard out of its arena block and hand back
+        // heap buffers, which also defeats the zero-copy emit.
+        if shards.iter().take(self.data_shards).all(Option::is_some) {
+            return Ok(());
+        }
 
         let shard_len = shards
             .iter()
@@ -474,6 +480,12 @@ impl ReedSolomonEncoder {
     /// Reconstruct missing data shards.
     pub fn reconstruct_data<S: ShardBytes>(&self, shards: &mut [Option<S>]) -> io::Result<()> {
         if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
+            return Ok(());
+        }
+        // Every data shard present: nothing to rebuild. The conversions
+        // below would copy each shard out of its arena block and hand back
+        // heap buffers, which also defeats the zero-copy emit.
+        if shards.iter().take(self.data_shards).all(Option::is_some) {
             return Ok(());
         }
 

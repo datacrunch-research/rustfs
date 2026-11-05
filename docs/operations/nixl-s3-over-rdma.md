@@ -83,6 +83,13 @@ client to load the server's metadata.
 - The binding serializes every agent call with a lock of its own; the agent
   is nevertheless created with reader-writer synchronization so correctness
   does not rest on that detail.
+- Transfers are posted and polled by one completion thread (`nixl-xfer`);
+  request tasks wait on a oneshot. The binding takes a process-wide lock on
+  every agent call, and hundreds of tasks each spinning on their own
+  transfer's status made that lock a convoy.
+- Keep the page cache for served shards (`RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE=false`)
+  and size the staging pool for the load (`RUSTFS_NIXL_POOL_BYTES`, 8 GiB
+  for 16 concurrent streams); the benchmark record lists the sweep.
 - `nixl-reuse` in the `rustfs-bench` repository is a RustFS-free check of the
   chunk-reuse contract: a writer fills a remote buffer from a small pool of
   chunks, refilling each as soon as NIXL reports its transfer complete, and

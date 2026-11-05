@@ -1144,6 +1144,115 @@ libibverbs copies and the rdma-core 48/50 ABI skew, UCX multi-path, TX CQ
 moderation, the zero-copy threshold, protocol v1, agent synchronization,
 an endpoint warm-up read) are recorded in the harness scripts, not here.
 
+## Where the corrected pipeline spends its time (2026-11-05)
+
+With real completions, one server on one RoCE port (`mlx5_11`) serves 2 GiB
+GETs at 12-15 GB/s and 8-16 concurrent 8 GiB host-memory streams at 17-20
+GB/s aggregate (total bytes over the window from the first start to the
+last end); two ports give 19-23 GB/s. The standalone `nixl-reuse` writer
+moves 35 GB/s over the same port from one process, so the serving pipeline
+is the limit, as before. Environment sweeps on the one-port, 8-stream row,
+each a restart with the previous winners kept:
+
+| change | 8 x 2 GiB aggregate | effect on the stages |
+| --- | --- | --- |
+| baseline (1 GiB staging pool) | 15.8 GB/s | `duplex_backpressure` 38.6 ms per shard write: segments wait for staging chunks |
+| `RUSTFS_NIXL_POOL_BYTES` 8 GiB | 20.8 GB/s | backpressure 0.95 ms |
+| + `RUSTFS_OBJECT_MMAP_READ_ENABLE=false` | 17-19 GB/s | `reader_setup` 56 -> 24 ms: the local shard's 22 ms mmap copy at open is gone |
+| + idle pool 64 min / 256 max per peer | 19 GB/s | `reader_setup` 10.6 ms, `reader_task_file_open` 5.6 ms, dials 1313 -> 192 per 15 min |
+| `RUSTFS_CUOBJECT_INFLIGHT_WRITES=8` | 18.0 GB/s | none |
+| `RUSTFS_NIXL_NUM_WORKERS=4` | 19.5 GB/s | none |
+| `RUSTFS_NIXL_CHUNK_BYTES` 32 MiB | 20.5 GB/s | none |
+| fan-out 16, budget 64 | 13.1-14.5 GB/s | every stage slower (stripe read 24 ms, emit 13 ms): more segments contend |
+| stripe prefetch 2, with or without decode overlap | 18-19 GB/s | none |
+| `RUSTFS_RUNTIME_WORKER_THREADS` 32 / 64 / 128 | 18.5-19.2 GB/s | none (the runtime already had 127 workers) |
+| shard arena 4 GiB (zero-copy emit) | 15.7 GB/s | byte-exact, no stalls; emit 7.2 ms, no faster than the staging copy |
+
+After the pool, mmap and idle-pool changes a part costs `reader_setup` 9-15 ms
+plus `decode` 52-74 ms (per 24 MiB stripe: `stripe_read` 8-10 ms with the
+slowest shard at 9.6 ms, `emit` 5.5-6.2 ms, strictly in sequence), so a
+segment moves 1.5-2.5 GB/s and the fan-out budget of 16 segments per node
+bounds the node near 20 GB/s; raising the budget makes every segment
+slower instead. The server burns 63 cores for 20 GB/s (237 runtime and
+blocking threads, 19 of them at a full core), and the NIXL binding takes a
+process-wide write lock on every call while every in-flight write had a
+task spinning on its status, which is the contention signature observed.
+The completion thread (one thread posts and polls every transfer, tasks
+wait on a oneshot) is the next change measured below.
+
+Client-side notes from the same runs: sixteen `nixl-get` processes
+starting together segfault in UCX's shared-memory transport setup
+(`uct_mm_iface_t_new` -> `ucs_mpool_grow`) because the pod's `/dev/shm` is
+64 MiB; `UCX_TLS=^posix,sysv,cma,xpmem,knem` on the client avoids the
+shared-memory transports and all sixteen complete (positive `UCX_TLS` lists
+make the NIXL backend fail to start). The aggregate over several
+unsynchronized 2 GiB streams is dominated by per-process start-up (HEAD,
+agent, metadata, first-request handshake), so the multi-stream rows use 8
+GiB objects.
+
+### Page cache, mmap copy and the positional internode serve path (2026-11-05)
+
+Every served shard read evicted its pages (`RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE`
+defaults to true), so each GET went back to NVMe; the drives read 7-8 GB/s
+each with direct I/O but a buffered 1 MiB fill cost 2 ms and every attempt
+to put more reads in flight (deeper internode windows, larger chunks, a
+bigger fan-out budget) queued at the drives and made the node slower. With
+reclaim off the peer keeps 320 GiB of page cache and a cached 1 MiB read
+costs 0.17 ms, yet the served fills still took 1.7 ms: the stream server
+filled its 1 MiB slots one after another through an `AsyncRead` over
+`tokio::fs::File` (a blocking-pool round trip and two copies per read). The
+server now opens a local shard file for positional reads and fills every
+free slot of the peer's window with its own blocking `pread` straight into
+the registered slot, announcing the chunks in offset order
+(`RdmaRequestHandler::read_positional`, `push_positional`). One port,
+`mlx5_11`, 8 GiB host-memory streams, two rounds, aggregate over the window:
+
+| server | 1 stream | 8 streams | 16 streams | 4 GPU streams |
+| --- | --- | --- | --- | --- |
+| reclaim on (every read from NVMe) | 13.9 GB/s | 16.7-19.2 GB/s | 19.8-23.9 GB/s | 11.7 GB/s |
+| reclaim off | 15.2 GB/s | 20.9 GB/s | 24.7 GB/s | 14.3 GB/s |
+| reclaim off, mmap copy on (cached, 14 ms per part) | 13.6 GB/s | 21.8-22.7 GB/s | 25.9-26.0 GB/s | |
+| + positional serve path, 4 slots | 17.0 GB/s | 23.8 GB/s | 27.7 GB/s | |
+| + positional serve path, 8 slots | 17.7 GB/s | 24.4 GB/s | 26.5 GB/s | 16.6 GB/s |
+| + positional serve path, 16 slots | 16.3 GB/s | 14.4 GB/s | 18.8 GB/s | 10.8 GB/s |
+
+The served fill is 1.3 ms on average (now overlapped four or eight deep
+per stream instead of serial; sixteen deep floods the blocking pool and
+loses a third of the aggregate), `stripe_read` is 6.9-7.9 ms per 24 MiB
+stripe and the slowest shard 4.3-5.2 ms, so the per-segment cost is now
+`stripe_read` plus the 6 ms staging copy, and the completion thread holds
+the NIXL write at 2.7 ms per 10 MB.
+### Zero-copy emit restored: the decode converted every shard to the heap (2026-11-05)
+
+The arena emit never fired because `Erasure::decode_data` ran the codec's
+`reconstruct_data` on every stripe even with all data shards present, and
+that path moves every shard into a `Vec` (a copy out of the arena block)
+and hands back heap buffers; only the bridge engines had the data-complete
+early return. With the early return in both `reconstruct_data`
+implementations the counters show every shard buffer still arena-backed
+after the bitrot read, every shard offered to the emitter taken, and every
+write leaving as `write_zero_copy`. One port, `mlx5_11`, reclaim off, mmap
+copy on, positional serve path, shard arena 8 GiB, 8 GiB objects:
+
+| | before (staging copy) | zero-copy arena emit |
+| --- | --- | --- |
+| single GET into host memory | 17.0-17.7 GB/s | 27.8-30.2 GB/s |
+| 8 streams, aggregate | 23.8-24.4 GB/s | 35.5-36.0 GB/s |
+| 16 streams, aggregate | 26.5-27.7 GB/s | 35.6 GB/s |
+| 4 GPU streams, aggregate | 16.6 GB/s | 25.2 GB/s |
+| emit per 24 MiB stripe | 6.1-6.7 ms | 0.96 ms |
+| decode per 128 MiB part | 50-55 ms | 30.8 ms |
+| NIXL write (now 7.3 MB scatter-gather average) | 2.7 ms | 1.2-3.3 ms |
+
+The first arena run also hit the 60 s NIXL transfer timeout on about 26
+scatter-gather writes (failed GETs and a 100 ms tail on the write average)
+during its 16-stream and four-GPU rows; three following runs (sequential
+GETs plus 8 streams, with one UCX path, with one write in flight) had no
+timeout, so it is load-dependent and still open. A timed-out transfer used
+to let the request task drop its arena blocks while the NIC could still
+read them; the buffers now travel with the transfer on the completion
+thread and stay there until the library completes it.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |

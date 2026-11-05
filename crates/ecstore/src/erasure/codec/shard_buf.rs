@@ -241,6 +241,10 @@ pub trait ShardAppend: BufMut + Deref<Target = [u8]> + Default + Send + 'static 
     fn reserve(&mut self, additional: usize);
     fn truncate(&mut self, len: usize);
     fn extend_from_slice(&mut self, bytes: &[u8]);
+    /// Whether the bytes live in a registered arena block.
+    fn lives_in_arena(&self) -> bool {
+        false
+    }
 }
 
 impl ShardAppend for Vec<u8> {
@@ -260,6 +264,10 @@ impl ShardAppend for Vec<u8> {
 impl ShardAppend for ShardBuf {
     fn reserve(&mut self, additional: usize) {
         ShardBuf::reserve(self, additional)
+    }
+
+    fn lives_in_arena(&self) -> bool {
+        self.is_arena()
     }
 
     fn truncate(&mut self, len: usize) {

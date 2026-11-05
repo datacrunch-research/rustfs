@@ -28,8 +28,9 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     PUT_FILE_AUTH_V1, RemoteBackgroundIo, find_local_disk_by_ref_for_rpc, with_remote_background_io,
 };
 use crate::storage::storage_api::rpc_consumer::rdma_service::{
-    DiskStore, FileReader, RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer,
-    RdmaWriteRequest, default_listen_addrs, get_global_endpoints_opt, global_rustfs_port, server_enabled, settings, shared_pool,
+    Disk, DiskStore, FileReader, PositionalRead, RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler,
+    RdmaServer, RdmaWriteRequest, default_listen_addrs, get_global_endpoints_opt, global_rustfs_port, server_enabled, settings,
+    shared_pool,
 };
 use async_trait::async_trait;
 use std::io;
@@ -55,6 +56,19 @@ impl RdmaRequestHandler for RdmaDiskHandler {
         let disk = self.lookup_disk(&request.disk).await;
         with_remote_background_io(admission, async move {
             let outcome = open_read(disk, &request).await;
+            if outcome.is_err() {
+                RemoteBackgroundIo::discard_current_progress();
+            }
+            outcome
+        })
+        .await
+    }
+
+    async fn read_positional(&self, request: &RdmaReadRequest) -> Result<Option<PositionalRead>, RdmaReject> {
+        let admission = background_admission(request.background)?;
+        let disk = self.lookup_disk(&request.disk).await;
+        with_remote_background_io(admission, async move {
+            let outcome = open_positional(disk, request).await;
             if outcome.is_err() {
                 RemoteBackgroundIo::discard_current_progress();
             }
@@ -110,6 +124,43 @@ async fn open_read(disk: Result<DiskStore, RdmaReject>, request: &RdmaReadReques
     read_file_stream_with_legacy_meta_fallback(&disk, &request.volume, &request.path, offset, length)
         .await
         .map_err(|error| RdmaReject::from_disk_error(&error, "read file err"))
+}
+
+/// Opens the shard file of a local disk for positional reads. Remote or
+/// unusual disks, and files that fail to open, fall back to the streaming
+/// read (`None`) so its error handling and legacy-name retry stay in charge.
+async fn open_positional(
+    disk: Result<DiskStore, RdmaReject>,
+    request: &RdmaReadRequest,
+) -> Result<Option<PositionalRead>, RdmaReject> {
+    let disk = disk?;
+    let Disk::Local(local) = disk.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(path) = local.get_object_path_if_local(&request.volume, &request.path) else {
+        return Ok(None);
+    };
+    let offset = request.offset;
+    let length = request.length;
+    let opened = tokio::task::spawn_blocking(move || -> io::Result<Option<PositionalRead>> {
+        let file = std::fs::File::open(&path)?;
+        let size = file.metadata()?.len();
+        if offset > size {
+            return Ok(None);
+        }
+        let available = size - offset;
+        let length = if length == 0 { available } else { length.min(available) };
+        Ok(Some(PositionalRead {
+            file: Arc::new(file),
+            offset,
+            length,
+        }))
+    })
+    .await;
+    match opened {
+        Ok(Ok(read)) => Ok(read),
+        Ok(Err(_)) | Err(_) => Ok(None),
+    }
 }
 
 async fn commit_write(

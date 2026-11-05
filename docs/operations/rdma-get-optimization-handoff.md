@@ -200,6 +200,16 @@ loader (separate repository).
 
 ## Next steps
 
+0. Status 2026-11-05, end of day: the NIXL transport is byte-exact (post
+   result fixed), the arena emit works again (`Erasure::decode_data` no
+   longer copies complete stripes to the heap), served internode streams
+   read positionally and concurrently, the staging pool, page-cache reclaim
+   and idle-pool settings are known (benchmark record, "Where the corrected
+   pipeline spends its time" and after), and one server on one RoCE port
+   serves 30 GB/s per GET and 36 GB/s aggregate against the 40 GB/s goal.
+   Open: the load-dependent NIXL transfer timeouts under 16 streams, the
+   two-port (80 GB/s goal) measurement, and the fan-out budget now that a
+   segment costs 31 ms per part. Item 1 below is resolved by the decode fix.
 1. The zero-copy (shard arena) emit path regressed in this tree: with
    `RUSTFS_CUOBJECT_SHARD_ARENA_BYTES` set, single GETs run at 0.3-6.6 GB/s
    with multi-second stalls, most emits fall back to the staging copy

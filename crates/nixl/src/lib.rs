@@ -370,20 +370,54 @@ pub fn library_version() -> (u32, u32) {
 /// One NIXL agent with the UCX backend, a registered staging pool and the
 /// remote agents it has loaded.
 pub struct NixlServer {
+    engine: Arc<Engine>,
+    staging: Staging,
+    /// Transfers queued for the completion thread; bounded by `inflight`.
+    jobs: std::sync::mpsc::Sender<Job>,
+    inflight: Arc<Semaphore>,
+    name: String,
+    devices: Vec<String>,
+}
+
+/// The agent and everything the completion thread touches.
+///
+/// All posting and polling happens on that one thread: the binding takes a
+/// process-wide lock on every agent call, and with hundreds of request tasks
+/// each spinning on the status of their own transfer the lock became a convoy
+/// that throttled the whole node. One thread posts the queued transfers,
+/// polls the in-flight ones in a tight loop (which also progresses UCX) and
+/// wakes the waiting task through a oneshot channel.
+struct Engine {
     agent: Agent,
     backend: Backend,
-    staging: Staging,
     /// Remote agents loaded so far, by name, with a hash of the metadata that
     /// was loaded (a client that restarts sends new metadata).
     remotes: parking_lot::Mutex<HashMap<String, u64>>,
-    /// Serializes loading a remote agent, so the concurrent segments of a new
-    /// client's first request load its metadata once.
-    load_lock: tokio::sync::Mutex<()>,
-    inflight: Arc<Semaphore>,
     poll_interval: Duration,
     transfer_timeout: Duration,
-    name: String,
-    devices: Vec<String>,
+}
+
+type BuildLists = Box<dyn FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send>;
+
+/// The memory a transfer reads or writes, owned by the completion thread
+/// while the library may still touch it and handed back on completion.
+type KeepAlive = Box<dyn std::any::Any + Send>;
+
+/// One transfer for the completion thread.
+struct Job {
+    op: XferOp,
+    token: RdmaToken,
+    build: BuildLists,
+    keep: KeepAlive,
+    done: tokio::sync::oneshot::Sender<Result<KeepAlive, NixlError>>,
+}
+
+/// A posted transfer the completion thread is polling.
+struct Pending {
+    request: nixl_sys::XferRequest,
+    keep: Option<KeepAlive>,
+    done: Option<tokio::sync::oneshot::Sender<Result<KeepAlive, NixlError>>>,
+    deadline: std::time::Instant,
 }
 
 impl std::fmt::Debug for NixlServer {
@@ -434,9 +468,24 @@ impl NixlServer {
         let registration = agent
             .register_memory(&buffer, Some(&opt_args))
             .map_err(nixl_err("register staging"))?;
-        Ok(Arc::new(Self {
+        let engine = Arc::new(Engine {
             agent,
             backend,
+            remotes: parking_lot::Mutex::new(HashMap::new()),
+            poll_interval: config.poll_interval,
+            transfer_timeout: config.transfer_timeout,
+        });
+        let (jobs, queue) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&engine);
+        std::thread::Builder::new()
+            .name("nixl-xfer".to_owned())
+            .spawn(move || worker.run(queue))
+            .map_err(|source| NixlError::Os {
+                op: "spawn transfer thread",
+                source,
+            })?;
+        Ok(Arc::new(Self {
+            engine,
             staging: Staging {
                 buffer,
                 _registration: registration,
@@ -444,11 +493,8 @@ impl NixlServer {
                 permits: Semaphore::new(chunks),
                 chunk_bytes: config.chunk_bytes,
             },
-            remotes: parking_lot::Mutex::new(HashMap::new()),
-            load_lock: tokio::sync::Mutex::new(()),
+            jobs,
             inflight: Arc::new(Semaphore::new(config.max_inflight.max(1))),
-            poll_interval: config.poll_interval,
-            transfer_timeout: config.transfer_timeout,
             name: config.agent_name.clone(),
             devices: config.ucx_devices.clone(),
         }))
@@ -469,7 +515,7 @@ impl NixlServer {
 
     /// This agent's metadata, for a client that wants to address the server.
     pub fn local_metadata(&self) -> Result<Vec<u8>, NixlError> {
-        self.agent.get_local_md().map_err(nixl_err("local metadata"))
+        self.engine.agent.get_local_md().map_err(nixl_err("local metadata"))
     }
 
     pub fn chunk_bytes(&self) -> usize {
@@ -509,8 +555,11 @@ impl NixlServer {
     pub fn register_arena(self: &Arc<Self>, len: usize) -> Result<Arc<RegisteredArena>, NixlError> {
         let buffer = HostBuffer::new(len)?;
         let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
-        opt_args.add_backend(&self.backend).map_err(nixl_err("opt args backend"))?;
+        opt_args
+            .add_backend(&self.engine.backend)
+            .map_err(nixl_err("opt args backend"))?;
         let registration = self
+            .engine
             .agent
             .register_memory(&buffer, Some(&opt_args))
             .map_err(nixl_err("register arena"))?;
@@ -522,39 +571,6 @@ impl NixlServer {
             len,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }))
-    }
-
-    /// Loads the client's agent metadata unless this exact metadata is already loaded.
-    async fn ensure_remote(&self, token: &RdmaToken) -> Result<(), NixlError> {
-        let Some(metadata) = &token.metadata else {
-            if self.remotes.lock().contains_key(&token.agent) {
-                return Ok(());
-            }
-            return Err(NixlError::Token(format!(
-                "agent {:?} is unknown to this server; send {NIXL_METADATA_HEADER}",
-                token.agent
-            )));
-        };
-        let hash = metadata_hash(metadata);
-        if self.remotes.lock().get(&token.agent) == Some(&hash) {
-            return Ok(());
-        }
-        let _loading = self.load_lock.lock().await;
-        if self.remotes.lock().get(&token.agent) == Some(&hash) {
-            return Ok(());
-        }
-        let loaded = self
-            .agent
-            .load_remote_md(metadata)
-            .map_err(nixl_err("load remote metadata"))?;
-        if loaded != token.agent {
-            return Err(NixlError::Token(format!(
-                "metadata belongs to agent {loaded:?}, request names {:?}",
-                token.agent
-            )));
-        }
-        self.remotes.lock().insert(token.agent.clone(), hash);
-        Ok(())
     }
 
     fn client_window(token: &RdmaToken, remote_offset: u64, len: u64) -> Result<u64, NixlError> {
@@ -573,66 +589,39 @@ impl NixlServer {
             .ok_or_else(|| NixlError::Token("remote address overflow".to_owned()))
     }
 
-    /// Runs one transfer to completion. `build` produces the local and remote
-    /// descriptor lists (pairing up by index) once a transfer slot is held,
-    /// and every NIXL object except the request itself is dropped before the
-    /// first await, so the future stays `Send` for the spawned pipelines.
-    async fn transfer<B>(&self, op: XferOp, token: &RdmaToken, build: B) -> Result<(), NixlError>
+    /// Runs one transfer to completion on the completion thread and hands
+    /// `keep` back. `build` produces the local and remote descriptor lists
+    /// (pairing up by index) there, so no NIXL object crosses an await and
+    /// the future stays `Send` for the spawned pipelines. `keep` owns every
+    /// buffer the transfer touches: it returns with the result, and a
+    /// transfer that times out keeps it on the thread until the library
+    /// completes the transfer, so the memory is never reused under a write
+    /// that is still running.
+    async fn transfer<B, K>(&self, op: XferOp, token: &RdmaToken, keep: K, build: B) -> Result<K, NixlError>
     where
-        B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send,
-    {
-        self.ensure_remote(token).await?;
-        self.transfer_loaded(op, token, build).await
-    }
-
-    /// `transfer` for an agent whose metadata is loaded.
-    async fn transfer_loaded<B>(&self, op: XferOp, token: &RdmaToken, build: B) -> Result<(), NixlError>
-    where
-        B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send,
+        B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send + 'static,
+        K: std::any::Any + Send + 'static,
     {
         let _inflight = Arc::clone(&self.inflight)
             .acquire_owned()
             .await
             .map_err(|_| NixlError::Token("server closed".to_owned()))?;
-        let (request, in_progress) = {
-            let (local, remote) = build()?;
-            let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
-            opt_args.add_backend(&self.backend).map_err(nixl_err("opt args backend"))?;
-            let request = self
-                .agent
-                .create_xfer_req(op, &local, &remote, &token.agent, Some(&opt_args))
-                .map_err(nixl_err("create transfer"))?;
-            // The binding answers `true` while the transfer is still in progress
-            // and `false` when it completed before returning.
-            let in_progress = self
-                .agent
-                .post_xfer_req(&request, Some(&opt_args))
-                .map_err(nixl_err("post transfer"))?;
-            (request, in_progress)
-        };
-        if !in_progress {
-            return Ok(());
-        }
-        let deadline = tokio::time::Instant::now() + self.transfer_timeout;
-        let mut polls = 0u32;
-        loop {
-            match self.agent.get_xfer_status(&request).map_err(nixl_err("transfer status"))? {
-                XferStatus::Success => return Ok(()),
-                XferStatus::InProgress => {
-                    if tokio::time::Instant::now() >= deadline {
-                        // Dropping the request releases it on the library side; the
-                        // client sees a failed GET instead of a hung one.
-                        return Err(NixlError::TransferTimeout(self.transfer_timeout));
-                    }
-                    polls = polls.saturating_add(1);
-                    if polls < 64 {
-                        tokio::task::yield_now().await;
-                    } else {
-                        tokio::time::sleep(self.poll_interval).await;
-                    }
-                }
-            }
-        }
+        let (done, completion) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(Job {
+                op,
+                token: token.clone(),
+                build: Box::new(build),
+                keep: Box::new(keep),
+                done,
+            })
+            .map_err(|_| NixlError::Token("transfer thread stopped".to_owned()))?;
+        let keep = completion
+            .await
+            .map_err(|_| NixlError::Token("transfer thread stopped".to_owned()))??;
+        keep.downcast::<K>()
+            .map(|boxed| *boxed)
+            .map_err(|_| NixlError::Token("transfer returned another keep-alive".to_owned()))
     }
 
     fn remote_list_for(memory: ClientMemory, device: u64, addr: u64, len: usize) -> Result<XferDescList<'static>, NixlError> {
@@ -663,18 +652,19 @@ impl NixlServer {
         }
         let remote_addr = Self::client_window(token, offset, len as u64)?;
         let (local_addr, memory, device) = (chunk.local_addr(), token.memory, token.device);
-        self.transfer(XferOp::Write, token, move || {
-            Ok((
-                Self::local_list(local_addr, len)?,
-                Self::remote_list_for(memory, device, remote_addr, len)?,
-            ))
-        })
-        .await?;
+        let chunk = self
+            .transfer(XferOp::Write, token, chunk, move || {
+                Ok((
+                    Self::local_list(local_addr, len)?,
+                    Self::remote_list_for(memory, device, remote_addr, len)?,
+                ))
+            })
+            .await?;
         Ok((len as u64, chunk))
     }
 
     /// Writes one arena range at `remote_offset`; `keep` stays alive for the transfer.
-    pub async fn write_to_client_from_arena_owned<T: Send + 'static>(
+    pub async fn write_to_client_from_arena_owned<T: std::any::Any + Send + 'static>(
         self: &Arc<Self>,
         _key: &str,
         token: &RdmaToken,
@@ -698,19 +688,21 @@ impl NixlServer {
         let remote_addr = Self::client_window(token, remote_offset, source.len as u64)?;
         let (local_addr, len, memory, device) =
             (source.arena.buffer.addr() + source.local_offset, source.len, token.memory, token.device);
-        self.transfer(XferOp::Write, token, move || {
-            Ok((
-                Self::local_list(local_addr, len)?,
-                Self::remote_list_for(memory, device, remote_addr, len)?,
-            ))
-        })
-        .await?;
-        Ok((source.len as u64, keep))
+        let keep = self
+            .transfer(XferOp::Write, token, (source, keep), move || {
+                Ok((
+                    Self::local_list(local_addr, len)?,
+                    Self::remote_list_for(memory, device, remote_addr, len)?,
+                ))
+            })
+            .await?
+            .1;
+        Ok((len as u64, keep))
     }
 
     /// Writes several arena ranges to consecutive client offsets starting at
     /// `remote_offset` in one transfer; `keep` stays alive for the transfer.
-    pub async fn write_to_client_sg_owned<T: Send + 'static>(
+    pub async fn write_to_client_sg_owned<T: std::any::Any + Send + 'static>(
         self: &Arc<Self>,
         _key: &str,
         token: &RdmaToken,
@@ -738,18 +730,20 @@ impl NixlServer {
             }
         }
         let (ranges, memory, device) = (source.ranges.clone(), token.memory, token.device);
-        self.transfer(XferOp::Write, token, move || {
-            let mut local = XferDescList::new(MemType::Dram).map_err(nixl_err("local descriptors"))?;
-            let mut remote = XferDescList::new(memory.mem_type()).map_err(nixl_err("remote descriptors"))?;
-            let mut cursor = 0usize;
-            for (local_offset, len) in &ranges {
-                local.add_desc(arena_base + local_offset, *len, 0);
-                remote.add_desc(remote_base + cursor, *len, device);
-                cursor += len;
-            }
-            Ok((local, remote))
-        })
-        .await?;
+        let keep = self
+            .transfer(XferOp::Write, token, (source, keep), move || {
+                let mut local = XferDescList::new(MemType::Dram).map_err(nixl_err("local descriptors"))?;
+                let mut remote = XferDescList::new(memory.mem_type()).map_err(nixl_err("remote descriptors"))?;
+                let mut cursor = 0usize;
+                for (local_offset, len) in &ranges {
+                    local.add_desc(arena_base + local_offset, *len, 0);
+                    remote.add_desc(remote_base + cursor, *len, device);
+                    cursor += len;
+                }
+                Ok((local, remote))
+            })
+            .await?
+            .1;
         Ok((total as u64, keep))
     }
 
@@ -773,15 +767,169 @@ impl NixlServer {
         let remote_addr = Self::client_window(token, offset, len as u64)?;
         chunk.clear();
         let (local_addr, memory, device) = (chunk.local_addr(), token.memory, token.device);
-        self.transfer(XferOp::Read, token, move || {
-            Ok((
-                Self::local_list(local_addr, len)?,
-                Self::remote_list_for(memory, device, remote_addr, len)?,
-            ))
-        })
-        .await?;
+        let mut chunk = self
+            .transfer(XferOp::Read, token, chunk, move || {
+                Ok((
+                    Self::local_list(local_addr, len)?,
+                    Self::remote_list_for(memory, device, remote_addr, len)?,
+                ))
+            })
+            .await?;
         chunk.advance(len)?;
         Ok(chunk)
+    }
+}
+
+impl Engine {
+    /// Loads the client's agent metadata unless this exact metadata is already loaded.
+    fn ensure_remote(&self, token: &RdmaToken) -> Result<(), NixlError> {
+        let Some(metadata) = &token.metadata else {
+            if self.remotes.lock().contains_key(&token.agent) {
+                return Ok(());
+            }
+            return Err(NixlError::Token(format!(
+                "agent {:?} is unknown to this server; send {NIXL_METADATA_HEADER}",
+                token.agent
+            )));
+        };
+        let hash = metadata_hash(metadata);
+        if self.remotes.lock().get(&token.agent) == Some(&hash) {
+            return Ok(());
+        }
+        let loaded = self
+            .agent
+            .load_remote_md(metadata)
+            .map_err(nixl_err("load remote metadata"))?;
+        if loaded != token.agent {
+            return Err(NixlError::Token(format!(
+                "metadata belongs to agent {loaded:?}, request names {:?}",
+                token.agent
+            )));
+        }
+        self.remotes.lock().insert(token.agent.clone(), hash);
+        Ok(())
+    }
+
+    /// Posts one transfer; `None` when it completed before returning.
+    fn post(&self, op: XferOp, token: &RdmaToken, build: BuildLists) -> Result<Option<nixl_sys::XferRequest>, NixlError> {
+        self.ensure_remote(token)?;
+        let (local, remote) = build()?;
+        let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
+        opt_args.add_backend(&self.backend).map_err(nixl_err("opt args backend"))?;
+        let request = self
+            .agent
+            .create_xfer_req(op, &local, &remote, &token.agent, Some(&opt_args))
+            .map_err(nixl_err("create transfer"))?;
+        // The binding answers `true` while the transfer is still in progress
+        // and `false` when it completed before returning.
+        let in_progress = self
+            .agent
+            .post_xfer_req(&request, Some(&opt_args))
+            .map_err(nixl_err("post transfer"))?;
+        Ok(in_progress.then_some(request))
+    }
+
+    fn admit(&self, job: Job, pending: &mut Vec<Pending>) {
+        match self.post(job.op, &job.token, job.build) {
+            Ok(Some(request)) => pending.push(Pending {
+                request,
+                keep: Some(job.keep),
+                done: Some(job.done),
+                deadline: std::time::Instant::now() + self.transfer_timeout,
+            }),
+            Ok(None) => {
+                let _ = job.done.send(Ok(job.keep));
+            }
+            Err(err) => {
+                let _ = job.done.send(Err(err));
+            }
+        }
+    }
+
+    /// The completion thread: posts queued transfers and polls the in-flight
+    /// ones until the server is dropped.
+    fn run(self: Arc<Self>, queue: std::sync::mpsc::Receiver<Job>) {
+        let mut pending: Vec<Pending> = Vec::new();
+        // Transfers past their deadline: the task was told, the request stays
+        // alive until the library completes it so its buffers are never
+        // reused under a transfer that is still running.
+        let mut expired: Vec<Pending> = Vec::new();
+        let mut idle_polls = 0u32;
+        loop {
+            // Take new work: block when nothing is in flight.
+            if pending.is_empty() && expired.is_empty() {
+                match queue.recv() {
+                    Ok(job) => self.admit(job, &mut pending),
+                    Err(_) => return,
+                }
+            }
+            loop {
+                match queue.try_recv() {
+                    Ok(job) => self.admit(job, &mut pending),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if pending.is_empty() && expired.is_empty() {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+            let now = std::time::Instant::now();
+            let mut progressed = false;
+            let mut index = 0;
+            while index < pending.len() {
+                match self.agent.get_xfer_status(&pending[index].request) {
+                    Ok(XferStatus::Success) => {
+                        progressed = true;
+                        let mut transfer = pending.swap_remove(index);
+                        Self::finish(&mut transfer, Ok(()));
+                    }
+                    Ok(XferStatus::InProgress) if now >= pending[index].deadline => {
+                        // The task gets the error; the request and the buffers it
+                        // references stay here until the library completes it.
+                        let mut transfer = pending.swap_remove(index);
+                        Self::finish(&mut transfer, Err(NixlError::TransferTimeout(self.transfer_timeout)));
+                        tracing::warn!(
+                            agent = %"nixl",
+                            timeout_ms = self.transfer_timeout.as_millis() as u64,
+                            "nixl transfer timed out; its request is kept until the library completes it"
+                        );
+                        expired.push(transfer);
+                    }
+                    Ok(XferStatus::InProgress) => index += 1,
+                    Err(err) => {
+                        progressed = true;
+                        let mut transfer = pending.swap_remove(index);
+                        Self::finish(&mut transfer, Err(nixl_err("transfer status")(err)));
+                    }
+                }
+            }
+            expired.retain(|transfer| matches!(self.agent.get_xfer_status(&transfer.request), Ok(XferStatus::InProgress)));
+            if progressed {
+                idle_polls = 0;
+            } else {
+                idle_polls = idle_polls.saturating_add(1);
+                if idle_polls > 64 {
+                    std::thread::sleep(self.poll_interval);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    fn finish(transfer: &mut Pending, result: Result<(), NixlError>) {
+        let Some(done) = transfer.done.take() else {
+            return;
+        };
+        let result = match result {
+            // The buffers go back with a completed transfer; a caller that
+            // stopped waiting drops them here, after the library is done.
+            Ok(()) => Ok(transfer.keep.take().expect("buffers travel with the transfer")),
+            Err(err) => Err(err),
+        };
+        let _ = done.send(result);
     }
 }
 

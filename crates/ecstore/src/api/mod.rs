@@ -669,8 +669,9 @@ pub mod rpc {
         pub use crate::cluster::rpc::rdma::proto::ErrorCode as RdmaErrorCode;
         pub use crate::cluster::rpc::rdma::proto::{StreamOp as RdmaStreamOp, WriteRequest as RdmaWriteRequestWire};
         pub use crate::cluster::rpc::rdma::{
-            RdmaBodyStream, RdmaInternodeDataTransport, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer,
-            RdmaSettings, RdmaWriteRequest, RegisteredPool, default_listen_addrs, server_enabled, settings, shared_pool,
+            PositionalRead, RdmaBodyStream, RdmaInternodeDataTransport, RdmaReadRequest, RdmaReject, RdmaRequestHandler,
+            RdmaServer, RdmaSettings, RdmaWriteRequest, RegisteredPool, default_listen_addrs, server_enabled, settings,
+            shared_pool,
         };
     }
 }
