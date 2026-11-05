@@ -859,7 +859,7 @@ impl SegmentState {
                 .write_to_client_sg_owned(&object, &token, remote_offset, source, shards)
                 .await
                 .map(|(moved, _shards)| (moved, None));
-            record_emit_write_latency(len, started.elapsed());
+            record_emit_write_latency(len, started.elapsed(), "write_zero_copy");
             result
         }));
     }
@@ -884,7 +884,7 @@ impl SegmentState {
                 .write_to_client_owned(&object, &token, offset, chunk)
                 .await
                 .map(|(moved, chunk)| (moved, Some(chunk)));
-            record_emit_write_latency(len as usize, started.elapsed());
+            record_emit_write_latency(len as usize, started.elapsed(), "write_staging");
             result
         }));
     }
@@ -918,8 +918,11 @@ impl SegmentState {
 /// visible next to the decode-loop stages.
 const EMIT_STAGE_PATH: &str = "cuobject_emit";
 
-fn record_emit_write_latency(bytes: usize, elapsed: std::time::Duration) {
+fn record_emit_write_latency(bytes: usize, elapsed: std::time::Duration, path: &'static str) {
     let secs = elapsed.as_secs_f64();
+    // One stage per emit path, so the summary shows how many writes went out
+    // straight from the shard arena and how many through the staging copy.
+    rustfs_io_metrics::record_get_object_stage_duration(EMIT_STAGE_PATH, path, secs);
     let bucket = match elapsed.as_millis() {
         0..=1 => "write_le_1ms",
         2..=5 => "write_le_5ms",

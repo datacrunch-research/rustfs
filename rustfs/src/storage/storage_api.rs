@@ -300,14 +300,15 @@ pub(crate) mod rpc_consumer {
     #[cfg(all(feature = "rdma", target_os = "linux"))]
     pub(crate) mod rdma_service {
         pub(crate) use super::super::{DiskStore, FileReader, get_global_endpoints_opt, global_rustfs_port};
+        pub(crate) use rustfs_ecstore::api::disk::Disk;
         #[cfg(test)]
         pub(crate) use rustfs_ecstore::api::rpc::rdma::{
             InternodeDataTransport, RdmaInternodeDataTransport, RdmaSettings, RdmaStreamOp, RdmaWriteRequestWire,
             ReadStreamRequest, RegisteredPool,
         };
         pub(crate) use rustfs_ecstore::api::rpc::rdma::{
-            RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer, RdmaWriteRequest,
-            default_listen_addrs, server_enabled, settings, shared_pool,
+            PositionalRead, RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer,
+            RdmaWriteRequest, default_listen_addrs, server_enabled, settings, shared_pool,
         };
     }
 

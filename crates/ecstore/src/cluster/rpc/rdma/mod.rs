@@ -34,6 +34,7 @@ mod tests;
 pub use buffer::RegisteredPool;
 pub use client::RdmaInternodeDataTransport;
 pub use server::{RdmaBodyStream, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer, RdmaWriteRequest};
+pub use stream::PositionalRead;
 
 use crate::cluster::rpc::internode_data_transport::InternodeDataTransport;
 use rustfs_config::{

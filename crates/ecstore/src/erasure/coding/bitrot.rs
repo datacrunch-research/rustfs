@@ -462,7 +462,19 @@ where
     /// On return `out.len()` has grown by exactly the returned count.
     pub async fn read_appending<B: ShardAppend>(&mut self, out: &mut B, want: usize) -> std::io::Result<usize> {
         let start = out.len();
+        let arena_in = out.lives_in_arena();
         let count = self.read_appending_frame(out, want).await?;
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            // Where the shard buffer lives before and after the frame read: a
+            // buffer that enters in the arena and leaves on the heap was moved
+            // by a reservation larger than its block.
+            let stage = match (arena_in, out.lives_in_arena()) {
+                (true, true) => "bitrot_arena_kept",
+                (true, false) => "bitrot_arena_lost",
+                (false, _) => "bitrot_heap_in",
+            };
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", stage, 0.0);
+        }
         if let Some(integrity) = &mut self.integrity
             && let Err(error) = integrity.verify(&out[start..]).await
         {
@@ -478,6 +490,9 @@ where
 
         self.begin_read(want)?;
         out.reserve(want);
+        if rustfs_io_metrics::get_stage_metrics_enabled() && !out.lives_in_arena() {
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "bitrot_heap_after_reserve", want as f64);
+        }
         let hash_size = self.hash_algo.size();
 
         // No-hash path: read straight into `out`'s spare capacity. `read_buf`
@@ -502,6 +517,9 @@ where
         let need = hash_size + want;
 
         if let Some(block) = self.inner.try_take_block(need) {
+            if rustfs_io_metrics::get_stage_metrics_enabled() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "bitrot_branch_block", block.len() as f64);
+            }
             let verify = if should_offload_verify(self.skip_verify, block.len()) {
                 verify_and_append_off_thread(&self.hash_algo, block, hash_size, out).await?
             } else {

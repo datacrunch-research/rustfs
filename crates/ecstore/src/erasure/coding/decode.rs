@@ -345,6 +345,12 @@ where
     // the buffer never needs zeroing first (rustfs/backlog#1159).
     let mut buf = recycled_buf.unwrap_or_else(|| ShardBuf::with_capacity(shard_size));
     buf.clear();
+    if metrics_path.is_some() {
+        // Where the shard buffer lives, with the requested capacity as the
+        // recorded value so the summary shows it next to the arena block size.
+        let home = if buf.is_arena() { "shard_buf_arena" } else { "shard_buf_heap" };
+        rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", home, shard_size as f64);
+    }
     let read_start = metrics_path.map(|_| Instant::now());
     let read_result = if read_timeout.is_zero() {
         reader.read_appending(&mut buf, shard_size).await
@@ -2201,10 +2207,22 @@ where
         let write_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
         // Zero-copy emit: a consumer that can send straight out of registered
         // arena memory takes the whole shard; the bytes still go out in order.
+        // The three counters (zero duration, one per decision) show in the
+        // stage summary how many shards an emitter saw, how many lived in the
+        // arena and how many it took.
+        if emitter_offered && write_stage_start.is_some() {
+            rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_offered", 0.0);
+            if block.is_arena() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_arena", 0.0);
+            }
+        }
         if emitter_offered
             && block.is_arena()
             && crate::erasure::codec::shard_emit::emit_shard(block_op, start..start + write_len).await?
         {
+            if write_stage_start.is_some() {
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "emit_shard_taken", 0.0);
+            }
             if let Some(write_stage_start) = write_stage_start {
                 rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
             }
