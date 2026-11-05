@@ -75,6 +75,8 @@ const MIGRATING_META_BUCKET: &str = ".minio.sys";
 const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
 const RPC_OPERATION_UNKNOWN: &str = "unknown";
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
+#[cfg(feature = "nixl")]
+use crate::storage::storage_api::rpc_consumer::nixl_read::READ_FILE_NIXL_PATH;
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
 const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
@@ -446,6 +448,8 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         let path = req.uri().path();
         let response = match (method, path) {
             (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
+            #[cfg(feature = "nixl")]
+            (Method::GET, READ_FILE_NIXL_PATH) => super::nixl_read::handle_read_file_nixl(req).await,
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
                 Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
@@ -514,6 +518,8 @@ fn emit_internode_rpc_telemetry(started_at: Instant, status: StatusCode) {
 fn internode_http_operation(path: &str) -> Option<&'static str> {
     match path {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        #[cfg(feature = "nixl")]
+        READ_FILE_NIXL_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
         PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),

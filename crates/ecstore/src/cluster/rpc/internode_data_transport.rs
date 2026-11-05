@@ -30,8 +30,8 @@ use crate::storage_api_contracts::internode::{
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
-    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_RDMA,
-    INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_NIXL,
+    INTERNODE_DATA_TRANSPORT_RDMA, INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{
     ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
@@ -658,7 +658,7 @@ fn verify_put_file_capability_response(challenge: Uuid, body: &[u8]) -> Result<U
     Ok(response.server_epoch)
 }
 
-fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
+pub(super) fn build_read_file_stream_url(request: &ReadStreamRequest) -> String {
     format!(
         "{}{}?disk={}&volume={}&path={}&offset={}&length={}",
         request.endpoint,
@@ -913,7 +913,7 @@ fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challen
     )
 }
 
-fn json_headers() -> HeaderMap {
+pub(super) fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
     headers
@@ -937,6 +937,9 @@ fn build_internode_data_transport_result(
             Ok(Arc::new(TcpHttpInternodeDataTransport))
         }
         Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_RDMA) => build_rdma_transport(transport),
+        Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_NIXL) => {
+            Ok(Arc::new(super::nixl_internode::NixlInternodeDataTransport::from_env()))
+        }
         Some(transport) => Err(unsupported_transport_message(transport)),
     }
 }
@@ -2273,14 +2276,23 @@ mod tests {
     fn transport_config_known_backends_are_current_oss_values() {
         assert_eq!(
             KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
-            &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP]
+            &[
+                DEFAULT_INTERNODE_DATA_TRANSPORT,
+                INTERNODE_DATA_TRANSPORT_TCP,
+                INTERNODE_DATA_TRANSPORT_RDMA,
+                INTERNODE_DATA_TRANSPORT_NIXL
+            ]
         );
 
-        for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
+        for configured in [DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP] {
             let transport = build_internode_data_transport(Some(configured)).unwrap();
 
             assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
         }
+        // NIXL builds everywhere and serves reads over TCP/HTTP until a node
+        // installs its receive pool; RDMA depends on the build.
+        let transport = build_internode_data_transport(Some(INTERNODE_DATA_TRANSPORT_NIXL)).unwrap();
+        assert_eq!(transport.name(), INTERNODE_DATA_TRANSPORT_NIXL);
     }
 
     #[test]

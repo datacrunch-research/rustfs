@@ -23,6 +23,7 @@
 use bytes::Bytes;
 use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, ThreadSync, XferDescList, XferOp, XferStatus};
 
+pub mod devices;
 mod mem;
 
 use mem::HostBuffer;
@@ -203,6 +204,8 @@ pub struct NixlConfig {
     pub poll_interval: Duration,
     /// A transfer that has not completed after this long fails the request.
     pub transfer_timeout: Duration,
+    /// Run NIXL's progress thread (see `NixlServer::create_agent`).
+    pub progress_thread: bool,
 }
 
 impl Default for NixlConfig {
@@ -216,6 +219,7 @@ impl Default for NixlConfig {
             max_inflight: 256,
             poll_interval: Duration::from_micros(50),
             transfer_timeout: Duration::from_secs(60),
+            progress_thread: true,
         }
     }
 }
@@ -347,6 +351,19 @@ impl StagingChunk {
     fn local_addr(&self) -> usize {
         self.server.staging.buffer.addr() + self.index * self.server.staging.chunk_bytes
     }
+
+    /// Address of the chunk in registered memory, for a peer's transfer descriptor.
+    pub fn addr(&self) -> usize {
+        self.local_addr()
+    }
+}
+
+impl AsRef<[u8]> for StagingChunk {
+    /// The staged bytes; empty if the chunk's range were ever out of the pool
+    /// (it cannot be: the index comes from the pool).
+    fn as_ref(&self) -> &[u8] {
+        self.staged().unwrap_or(&[])
+    }
 }
 
 impl Drop for StagingChunk {
@@ -366,6 +383,9 @@ pub fn library_version() -> (u32, u32) {
     let mut parts = NIXL_LIBRARY_VERSION.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
     (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
 }
+
+/// Timeout of the NIXL progress thread's poll() between passes, in microseconds.
+const PROGRESS_THREAD_POLL_US: u64 = 1_000;
 
 /// One NIXL agent with the UCX backend, a registered staging pool and the
 /// remote agents it has loaded.
@@ -415,6 +435,8 @@ struct Job {
 /// A posted transfer the completion thread is polling.
 struct Pending {
     request: nixl_sys::XferRequest,
+    /// The remote agent, forgotten if the transfer fails.
+    agent: String,
     keep: Option<KeepAlive>,
     done: Option<tokio::sync::oneshot::Sender<Result<KeepAlive, NixlError>>>,
     deadline: std::time::Instant,
@@ -501,9 +523,19 @@ impl NixlServer {
     }
 
     fn create_agent(config: &NixlConfig, thread_sync: ThreadSync) -> Result<Agent, NixlError> {
+        // NIXL's progress thread keeps the UCX worker answering peers while this
+        // node has no transfer of its own in flight: a node that is the target
+        // of RDMA writes (internode reads into its buffers) must still complete
+        // connection handshakes and keepalives, or its peers declare it dead.
+        // The thread sleeps in poll() on the worker's event descriptor between
+        // passes; the delay is that poll's timeout (rounded up to whole
+        // milliseconds). Zero, the binding's default, makes it spin on the
+        // worker and starve every other caller of the worker lock.
         let agent_config = AgentConfig {
             num_workers: config.num_workers.max(1),
             thread_sync,
+            enable_prog_thread: config.progress_thread,
+            pthr_delay_us: PROGRESS_THREAD_POLL_US,
             ..AgentConfig::default()
         };
         Agent::new_configured(&config.agent_name, &agent_config).map_err(nixl_err("agent"))
@@ -796,6 +828,10 @@ impl Engine {
         if self.remotes.lock().get(&token.agent) == Some(&hash) {
             return Ok(());
         }
+        // A peer that was loaded before (and dropped after a failed transfer, or
+        // restarted with new metadata) must be invalidated first: NIXL refuses
+        // to load an agent it still holds. For a new agent this is a no-op error.
+        let _ = self.agent.invalidate_remote_md(&token.agent);
         let loaded = self
             .agent
             .load_remote_md(metadata)
@@ -829,10 +865,17 @@ impl Engine {
         Ok(in_progress.then_some(request))
     }
 
+    /// Forgets `agent` after a failed transfer, so the next request reloads its
+    /// metadata and reconnects instead of failing against a peer NIXL dropped.
+    fn forget_remote(&self, agent: &str) {
+        self.remotes.lock().remove(agent);
+    }
+
     fn admit(&self, job: Job, pending: &mut Vec<Pending>) {
         match self.post(job.op, &job.token, job.build) {
             Ok(Some(request)) => pending.push(Pending {
                 request,
+                agent: job.token.agent.clone(),
                 keep: Some(job.keep),
                 done: Some(job.done),
                 deadline: std::time::Instant::now() + self.transfer_timeout,
@@ -841,6 +884,7 @@ impl Engine {
                 let _ = job.done.send(Ok(job.keep));
             }
             Err(err) => {
+                self.forget_remote(&job.token.agent);
                 let _ = job.done.send(Err(err));
             }
         }
@@ -901,6 +945,7 @@ impl Engine {
                     Err(err) => {
                         progressed = true;
                         let mut transfer = pending.swap_remove(index);
+                        self.forget_remote(&transfer.agent);
                         Self::finish(&mut transfer, Err(nixl_err("transfer status")(err)));
                     }
                 }
