@@ -182,11 +182,20 @@ same band as the 16-32 stream rows: one server's pipeline, not the
 client, the NIC or the PCIe path, is the limit in every configuration. The CPU-side RoCE ports work too
 (16 GB/s into GPU 4 over one port; both ports stripe host-memory puts with
 `UCX_MAX_RMA_RAILS=2`, CUDA targets stay on one lane), so RoCE is enabled
-again on 53:00.0 on 110, 139 and 141. Next for this path: the server's UCX
-falls back to `rc_verbs` (no accelerated mlx5 transport, unlike the client
-with the same libraries), the zero-copy emit (arena ranges as one
-scatter-gather transfer, after the arena regression is fixed), the per-part
-decode cost that now bounds every target, and the NIXL plugin for the
+again on 53:00.0 on 110, 139 and 141. Those first numbers were taken with
+the `nixl-sys` post result read inverted (every transfer "complete" at post,
+replies ahead of the data, masked by three-round verification); fixed on
+2026-11-05 and re-measured single-round and byte-exact: 12-14 GB/s per GET
+into host memory or one GPU, 17 GB/s for 8 GiB, 19.0 GB/s for four GPUs
+over the four rails from one server (see "Transfer completion fix" in the
+record). The server now runs the accelerated `rc_mlx5` transport once
+`/shared/nixl-libs` resolves `libibverbs`/`libmlx5` to the system copies;
+the wheel's bundled rdma-core 48 next to the system's 50 was the cause of
+the `rc_verbs` fallback, not of the corruption. Next for this path: the
+zero-copy emit (arena ranges as one scatter-gather transfer, after the
+arena regression is fixed), the per-part decode cost that bounds every
+target at 17-19 GB/s per server, a NIXL/UCX build against the system
+rdma-core instead of the wheel's libraries, and the NIXL plugin for the
 loader (separate repository).
 
 ## Next steps

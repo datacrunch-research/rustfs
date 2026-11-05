@@ -21,7 +21,7 @@
 //! client treats both the same.
 
 use bytes::Bytes;
-use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, XferDescList, XferOp, XferStatus};
+use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, ThreadSync, XferDescList, XferOp, XferStatus};
 
 mod mem;
 
@@ -376,6 +376,9 @@ pub struct NixlServer {
     /// Remote agents loaded so far, by name, with a hash of the metadata that
     /// was loaded (a client that restarts sends new metadata).
     remotes: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Serializes loading a remote agent, so the concurrent segments of a new
+    /// client's first request load its metadata once.
+    load_lock: tokio::sync::Mutex<()>,
     inflight: Arc<Semaphore>,
     poll_interval: Duration,
     transfer_timeout: Duration,
@@ -405,11 +408,18 @@ impl NixlServer {
         if config.chunk_bytes == 0 || config.chunk_bytes > MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
             return Err(NixlError::Token("invalid staging configuration".to_owned()));
         }
-        let agent_config = AgentConfig {
-            num_workers: config.num_workers.max(1),
-            ..AgentConfig::default()
+        // Request tasks post and poll transfers from every runtime thread. The
+        // binding serializes its calls with a lock of its own, but the agent is
+        // configured for concurrent use as well (reader-writer locking, UCX
+        // workers in multi-thread mode) so correctness does not rest on that
+        // detail; a UCX without thread support gets the strict mode instead.
+        let agent = match Self::create_agent(config, ThreadSync::Rw) {
+            Ok(agent) => agent,
+            Err(err) => {
+                tracing::warn!(error = %err, "NIXL agent with rw synchronization failed; using strict");
+                Self::create_agent(config, ThreadSync::Strict)?
+            }
         };
-        let agent = Agent::new_configured(&config.agent_name, &agent_config).map_err(nixl_err("agent"))?;
         let mut params = Params::from(std::iter::empty::<(&str, &str)>()).map_err(nixl_err("params"))?;
         if !config.ucx_devices.is_empty() {
             params
@@ -435,12 +445,22 @@ impl NixlServer {
                 chunk_bytes: config.chunk_bytes,
             },
             remotes: parking_lot::Mutex::new(HashMap::new()),
+            load_lock: tokio::sync::Mutex::new(()),
             inflight: Arc::new(Semaphore::new(config.max_inflight.max(1))),
             poll_interval: config.poll_interval,
             transfer_timeout: config.transfer_timeout,
             name: config.agent_name.clone(),
             devices: config.ucx_devices.clone(),
         }))
+    }
+
+    fn create_agent(config: &NixlConfig, thread_sync: ThreadSync) -> Result<Agent, NixlError> {
+        let agent_config = AgentConfig {
+            num_workers: config.num_workers.max(1),
+            thread_sync,
+            ..AgentConfig::default()
+        };
+        Agent::new_configured(&config.agent_name, &agent_config).map_err(nixl_err("agent"))
     }
 
     pub fn name(&self) -> &str {
@@ -505,32 +525,36 @@ impl NixlServer {
     }
 
     /// Loads the client's agent metadata unless this exact metadata is already loaded.
-    fn ensure_remote(&self, token: &RdmaToken) -> Result<(), NixlError> {
-        match &token.metadata {
-            Some(metadata) => {
-                let hash = metadata_hash(metadata);
-                if self.remotes.lock().get(&token.agent) == Some(&hash) {
-                    return Ok(());
-                }
-                let loaded = self
-                    .agent
-                    .load_remote_md(metadata)
-                    .map_err(nixl_err("load remote metadata"))?;
-                if loaded != token.agent {
-                    return Err(NixlError::Token(format!(
-                        "metadata belongs to agent {loaded:?}, request names {:?}",
-                        token.agent
-                    )));
-                }
-                self.remotes.lock().insert(token.agent.clone(), hash);
-                Ok(())
+    async fn ensure_remote(&self, token: &RdmaToken) -> Result<(), NixlError> {
+        let Some(metadata) = &token.metadata else {
+            if self.remotes.lock().contains_key(&token.agent) {
+                return Ok(());
             }
-            None if self.remotes.lock().contains_key(&token.agent) => Ok(()),
-            None => Err(NixlError::Token(format!(
+            return Err(NixlError::Token(format!(
                 "agent {:?} is unknown to this server; send {NIXL_METADATA_HEADER}",
                 token.agent
-            ))),
+            )));
+        };
+        let hash = metadata_hash(metadata);
+        if self.remotes.lock().get(&token.agent) == Some(&hash) {
+            return Ok(());
         }
+        let _loading = self.load_lock.lock().await;
+        if self.remotes.lock().get(&token.agent) == Some(&hash) {
+            return Ok(());
+        }
+        let loaded = self
+            .agent
+            .load_remote_md(metadata)
+            .map_err(nixl_err("load remote metadata"))?;
+        if loaded != token.agent {
+            return Err(NixlError::Token(format!(
+                "metadata belongs to agent {loaded:?}, request names {:?}",
+                token.agent
+            )));
+        }
+        self.remotes.lock().insert(token.agent.clone(), hash);
+        Ok(())
     }
 
     fn client_window(token: &RdmaToken, remote_offset: u64, len: u64) -> Result<u64, NixlError> {
@@ -557,12 +581,20 @@ impl NixlServer {
     where
         B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send,
     {
+        self.ensure_remote(token).await?;
+        self.transfer_loaded(op, token, build).await
+    }
+
+    /// `transfer` for an agent whose metadata is loaded.
+    async fn transfer_loaded<B>(&self, op: XferOp, token: &RdmaToken, build: B) -> Result<(), NixlError>
+    where
+        B: FnOnce() -> Result<(XferDescList<'static>, XferDescList<'static>), NixlError> + Send,
+    {
         let _inflight = Arc::clone(&self.inflight)
             .acquire_owned()
             .await
             .map_err(|_| NixlError::Token("server closed".to_owned()))?;
-        self.ensure_remote(token)?;
-        let (request, completed) = {
+        let (request, in_progress) = {
             let (local, remote) = build()?;
             let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
             opt_args.add_backend(&self.backend).map_err(nixl_err("opt args backend"))?;
@@ -570,13 +602,15 @@ impl NixlServer {
                 .agent
                 .create_xfer_req(op, &local, &remote, &token.agent, Some(&opt_args))
                 .map_err(nixl_err("create transfer"))?;
-            let completed = self
+            // The binding answers `true` while the transfer is still in progress
+            // and `false` when it completed before returning.
+            let in_progress = self
                 .agent
                 .post_xfer_req(&request, Some(&opt_args))
                 .map_err(nixl_err("post transfer"))?;
-            (request, completed)
+            (request, in_progress)
         };
-        if completed {
+        if !in_progress {
             return Ok(());
         }
         let deadline = tokio::time::Instant::now() + self.transfer_timeout;
