@@ -326,12 +326,35 @@ pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 /// Internode RDMA data-plane backend. Requires a build with the `rdma` Cargo feature.
 pub const INTERNODE_DATA_TRANSPORT_RDMA: &str = "rdma";
 
+/// Internode reads whose data moves over NIXL/UCX (InfiniBand rails or RoCE by
+/// LID/GID, no IP needed); requests, writes and walks stay on TCP/HTTP. Requires
+/// a binary built with the `nixl` feature and `RUSTFS_NIXL_ENABLE`; until the
+/// NIXL agent is up, and for any read it cannot serve, it uses TCP/HTTP.
+pub const INTERNODE_DATA_TRANSPORT_NIXL: &str = "nixl";
+
 /// Known internode transport backend names accepted by the config parser.
 pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[
     DEFAULT_INTERNODE_DATA_TRANSPORT,
     INTERNODE_DATA_TRANSPORT_TCP,
     INTERNODE_DATA_TRANSPORT_RDMA,
+    INTERNODE_DATA_TRANSPORT_NIXL,
 ];
+
+/// Check the configured RDMA devices at startup and leave out any that is down,
+/// slower than its peers, or loses its link during a short watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_CHECK: &str = "RUSTFS_NIXL_DEVICE_CHECK";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_CHECK: bool = true;
+/// Leave out a device whose link dropped this many times more since boot than
+/// the quietest device of its link layer; 0 skips this test.
+pub const ENV_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: &str = "RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: u64 = 16;
+/// How long the startup device check watches the link counters; 0 skips the watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: &str = "RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: u64 = 3_000;
+
+/// NIXL internode reads in flight per remote shard stream.
+pub const ENV_RUSTFS_NIXL_INTERNODE_DEPTH: &str = "RUSTFS_NIXL_INTERNODE_DEPTH";
+pub const DEFAULT_RUSTFS_NIXL_INTERNODE_DEPTH: usize = 4;
 
 /// Added to a peer's internode HTTP port to derive its RDMA listener port.
 pub const ENV_RUSTFS_RDMA_PORT_OFFSET: &str = "RUSTFS_RDMA_PORT_OFFSET";
@@ -604,7 +627,7 @@ mod tests {
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
-        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "rdma"]);
+        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "rdma", "nixl"]);
         assert_eq!(INTERNODE_DATA_TRANSPORT_RDMA, "rdma");
         assert_eq!(DEFAULT_RUSTFS_RDMA_PORT_OFFSET, 1000);
         assert_eq!(DEFAULT_RUSTFS_RDMA_CHUNK_SIZE, 1024 * 1024);

@@ -142,8 +142,9 @@ async fn open_positional(
     };
     let offset = request.offset;
     let length = request.length;
+    let key = request.path.clone();
     let opened = tokio::task::spawn_blocking(move || -> io::Result<Option<PositionalRead>> {
-        let file = std::fs::File::open(&path)?;
+        let file = super::open_shard_contained(&path, &key)?;
         let size = file.metadata()?.len();
         if offset > size {
             return Ok(None);
@@ -277,6 +278,8 @@ mod tests {
             chunk_size: 64 * 1024,
             stream_slots: 2,
             pool_bytes: 32 * 64 * 1024,
+            idle_conns_per_peer: 2,
+            min_idle_conns_per_peer: 0,
             fallback_tcp: false,
             connect_timeout: Duration::from_secs(2),
             stall_timeout: Duration::from_secs(5),

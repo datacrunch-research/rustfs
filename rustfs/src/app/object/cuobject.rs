@@ -72,7 +72,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use transport::{Error as CuObjectError, RdmaToken, RegisteredArena, Server as CuObjectServer, StagingChunk};
 pub(crate) use transport::{RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER};
 
@@ -219,10 +219,12 @@ async fn build_servers() -> io::Result<(Vec<Arc<CuObjectServer>>, u16, usize, us
 #[cfg(feature = "nixl")]
 async fn build_servers() -> io::Result<(Vec<Arc<CuObjectServer>>, u16, usize, usize)> {
     use rustfs_config::{
-        DEFAULT_RUSTFS_NIXL_CHUNK_BYTES, DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT, DEFAULT_RUSTFS_NIXL_NUM_WORKERS,
+        DEFAULT_RUSTFS_NIXL_CHUNK_BYTES, DEFAULT_RUSTFS_NIXL_DEVICE_CHECK, DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS,
+        DEFAULT_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS, DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT, DEFAULT_RUSTFS_NIXL_NUM_WORKERS,
         DEFAULT_RUSTFS_NIXL_POOL_BYTES, DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, ENV_RUSTFS_NIXL_AGENT_NAME,
-        ENV_RUSTFS_NIXL_CHUNK_BYTES, ENV_RUSTFS_NIXL_MAX_INFLIGHT, ENV_RUSTFS_NIXL_NUM_WORKERS, ENV_RUSTFS_NIXL_POOL_BYTES,
-        ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, ENV_RUSTFS_NIXL_UCX_DEVICES,
+        ENV_RUSTFS_NIXL_CHUNK_BYTES, ENV_RUSTFS_NIXL_DEVICE_CHECK, ENV_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS,
+        ENV_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS, ENV_RUSTFS_NIXL_MAX_INFLIGHT, ENV_RUSTFS_NIXL_NUM_WORKERS,
+        ENV_RUSTFS_NIXL_POOL_BYTES, ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS, ENV_RUSTFS_NIXL_UCX_DEVICES,
     };
     use rustfs_nixl::NixlConfig;
 
@@ -237,6 +239,19 @@ async fn build_servers() -> io::Result<(Vec<Arc<CuObjectServer>>, u16, usize, us
         .filter(|device| !device.is_empty())
         .map(str::to_owned)
         .collect();
+    let ucx_devices = if get_env_bool(ENV_RUSTFS_NIXL_DEVICE_CHECK, DEFAULT_RUSTFS_NIXL_DEVICE_CHECK) {
+        checked_nixl_devices(
+            ucx_devices,
+            get_env_u64(ENV_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS, DEFAULT_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS),
+            Duration::from_millis(get_env_u64(
+                ENV_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS,
+                DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS,
+            )),
+        )
+        .await?
+    } else {
+        ucx_devices
+    };
     let config = NixlConfig {
         agent_name,
         ucx_devices,
@@ -292,6 +307,8 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         return Ok(());
     }
     let shard_arena = install_cuobject_shard_arena(&servers).await?;
+    #[cfg(feature = "nixl")]
+    install_nixl_recv_pool(&servers)?;
     let (major, minor) = transport::library_version();
     info!(
         event = EVENT_CUOBJECT_SERVICE_STATE,
@@ -362,6 +379,138 @@ async fn install_cuobject_shard_arena(servers: &[Arc<CuObjectServer>]) -> io::Re
         return Ok(None);
     }
     Ok(Some(arena))
+}
+
+/// Leaves out the RDMA devices that are down, slower than their peers, or flap
+/// (a long drop history, or a drop during a short watch); `RUSTFS_NIXL_DEVICE_CHECK`. An empty list
+/// means every device on the node. Fails when no device passes.
+#[cfg(feature = "nixl")]
+async fn checked_nixl_devices(candidates: Vec<String>, max_link_drops: u64, flap_window: Duration) -> io::Result<Vec<String>> {
+    let check =
+        tokio::task::spawn_blocking(move || rustfs_nixl::devices::check_system_devices(&candidates, max_link_drops, flap_window))
+            .await
+            .map_err(io::Error::other)?;
+    let kept = check.kept.join(",");
+    let excluded = check
+        .excluded
+        .iter()
+        .map(|(device, reason)| format!("{device} ({reason})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if check.kept.is_empty() {
+        error!(
+            event = EVENT_CUOBJECT_SERVICE_STATE,
+            component = LOG_COMPONENT_OBJECT,
+            subsystem = LOG_SUBSYSTEM_CUOBJECT,
+            state = "device_check",
+            result = "failed",
+            excluded = %excluded,
+            "no healthy rdma device for the nixl agent"
+        );
+        return Err(io::Error::other(format!("no healthy RDMA device for NIXL; left out: {excluded}")));
+    }
+    if check.excluded.is_empty() {
+        info!(
+            event = EVENT_CUOBJECT_SERVICE_STATE,
+            component = LOG_COMPONENT_OBJECT,
+            subsystem = LOG_SUBSYSTEM_CUOBJECT,
+            state = "device_check",
+            result = "ok",
+            kept = %kept,
+            "nixl rdma devices checked"
+        );
+    } else {
+        warn!(
+            event = EVENT_CUOBJECT_SERVICE_STATE,
+            component = LOG_COMPONENT_OBJECT,
+            subsystem = LOG_SUBSYSTEM_CUOBJECT,
+            state = "device_check",
+            result = "degraded",
+            kept = %kept,
+            excluded = %excluded,
+            "nixl rdma devices left out"
+        );
+    }
+    Ok(check.kept)
+}
+
+/// This node's NIXL agent, once the transport service is running.
+#[cfg(feature = "nixl")]
+pub(crate) fn nixl_server() -> Option<Arc<CuObjectServer>> {
+    SERVICE.get()?.servers.first().cloned()
+}
+
+/// Receive buffers for internode NIXL reads: staging chunks of this node's agent.
+#[cfg(feature = "nixl")]
+struct NixlRecvPoolAdapter {
+    server: Arc<CuObjectServer>,
+    metadata_base64: String,
+    metadata_sha256_hex: String,
+}
+
+#[cfg(feature = "nixl")]
+struct NixlRecvChunk(StagingChunk);
+
+#[cfg(feature = "nixl")]
+impl rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer for NixlRecvChunk {
+    fn descriptor(&self) -> String {
+        format!("dram:0:{:#x}:{}", self.0.addr(), self.0.capacity())
+    }
+
+    fn into_bytes(self: Box<Self>, len: usize) -> io::Result<bytes::Bytes> {
+        let mut chunk = self.0;
+        chunk.clear();
+        chunk.advance(len).map_err(io::Error::other)?;
+        Ok(bytes::Bytes::from_owner(chunk))
+    }
+}
+
+#[cfg(feature = "nixl")]
+impl rustfs_ecstore::api::rpc::nixl::NixlRecvPool for NixlRecvPoolAdapter {
+    fn agent_name(&self) -> &str {
+        self.server.name()
+    }
+
+    fn metadata_base64(&self) -> &str {
+        &self.metadata_base64
+    }
+
+    fn metadata_sha256_hex(&self) -> &str {
+        &self.metadata_sha256_hex
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        self.server.chunk_bytes()
+    }
+
+    fn reserve(
+        &self,
+    ) -> futures::future::BoxFuture<'static, io::Result<Box<dyn rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer>>> {
+        let server = Arc::clone(&self.server);
+        Box::pin(async move {
+            let chunk = server.reserve(STAGING_RESERVE_TIMEOUT).await.map_err(io::Error::other)?;
+            Ok(Box::new(NixlRecvChunk(chunk)) as Box<dyn rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer>)
+        })
+    }
+}
+
+/// Lets internode reads use this node's agent and staging pool
+/// (`RUSTFS_INTERNODE_DATA_TRANSPORT=nixl`).
+#[cfg(feature = "nixl")]
+fn install_nixl_recv_pool(servers: &[Arc<CuObjectServer>]) -> io::Result<()> {
+    let Some(server) = servers.first() else {
+        return Ok(());
+    };
+    let metadata = server
+        .local_metadata()
+        .map_err(|error| io::Error::other(format!("nixl agent metadata: {error}")))?;
+    let adapter = NixlRecvPoolAdapter {
+        server: Arc::clone(server),
+        metadata_base64: base64_simd::STANDARD.encode_to_string(&metadata),
+        metadata_sha256_hex: crate::storage::rpc::nixl_read::sha256_hex(&metadata),
+    };
+    rustfs_ecstore::api::rpc::nixl::install_nixl_recv_pool(Arc::new(adapter));
+    Ok(())
 }
 
 /// Wraps the registered memory as a block arena. The arena owns a clone of
