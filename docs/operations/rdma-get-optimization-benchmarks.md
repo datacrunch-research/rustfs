@@ -1307,6 +1307,71 @@ one server. Next: put the internode transport on both ports or on the
 port the client stripe uses less, or weight the client stripe, and rerun
 this table.
 
+## Four servers on the GPU-side InfiniBand rails (2026-11-05)
+
+Layout: RustFS servers on b300-110, b300-121, b300-139 and b300-141, four
+NVMe drives each (16 drives, one 12+4 set), `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl`
+so internode shard reads also move over NIXL, and every node's agent on the
+same four XDR rails (`mlx5_0`, `mlx5_7`, `mlx5_10`, `mlx5_13`). The client
+runs on b300-110 (also a server): host-memory clients register the four
+rails, GPU clients GPUs 0, 2, 5 and 7, each on its own rail. Page-cache
+reclaim off, mmap read on, shard arena and staging pool 8 GiB each.
+
+Rail health decided the layout. `mlx5_5` is down on 139, `mlx5_12` went down
+on 110 during the runs, 110's `mlx5_8` dropped its link 4 times in 4 idle
+minutes (68 since boot) and `mlx5_9` 22 times, and 139's `mlx5_12` 148 times;
+121 and 141 are clean. Lanes on those rails failed UCX endpoints, NIXL then
+dropped the whole peer ("remote agent ... was disconnected after transfer
+request creation") and clients saw "Destination is unreachable". The four
+rails above are healthy on every node and saw no link drop during the run.
+The startup device check (`RUSTFS_NIXL_DEVICE_CHECK`) now leaves such
+devices out on its own.
+
+Correctness: a 2 GiB NIXL PUT and a NIXL GET through each of the four
+servers, from and into host memory and GPU 0, all byte-exact against a
+plain HTTP GET (16 checks). No transfer timeout, refused internode read or
+dropped peer in the whole run.
+
+| GetObject, 8 GiB objects, aggregate over the window | GB/s |
+| --- | --- |
+| 1 host stream (four rails) | 29.2 |
+| 4 / 8 / 16 host streams | 77.7 / 77.4 / 77.1 |
+| 24 host streams | 87.3 |
+| 8 / 16 host streams, one rail each | 80.2 / 78.3 |
+| 4 GPU streams (GPUs 0, 2, 5, 7) | 97.9 |
+| 8 GPU streams (two per GPU) | 111.5 |
+
+| PutObject, 4 GiB objects, 96 MiB parts, 8 in flight per client | GB/s |
+| --- | --- |
+| 1 host stream | 2.1 |
+| 4 / 8 / 16 host streams | 6.5 / 8.5 / 9.0 |
+| 4 GPU streams | 6.6 |
+
+GETs reach the 80 GB/s target with host memory and pass 110 GB/s into GPUs.
+PUTs move their parts client-to-server over NIXL (the client node's rails
+carry the data as the servers pull it), but the erasure-coded shard writes
+between servers still use TCP/HTTP over the Ethernet bond, which caps the
+cluster near 9 GB/s; NIXL internode writes are the next step for PUT.
+Per-part `reader_setup` is 26-39 ms and `stripe_read` 12-25 ms per 48 MiB
+stripe (three quarters of every stripe's data shards are remote), and about
+a third of the client writes still take over 50 ms under 24 streams.
+
+Two client nodes (b300-110 and b300-121, GPUs 0, 2, 5, 7 each, synchronized
+start) show that this is the servers' limit, not the client's:
+
+| 8 GiB GETs, two rounds | aggregate |
+| --- | --- |
+| 8 GPU streams from 110 alone | 109.8 / 114.1 GB/s |
+| 8 GPU streams from 121 alone | 112.0 / 112.4 GB/s |
+| 16 GPU streams, 8 from each node | 95.1 / 97.1 GB/s (about 48 GB/s per node) |
+| 32 host streams, 16 from each node | 96.8 / 91.2 GB/s |
+
+For a 1.5 TB model this means about 14 s of transfer for one engine node
+from a warm page cache (2 TB of shards at 12+4, 500 GB per server, fits in
+the servers' memory with reclaim off), and loads that run together share
+the roughly 100-110 GB/s (two engines about 30 s each, four about 1 min).
+A cold first load reads NVMe and was not measured on this layout.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
