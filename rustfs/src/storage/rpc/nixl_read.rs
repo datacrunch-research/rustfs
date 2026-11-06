@@ -252,17 +252,21 @@ pub(crate) async fn handle_write_file_nixl(req: Request<Incoming>) -> Response<B
             Ok(chunk) => chunk,
             Err(error) => return refuse(StatusCode::SERVICE_UNAVAILABLE, "staging_exhausted", error),
         };
+        let read_started = rustfs_io_metrics::put_stage_timer();
         let chunk = match server.read_from_client_owned(&query.path, token, 0, len, chunk).await {
             Ok(chunk) => chunk,
             Err(error) => return refuse(StatusCode::BAD_GATEWAY, "nixl_read_failed", error),
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_file_read", read_started);
         let staged = match chunk.staged() {
             Ok(staged) => staged,
             Err(error) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "staging_view_failed", error),
         };
+        let write_started = rustfs_io_metrics::put_stage_timer();
         if let Err(error) = file.write_all(staged).await {
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, "write_failed", error);
         }
+        rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_file_write", write_started);
         written += len as u64;
     }
     if !query.append && query.last && query.size > 0 && written != query.size as u64 {
@@ -272,9 +276,11 @@ pub(crate) async fn handle_write_file_nixl(req: Request<Incoming>) -> Response<B
             format!("expected {} bytes, received {written}", query.size),
         );
     }
+    let flush_started = rustfs_io_metrics::put_stage_timer();
     if let Err(error) = file.flush().await {
         return refuse(StatusCode::INTERNAL_SERVER_ERROR, "flush_failed", error);
     }
+    rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_file_flush", flush_started);
     let mut response = reply(StatusCode::OK, "");
     response.headers_mut().insert(NIXL_BYTES_HEADER, HeaderValue::from(written));
     response

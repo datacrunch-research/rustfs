@@ -468,7 +468,9 @@ async fn send_segment(
             .map_err(|_| io::Error::other("nixl agent metadata is not a header value"))?,
     );
     build_auth_headers(&url, &Method::PUT, &mut headers)?;
+    let request_started = rustfs_io_metrics::put_stage_timer();
     let (status, response_headers, body) = rustfs_rio::internode_http_request(&url, Method::PUT, headers, Some(timeout)).await?;
+    rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_segment_request", request_started);
     if !status.is_success() {
         return Err(io::Error::other(format!(
             "nixl internode write returned {status}: {}",
