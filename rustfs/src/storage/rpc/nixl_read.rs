@@ -32,8 +32,16 @@ use rustfs_nixl::RdmaToken;
 use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
+
+/// Finishes one segment's file. A flush is not enough: the direct-I/O disk
+/// writer writes its trailing sub-alignment bytes only on shutdown, so a
+/// segment closed with a flush loses its tail (as the TCP put-file path,
+/// this shuts the writer down).
+async fn finish_segment_file<W: AsyncWrite + Unpin>(file: &mut W) -> std::io::Result<()> {
+    file.shutdown().await
+}
 
 const EVENT_NIXL_INTERNODE_READ: &str = "nixl_internode_read";
 const LOG_COMPONENT_INTERNODE_RPC: &str = "internode_rpc";
@@ -276,12 +284,60 @@ pub(crate) async fn handle_write_file_nixl(req: Request<Incoming>) -> Response<B
             format!("expected {} bytes, received {written}", query.size),
         );
     }
-    let flush_started = rustfs_io_metrics::put_stage_timer();
-    if let Err(error) = file.flush().await {
-        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "flush_failed", error);
+    let finish_started = rustfs_io_metrics::put_stage_timer();
+    if let Err(error) = finish_segment_file(&mut file).await {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "finish_failed", error);
     }
-    rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_file_flush", flush_started);
+    rustfs_io_metrics::record_put_object_stage_duration_from("nixl_write_file_finish", finish_started);
     let mut response = reply(StatusCode::OK, "");
     response.headers_mut().insert(NIXL_BYTES_HEADER, HeaderValue::from(written));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_segment_file;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+    /// Writes whole 4 KiB blocks as they fill and the remainder only on
+    /// shutdown, like the direct-I/O disk writer.
+    #[derive(Default)]
+    struct TailOnShutdown {
+        written: Vec<u8>,
+        staged: Vec<u8>,
+    }
+
+    impl AsyncWrite for TailOnShutdown {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.staged.extend_from_slice(buf);
+            let whole = self.staged.len() / 4096 * 4096;
+            let block: Vec<u8> = self.staged.drain(..whole).collect();
+            self.written.extend_from_slice(&block);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let tail = std::mem::take(&mut self.staged);
+            self.written.extend_from_slice(&tail);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn finishing_a_segment_writes_the_sub_alignment_tail() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut file = TailOnShutdown::default();
+        file.write_all(&data).await.expect("write");
+        file.flush().await.expect("flush");
+        assert_eq!(file.written.len(), 8192, "a flush leaves the tail staged");
+
+        finish_segment_file(&mut file).await.expect("finish");
+        assert_eq!(file.written, data, "finishing the segment must write every byte");
+    }
 }

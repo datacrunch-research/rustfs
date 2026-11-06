@@ -1455,6 +1455,17 @@ Short runs of 64 objects per client end within about a second and understate the
 
 With XXH3 ETags a single 57 MB PUT takes 66 ms: 50 ms of encode, now mostly the shard writes (the encoder waits about 6 ms per block on its producer), 6 ms of commit and under 2 ms of namespace lock; the lock and the existing-version lookup are too small at this size to be worth skipping for write-once objects. The two-server aggregate stays near 17-22 GB/s with either ETag.
 
+Writing the shard files with O_DIRECT (`RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE=true`) removes the page-cache work from the shard writes. These runs shared the two servers with an unrelated inference deployment, so they compare buffered and direct writes in the same pass only:
+
+| Same pass, alternating | buffered | O_DIRECT |
+| --- | --- | --- |
+| PUT, 1 in flight | 0.71-0.83 GB/s | 0.82-1.01 GB/s |
+| PUT, 1 client x 16 in flight | 6.5-6.6 GB/s | 9.2-9.7 GB/s |
+| PUT, 4 clients x 16 in flight | 6.7-7.5 GB/s | 16.0-20.6 GB/s |
+| GET of the just-written objects, 4 clients | 26.0-28.5 GB/s | 23.7-27.9 GB/s |
+
+The first O_DIRECT run lost the tail of every shard written over NIXL: the internode write handler finished each file with a flush, and the direct writer writes its trailing sub-alignment bytes only on shutdown, so GETs failed with short shard reads. The handler now shuts the writer down, as the TCP put-file path does, and every object read back byte-exact.
+
 Raising concurrency did not add throughput: 4 clients x 32 in flight with a large-PUT admission limit of 64 reached 18.9 GB/s at a p50 of 318 ms, against about 18 GB/s at 16 in flight. With the default limit (32 per server) the same load is refused with `SlowDown` (503, foreground write concurrency limit reached), which clients should retry with backoff. Every PUT verified byte-exact with its ETag equal to the MD5 of the object.
 
 ## Results by phase
