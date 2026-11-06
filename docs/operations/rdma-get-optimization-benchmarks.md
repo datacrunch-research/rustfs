@@ -1468,6 +1468,20 @@ The first O_DIRECT run lost the tail of every shard written over NIXL: the inter
 
 Raising concurrency did not add throughput: 4 clients x 32 in flight with a large-PUT admission limit of 64 reached 18.9 GB/s at a p50 of 318 ms, against about 18 GB/s at 16 in flight. With the default limit (32 per server) the same load is refused with `SlowDown` (503, foreground write concurrency limit reached), which clients should retry with backoff. Every PUT verified byte-exact with its ETag equal to the MD5 of the object.
 
+### 4k-token KV objects on four servers (2026-11-06)
+
+The same 57 MB objects on four servers (b300-110, 121, 139, 141; 16 drives, 12+4) with the client on b300-110, 128 runtime workers, fill-on-put off, `MIMALLOC_PURGE_DELAY=-1`, O_DIRECT shard writes and XXH3 ETags. An unrelated inference deployment shared b300-139 and b300-141. Every object verified byte-exact, with its XXH3 ETag, through all four servers.
+
+| Clients x objects in flight | PUT | GET |
+| --- | --- | --- |
+| 1 x 1 | 0.82 GB/s (65 ms) | |
+| 1 x 16 | 8.6 GB/s | |
+| 4 (one per server) x 16 | 28.5 GB/s (p50 108 ms) | 27.1 GB/s (first read, from the drives) |
+| 8 (two per server) x 16 | 33.4-34.4 GB/s (p50 170-177 ms) | 30.7-33.5 GB/s first read; 45.8 GB/s second read (p50 111 ms) |
+| 8 x 32, warm | | 48.7 GB/s |
+
+PUT does not gain from more than the large-PUT admission limit's 32 objects in flight per server: raising the limit to 64 (64 in flight per server) gave 21.7 GB/s at a p50 of 355 ms, and 128 gave 25.3 GB/s at 744 ms, while the servers' CPUs stayed 1-4% busy outside the client node. GET took 32 in flight per client (37.5 GB/s) but answered 64 per client with 503. Shards written with O_DIRECT are read from the drives the first time; the page cache and the object data cache serve the repeat reads about 40% faster.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
