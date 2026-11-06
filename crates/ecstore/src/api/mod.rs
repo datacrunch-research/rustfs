@@ -191,7 +191,7 @@ pub mod bucket {
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
-        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
     }
 
     pub mod config_parse_mode {
@@ -206,6 +206,12 @@ pub mod bucket {
         };
     }
 
+    pub mod etag {
+        pub use crate::bucket::etag::{
+            BUCKET_ETAG_ALGORITHM_MD5, BUCKET_ETAG_ALGORITHM_XXH3, BucketEtagConfig, bucket_uses_xxh3_etag,
+        };
+    }
+
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
             BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
@@ -213,7 +219,7 @@ pub mod bucket {
             acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
             capture_bucket_metadata_incarnation, delete, delete_if_incarnation, delete_if_incarnation_at,
             delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
-            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config, get_etag_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
@@ -621,8 +627,8 @@ pub mod rebalance {
 
 pub mod rio {
     pub use crate::io_support::rio::{
-        DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
-        boxed_reader, compression_metadata_value, wrap_reader,
+        DecryptReader, DynReader, EncryptReader, EtagAlgorithm, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption,
+        WritePlan, boxed_reader, compression_metadata_value, wrap_reader,
     };
 }
 

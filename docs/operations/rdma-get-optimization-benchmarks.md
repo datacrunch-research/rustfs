@@ -1449,7 +1449,7 @@ The PUT stage summary split a single 57 MB PUT (205 ms) into about 116 ms of enc
 | ETag MD5 on a blocking-pool thread | 0.38 GB/s (146 ms) | 4.1 GB/s | 11.0 GB/s (64 objects each) |
 | + fill-on-put off (zero-copy RDMA body) | 0.48 GB/s (113 ms) | 4.5-6.2 GB/s | 12.2-15.6 GB/s (512 objects each) |
 | + `MIMALLOC_PURGE_DELAY=-1` | 0.48-0.50 GB/s (110 ms) | 5.7-6.7 GB/s | 15.1-19.4 GB/s (512 objects each) |
-| + XXH3 ETags (`RUSTFS_OBJECT_ETAG_ALGORITHM=xxh3`) | 0.94-0.97 GB/s (55 ms) | 8.4-9.2 GB/s | 17.0-22.1 GB/s (512 objects each; MD5 16.9-18.1 in the same pass) |
+| + XXH3 ETags (process-wide at the time, now per bucket) | 0.94-0.97 GB/s (55 ms) | 8.4-9.2 GB/s | 17.0-22.1 GB/s (512 objects each; MD5 16.9-18.1 in the same pass) |
 
 Short runs of 64 objects per client end within about a second and understate the aggregate; the longer runs varied by about 20% between repeats. A system-wide profile during the 4-client PUT showed the remaining MD5 (17% of the node's CPU) and about 20% in the kernel's page allocator: faulting in and zeroing fresh buffers, TLB-shootdown IPIs and compaction under the zone lock, which the allocator's purge delay mostly removes.
 

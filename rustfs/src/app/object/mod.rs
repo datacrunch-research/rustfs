@@ -33,6 +33,7 @@ use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::object_usecase::bucket::replication::{ReplicationState, replication_statuses_map};
 use super::storage_api::object_usecase::bucket::{
     VersioningConfigExt as _,
+    etag::bucket_uses_xxh3_etag,
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
@@ -80,7 +81,9 @@ use super::storage_api::object_usecase::error::{
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
-use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::object_usecase::io::{
+    DynReader, EtagAlgorithm, HashReader, WritePlan, compression_metadata_value, wrap_reader,
+};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]

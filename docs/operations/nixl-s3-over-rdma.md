@@ -65,9 +65,29 @@ Several settings outside the NIXL variables decide PUT throughput on large hosts
 - `RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT=false` for write-heavy buckets such as an LLM KV cache: fill-on-put copies every PUT body that fits the cache entry limit into the object data cache, which cost about 30-40 ms per 57 MB object. Without it, an RDMA PutObject body also stays in the staging chunks it was read into (no copy).
 - `RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES` (default 8 MiB, `0` turns it off): bodies at least this large compute their ETag MD5 on a blocking-pool thread while the body streams into the erasure encoder, instead of inline before it. The ETag and the Content-MD5 check are unchanged; the PUT fails before commit on a mismatch.
 - `RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE=true`: shard files are written with O_DIRECT instead of through the page cache, which otherwise costs a copy into freshly allocated, zeroed cache pages, zone-lock contention and compaction on every write. With four PUT clients on two servers (57 MB objects) it more than doubled the aggregate (7 to 16-21 GB/s) while reads of the just-written objects, now served by the drives, stayed within about 10%. The NIXL internode shard writes finish every file with a writer shutdown, which the direct writer needs to write its trailing sub-alignment bytes.
-- `RUSTFS_OBJECT_ETAG_ALGORITHM=xxh3` (default `md5`) for a deployment whose clients never treat the ETag as an MD5, such as a dedicated LLM KV cache: objects written without Content-MD5 get an XXH3-128 ETag in the same 32-hex-digit form, an order of magnitude cheaper to compute. A request that carries Content-MD5 still gets an MD5 ETag and the exact check. It halved the single-stream PUT of 57 MB objects (105 to 55 ms) but did not raise the saturated aggregate. The setting is process-wide, not per bucket: on a server that also serves ordinary S3 clients, tools that compare a single-part ETag with the object's MD5 (rclone checksums, SDKs that verify uploads against the returned ETag) would report mismatches, so keep `md5` there.
+- A per-bucket XXH3 ETag for buckets whose clients never treat the ETag as an MD5, such as an LLM KV cache: objects written to the bucket without Content-MD5 get an XXH3-128 ETag in the same 32-hex-digit form, an order of magnitude cheaper to compute. It halved the single-stream PUT of 57 MB objects (105 to 55 ms) but did not raise the saturated aggregate. Other buckets keep MD5 ETags, so ordinary S3 clients (rclone checksums, SDKs that verify an upload against the returned ETag) are unaffected. See "Per-bucket ETag algorithm" below.
 
 `RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED=true` together with `RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED=true` writes the PUT and erasure stage timings (body wait, encode, internode segment writes, part commit phases) into the local stage summary file without a metrics exporter.
+
+### Per-bucket ETag algorithm
+
+A bucket's ETag algorithm is stored as a RustFS extension entry (`etag.json`) in its bucket metadata and set through the admin API with `ConfigUpdateAdminAction`:
+
+```bash
+# Use XXH3-128 ETags for objects written to the bucket without Content-MD5
+curl -X PUT "http://<host>/rustfs/admin/v3/bucket-etag/<bucket>" -d '{"algorithm":"xxh3"}'   # md5 | xxh3
+
+# Read it back ("algorithm": null means no setting: MD5 ETags)
+curl "http://<host>/rustfs/admin/v3/bucket-etag/<bucket>"
+
+# Clear it (MD5 ETags again)
+curl -X DELETE "http://<host>/rustfs/admin/v3/bucket-etag/<bucket>"
+```
+
+- It applies to PutObject and UploadPart; CopyObject, tier restore and internal writes keep MD5.
+- A request that carries Content-MD5 always gets an MD5 ETag and the exact check. Some SDKs add Content-MD5 to every PutObject and UploadPart on their own (boto3 before 1.36, for example), so their objects keep MD5 ETags, and the MD5 cost, even in an XXH3 bucket; the writer that should benefit must not send it.
+- A multipart upload keeps the algorithm the bucket had when the upload was created, so all its parts hash alike; the multipart ETag is formed from the part ETags as usual.
+- The setting propagates like the per-bucket durability override: immediately on the node that applied it, to peers through the bucket-metadata reload notification, and at the latest with the 15-minute metadata refresh. Objects already written keep their ETags.
 
 ## Wire contract
 

@@ -3589,6 +3589,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE);
         }
+        // The upload's pinned ETag algorithm is upload state, not object metadata.
+        rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_ETAG_ALGORITHM);
 
         let mut checksum_type = rustfs_rio::ChecksumType::NONE;
 

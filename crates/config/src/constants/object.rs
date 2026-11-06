@@ -125,16 +125,6 @@ pub const ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: &str = "RUSTFS_OBJECT_ETAG_MD5_
 /// Default: bodies of 8 MiB or more hash off the request's task.
 pub const DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Hash behind the ETag of an object written without Content-MD5: `md5`
-/// (default, the S3 convention) or `xxh3` (XXH3-128 in the same 32-hex-digit
-/// form, an order of magnitude cheaper, for buckets whose clients never treat
-/// the ETag as an MD5, such as an LLM KV cache). A request carrying
-/// Content-MD5 always gets an MD5 ETag, so the check stays exact.
-pub const ENV_OBJECT_ETAG_ALGORITHM: &str = "RUSTFS_OBJECT_ETAG_ALGORITHM";
-
-/// Default: MD5 ETags.
-pub const DEFAULT_OBJECT_ETAG_ALGORITHM: &str = "md5";
-
 /// Create independent shard commitments for new writes after the fleet is upgraded.
 /// Existing protected objects and multipart uploads retain their protection.
 pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
