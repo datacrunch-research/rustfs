@@ -299,9 +299,13 @@ pub(crate) mod rpc_consumer {
     /// Server side of internode NIXL chunk reads (`nixl` feature).
     #[cfg(feature = "nixl")]
     pub(crate) mod nixl_read {
+        pub(crate) use super::super::check_and_record_signed_rpc_nonce;
+        pub(crate) use super::super::ecstore_disk::DiskAPI;
         pub(crate) use super::super::find_local_disk_by_ref_for_rpc;
         pub(crate) use rustfs_ecstore::api::disk::Disk;
-        pub(crate) use rustfs_ecstore::api::rpc::nixl::{NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH};
+        pub(crate) use rustfs_ecstore::api::rpc::nixl::{
+            NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH,
+        };
     }
 
     /// Server side of the internode RDMA data plane (Linux, `rdma` feature).
