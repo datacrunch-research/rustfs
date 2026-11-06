@@ -1412,6 +1412,31 @@ quarters into host memory: about 35-40 s for a 1.5 TB model against about
 drive, well under their sequential rate); b300-121's two drives behind its
 x2 uplink share 7.9 GB/s.
 
+### Where a large PUT waits: huge-page compaction and 16 runtime workers (2026-11-06)
+
+PutObject of 8 GiB objects in 96 MiB parts, eight parts in flight per stream, streams spread over the four IB-rail servers (12+4, 16 drives), with NIXL shard writes. Per-stage timings come from the PUT stage summary (`RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED`, see the NIXL operations guide).
+
+| Change | 16 streams | 1 stream |
+| --- | --- | --- |
+| before | 8.5 GB/s | 2.0 GB/s |
+| `MIMALLOC_ALLOW_THP=0` | 12.5-14.1 GB/s | 2.3 GB/s |
+| + 128 runtime workers (`RUSTFS_RUNTIME_WORKER_THREADS`) | 22-26 GB/s | 2.2 GB/s |
+| same, PUT body read-ahead 1 instead of 4 | 22.0 GB/s; 28 streams 22.5 (27.0 with 4) | |
+
+The first profile (system-wide `perf`) showed about a third of each server's CPU in the kernel's direct compaction: mimalloc asked for transparent huge pages for the encoder's per-stripe buffers and the kernel, in `madvise` mode, compacted memory synchronously to serve them. The `MIMALLOC_ALLOW_THP=0` environment variable removes it.
+
+The second limit was not a resource. During a 16-stream PUT each server used 4-5 cores, its rails carried about 3 GB/s each, raw `ib_read_bw` reached 46-59 GB/s per rail, and the drives (5 GB/s each with direct writes) absorbed the 4.3 GB/s per node easily. NIXL itself was quick: at steady state a 16 MiB read completed 0.2-1.9 ms after it was posted, with about two transfers in flight per server. Yet the tasks waiting on those transfers resumed 9-12 ms later, and each part's metadata round trips and commit (`rename_part`) grew from tens to hundreds of milliseconds under load. The runtime had 16 worker threads (the default cap), and each part runs its MD5 and erasure encoding inline on them in bursts of 20-70 ms; a woken task waited behind those bursts. With 128 workers on the 256-core servers:
+
+| Per 96 MiB part, 16 streams | 16 workers | 128 workers |
+| --- | --- | --- |
+| part total (`multipart_store_write`) | 923 ms | 499 ms |
+| encode (MD5, erasure, shard writes) | 411 ms | 389 ms |
+| commit (`rename_part`) | 405 ms | 95 ms |
+| metadata reads before the write | 57 + 46 ms | 9 + 5 ms |
+| wait per 16 MiB body chunk | 9.1 ms | 2.3 ms |
+
+The part is now bound by its encode, where the serial MD5 (ETag) of the part dominates the producer side. Raising the large-PUT admission limit beyond its 32 parts per server did not add throughput, and at 128 it ended in 503s. Every PUT through the four servers at 128 workers, from host memory and GPU 0, reads back byte-exact.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
