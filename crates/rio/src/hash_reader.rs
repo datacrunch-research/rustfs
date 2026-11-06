@@ -100,9 +100,23 @@ use std::io::Cursor;
 use std::io::Write;
 use std::mem;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::error;
+
+/// Whether a body of `size` bytes hashes its ETag MD5 off the request's task
+/// (`RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES`, read once).
+fn md5_offload_for(size: i64) -> bool {
+    static MIN_BYTES: OnceLock<u64> = OnceLock::new();
+    let min_bytes = *MIN_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+            rustfs_config::DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+        )
+    });
+    min_bytes > 0 && u64::try_from(size).is_ok_and(|size| size >= min_bytes)
+}
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
@@ -163,7 +177,7 @@ impl HashReader {
         let inner = if size > 0 {
             let hard_limit_reader = HardLimitReader::new(inner, size);
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(hard_limit_reader, md5hex.clone()))
+                boxed_reader(EtagReader::new(hard_limit_reader, md5hex.clone()).with_md5_offload(md5_offload_for(size)))
             } else {
                 boxed_reader(hard_limit_reader)
             }
@@ -204,7 +218,9 @@ impl HashReader {
         let inner = WarpReader::new(inner);
         let inner = if size > 0 {
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(HardLimitReader::new(inner, size), md5hex.clone()))
+                boxed_reader(
+                    EtagReader::new(HardLimitReader::new(inner, size), md5hex.clone()).with_md5_offload(md5_offload_for(size)),
+                )
             } else {
                 boxed_reader(HardLimitReader::new(inner, size))
             }
@@ -306,7 +322,7 @@ impl HashReader {
                 inner = Box::new(hr);
 
                 if !diskable_md5 && !inner.is_hash_reader() {
-                    let er = EtagReader::new(inner, md5hex.clone());
+                    let er = EtagReader::new(inner, md5hex.clone()).with_md5_offload(md5_offload_for(size));
                     inner = Box::new(er);
                 }
             } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {

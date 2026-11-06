@@ -14,14 +14,58 @@
 
 use crate::compress_index::{Index, TryGetIndex};
 use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
+use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use pin_project_lite::pin_project;
 use rustfs_utils::FastMd5;
 use sha2::Sha256;
+use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::PollSender;
 use tracing::error;
+
+/// Chunks queued for the offloaded MD5 before the reader waits for it.
+const MD5_OFFLOAD_QUEUE: usize = 4;
+
+/// The ETag MD5 running on a blocking-pool thread: the reader copies every
+/// chunk it returns into the queue and collects the digest at EOF.
+enum Md5Offload {
+    /// Requested; the hasher starts on the first read, inside the runtime.
+    Pending,
+    Running {
+        chunks: PollSender<Bytes>,
+        digest: oneshot::Receiver<[u8; 16]>,
+    },
+    /// The body ended; waiting for the hasher to finish the queued chunks.
+    Draining { digest: oneshot::Receiver<[u8; 16]> },
+}
+
+impl Md5Offload {
+    /// Starts the hasher, or `None` outside a Tokio runtime (hash inline then).
+    fn start() -> Option<Self> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let (chunks, mut queue) = mpsc::channel::<Bytes>(MD5_OFFLOAD_QUEUE);
+        let (done, digest) = oneshot::channel();
+        handle.spawn_blocking(move || {
+            let mut md5 = FastMd5::new();
+            while let Some(chunk) = queue.blocking_recv() {
+                md5.update(&chunk);
+            }
+            let _ = done.send(md5.finalize());
+        });
+        Some(Self::Running {
+            chunks: PollSender::new(chunks),
+            digest,
+        })
+    }
+}
+
+fn md5_offload_failed() -> std::io::Error {
+    std::io::Error::other("offloaded ETag MD5 stopped before the body ended")
+}
 
 pin_project! {
     pub struct  EtagReader<R> {
@@ -33,6 +77,7 @@ pin_project! {
         resolved_etag: Option<String>,
         encrypted_etag_mac: Option<Hmac<Sha256>>,
         delegate_inner_etag: bool,
+        md5_offload: Option<Md5Offload>,
     }
 }
 
@@ -46,7 +91,20 @@ impl<R> EtagReader<R> {
             resolved_etag: None,
             encrypted_etag_mac: None,
             delegate_inner_etag: false,
+            md5_offload: None,
         }
+    }
+
+    /// Compute the MD5 on a blocking-pool thread while the body streams, so
+    /// it overlaps the consumer's work instead of running inline on every
+    /// read. Each returned chunk is copied once into the hasher's queue; EOF
+    /// is reported only after the digest is in, so a Content-MD5 mismatch
+    /// still fails the read. Plain ETags only: encrypted or delegated ETags
+    /// keep hashing inline.
+    pub fn with_md5_offload(mut self, offload: bool) -> Self {
+        self.md5_offload =
+            (offload && self.encrypted_etag_mac.is_none() && !self.delegate_inner_etag).then_some(Md5Offload::Pending);
+        self
     }
 
     /// Protect the content fingerprint with the object's encryption material.
@@ -94,43 +152,90 @@ where
         if *this.finished {
             return Poll::Ready(Ok(()));
         }
+        if matches!(this.md5_offload, Some(Md5Offload::Pending)) {
+            *this.md5_offload = Md5Offload::start();
+        }
 
-        let orig_filled = buf.filled().len();
-        let poll = this.inner.as_mut().poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let filled = &buf.filled()[orig_filled..];
-            if !filled.is_empty() {
-                if !*this.delegate_inner_etag {
-                    this.md5.update(filled);
+        let digest = match this.md5_offload {
+            Some(Md5Offload::Running { chunks, .. }) => {
+                // Reserve the queue slot first, so a filled chunk always has room.
+                ready!(chunks.poll_reserve(cx)).map_err(|_| md5_offload_failed())?;
+                let orig_filled = buf.filled().len();
+                ready!(this.inner.as_mut().poll_read(cx, buf))?;
+                let filled = &buf.filled()[orig_filled..];
+                if !filled.is_empty() {
+                    chunks
+                        .send_item(Bytes::copy_from_slice(filled))
+                        .map_err(|_| md5_offload_failed())?;
+                    return Poll::Ready(Ok(()));
                 }
-            } else {
-                // EOF
-                *this.finished = true;
-                if let Some(checksum) = this.checksum {
-                    let etag = if let Some(etag) = this.resolved_etag.as_ref() {
-                        etag.clone()
-                    } else {
-                        let digest = this.md5.finalize_bytes();
-                        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
-                        *this.resolved_etag = Some(etag.clone());
-                        etag
-                    };
-
-                    if *checksum != etag {
-                        error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            BadDigest {
-                                expected_md5: checksum.clone(),
-                                calculated_md5: etag,
-                            },
-                        )));
+                // EOF: close the queue and wait for the hasher.
+                let Some(Md5Offload::Running { digest, .. }) = this.md5_offload.take() else {
+                    unreachable!("matched the running offload above");
+                };
+                *this.md5_offload = Some(Md5Offload::Draining { digest });
+                let Some(Md5Offload::Draining { digest }) = this.md5_offload else {
+                    unreachable!("just set");
+                };
+                ready!(Pin::new(digest).poll(cx)).map_err(|_| md5_offload_failed())?
+            }
+            Some(Md5Offload::Draining { digest }) => ready!(Pin::new(digest).poll(cx)).map_err(|_| md5_offload_failed())?,
+            _ => {
+                let orig_filled = buf.filled().len();
+                let poll = this.inner.as_mut().poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &poll {
+                    let filled = &buf.filled()[orig_filled..];
+                    if !filled.is_empty() {
+                        if !*this.delegate_inner_etag {
+                            this.md5.update(filled);
+                        }
+                        return poll;
+                    }
+                    // EOF
+                    *this.finished = true;
+                    if let Some(checksum) = this.checksum {
+                        let etag = if let Some(etag) = this.resolved_etag.as_ref() {
+                            etag.clone()
+                        } else {
+                            let digest = this.md5.finalize_bytes();
+                            let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+                            *this.resolved_etag = Some(etag.clone());
+                            etag
+                        };
+                        if let Err(err) = check_digest(checksum, etag) {
+                            return Poll::Ready(Err(err));
+                        }
                     }
                 }
+                return poll;
             }
+        };
+
+        // The offloaded digest is in: the body ended.
+        *this.md5_offload = None;
+        *this.finished = true;
+        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+        *this.resolved_etag = Some(etag.clone());
+        if let Some(checksum) = this.checksum {
+            check_digest(checksum, etag)?;
         }
-        poll
+        Poll::Ready(Ok(()))
     }
+}
+
+/// Fails with `BadDigest` when the body's MD5 is not the client's Content-MD5.
+fn check_digest(expected: &str, etag: String) -> std::io::Result<()> {
+    if expected == etag {
+        return Ok(());
+    }
+    error!("Checksum mismatch, expected={:?}, actual={:?}", expected, etag);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        BadDigest {
+            expected_md5: expected.to_owned(),
+            calculated_md5: etag,
+        },
+    ))
 }
 
 impl<R> EtagResolvable for EtagReader<R>
@@ -194,6 +299,53 @@ mod tests {
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offloaded_md5_matches_inline_md5_across_many_reads() {
+        let mut data = vec![0u8; 3 * 1024 * 1024 + 517];
+        rand::rng().fill(&mut data[..]);
+        let expected = hex_simd::encode_to_string(Md5::digest(&data), hex_simd::AsciiCase::Lower);
+
+        // Small BufReader reads give the hasher many chunks to keep in order.
+        let reader = BufReader::with_capacity(4096, Cursor::new(data.clone()));
+        let mut etag_reader = EtagReader::new(reader, None).with_md5_offload(true);
+        let mut out = Vec::new();
+        etag_reader
+            .read_to_end(&mut out)
+            .await
+            .expect("offloaded read should succeed");
+
+        assert_eq!(out, data);
+        assert_eq!(etag_reader.try_resolve_etag(), Some(expected.clone()));
+        assert_eq!(etag_reader.get_etag(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offloaded_md5_still_rejects_a_wrong_content_md5_at_eof() {
+        let data = vec![7u8; 256 * 1024];
+        let wrong = hex_simd::encode_to_string(Md5::digest(b"something else"), hex_simd::AsciiCase::Lower);
+        let reader = BufReader::with_capacity(8192, Cursor::new(data));
+        let mut etag_reader = EtagReader::new(reader, Some(wrong)).with_md5_offload(true);
+        let mut out = Vec::new();
+        let err = etag_reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("a wrong Content-MD5 must fail the read");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.get_ref().and_then(|source| source.downcast_ref::<BadDigest>()).is_some(),
+            "the mismatch should surface as BadDigest"
+        );
+    }
+
+    #[tokio::test]
+    async fn md5_offload_is_ignored_for_encrypted_etags() {
+        let reader = Cursor::new(b"payload".to_vec());
+        let etag_reader = EtagReader::new_encrypted(reader, [1u8; 32], [2u8; 12])
+            .expect("encrypted reader")
+            .with_md5_offload(true);
+        assert!(etag_reader.md5_offload.is_none());
+    }
 
     #[tokio::test]
     async fn encrypted_etags_hide_plaintext_fingerprints_including_empty_objects() {

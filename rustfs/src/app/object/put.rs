@@ -809,19 +809,24 @@ fn put_body_cache_collector(
     ciphertext_passthrough: bool,
     headers: &HeaderMap,
 ) -> Option<PutBodyCacheCollector> {
-    if !object_data_cache_fill_on_put_enabled() || adapter.is_disabled() || should_compress || ciphertext_passthrough {
-        return None;
-    }
-    if !adapter.fill_enabled() {
-        return None;
-    }
-    let Ok(size) = u64::try_from(size) else {
-        return None;
-    };
-    if size == 0 || size > adapter.fill_size_ceiling_bytes() || has_put_sse_request_headers(headers) {
+    if should_compress
+        || ciphertext_passthrough
+        || has_put_sse_request_headers(headers)
+        || !put_body_may_fill_cache(adapter, size)
+    {
         return None;
     }
     Some(Arc::new(Mutex::new(Vec::new())))
+}
+
+/// Whether fill-on-put could keep this PUT's body (see
+/// [`put_body_cache_collector`]); when it cannot, the body is consumed and
+/// dropped with the request.
+fn put_body_may_fill_cache(adapter: &ObjectDataCacheAdapter, size: i64) -> bool {
+    object_data_cache_fill_on_put_enabled()
+        && !adapter.is_disabled()
+        && adapter.fill_enabled()
+        && u64::try_from(size).is_ok_and(|size| size > 0 && size <= adapter.fill_size_ceiling_bytes())
 }
 
 /// Joins the collected frames into one body when they add up to `size` bytes.
@@ -1289,7 +1294,11 @@ impl DefaultObjectUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match super::cuobject::rdma_token_for_request(&req.headers) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token, false)?;
+                // Zero-copy only when the body cannot outlive the request in the
+                // object data cache (fill-on-put keeps it).
+                let zero_copy =
+                    !i64::try_from(token.buffer_len).is_ok_and(|size| put_body_may_fill_cache(&self.object_data_cache(), size));
+                let (body, total) = super::cuobject::rdma_put_body(&bucket, &key, &token, zero_copy)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
                 (Some(body), Some(total), Some(total))
             }

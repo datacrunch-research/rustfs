@@ -57,10 +57,13 @@ apply unchanged.
 
 ### Large-object PUT tuning
 
-Two process-level settings outside the NIXL variables decide PUT throughput on large hosts:
+Several settings outside the NIXL variables decide PUT throughput on large hosts:
 
 - `RUSTFS_RUNTIME_WORKER_THREADS`: the runtime defaults to at most 16 worker threads, sized for small-object PUTs. A large PUT runs its part's MD5 and erasure encoding inline on those workers in bursts of 20-70 ms, so with 16 workers a task woken by a finished NIXL transfer waits behind them while most cores stay idle. On the 256-core staging servers 128 workers doubled 16-stream PUT throughput (12.5 to 26 GB/s).
 - `MIMALLOC_ALLOW_THP=0`: with transparent huge pages in `madvise` mode, the allocator's huge-page requests for the per-stripe buffers send the kernel into direct compaction, which took about a third of the CPU during PUTs.
+- `MIMALLOC_PURGE_DELAY=-1`: the allocator keeps freed memory for reuse instead of returning it to the kernel. Every PUT allocates and frees tens of megabytes of stripe and staging buffers, and returning them made the kernel fault in and zero fresh pages, shoot down TLBs and compact memory under its zone lock. Keeping them raised a 4-client PUT of 57 MB objects from about 14 to about 18 GB/s on two servers. The process's resident memory then stays at its peak.
+- `RUSTFS_OBJECT_DATA_CACHE_FILL_ON_PUT=false` for write-heavy buckets such as an LLM KV cache: fill-on-put copies every PUT body that fits the cache entry limit into the object data cache, which cost about 30-40 ms per 57 MB object. Without it, an RDMA PutObject body also stays in the staging chunks it was read into (no copy).
+- `RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES` (default 8 MiB, `0` turns it off): bodies at least this large compute their ETag MD5 on a blocking-pool thread while the body streams into the erasure encoder, instead of inline before it. The ETag and the Content-MD5 check are unchanged; the PUT fails before commit on a mismatch.
 
 `RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED=true` together with `RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED=true` writes the PUT and erasure stage timings (body wait, encode, internode segment writes, part commit phases) into the local stage summary file without a metrics exporter.
 
