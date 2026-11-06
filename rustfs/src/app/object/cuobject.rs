@@ -32,9 +32,9 @@ use http::HeaderMap;
 use rustfs_config::{
     DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
     DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
-    DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES, ENV_ERASURE_SHARD_BYTES, ENV_RUSTFS_CUOBJECT_GET_FANOUT,
-    ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES,
-    ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
+    DEFAULT_RUSTFS_CUOBJECT_PUT_READ_AHEAD, DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES, ENV_ERASURE_SHARD_BYTES,
+    ENV_RUSTFS_CUOBJECT_GET_FANOUT, ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET, ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES,
+    ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, ENV_RUSTFS_CUOBJECT_PUT_READ_AHEAD, ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES,
 };
 /// The transport this build moves bytes with: NIXL/UCX when the `nixl`
 /// feature is on, otherwise NVIDIA cuObject. Both crates expose the same
@@ -87,6 +87,8 @@ static SERVICE: OnceLock<Arc<CuObjectService>> = OnceLock::new();
 pub(crate) struct CuObjectService {
     servers: Vec<Arc<CuObjectServer>>,
     inflight_writes: usize,
+    /// Staging chunks read ahead from the client per RDMA PUT body.
+    put_read_ahead: usize,
     /// Segments one GET is split into on the server; 1 keeps the body sequential.
     get_fanout: usize,
     /// Smallest segment worth its own producer, in bytes.
@@ -289,6 +291,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         return Ok(());
     }
     let inflight_writes = get_env_usize(ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES, DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES).max(1);
+    let put_read_ahead = get_env_usize(ENV_RUSTFS_CUOBJECT_PUT_READ_AHEAD, DEFAULT_RUSTFS_CUOBJECT_PUT_READ_AHEAD).max(1);
     let get_fanout = get_env_usize(ENV_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT).max(1);
     let get_fanout_min_bytes =
         get_env_u64(ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES);
@@ -320,6 +323,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
         chunk_bytes,
         pool_bytes,
         inflight_writes,
+        put_read_ahead,
         get_fanout,
         get_fanout_min_bytes,
         get_fanout_budget,
@@ -330,6 +334,7 @@ pub(crate) async fn init_cuobject_service() -> io::Result<()> {
     let _ = SERVICE.set(Arc::new(CuObjectService {
         servers,
         inflight_writes,
+        put_read_ahead,
         get_fanout,
         get_fanout_min_bytes,
         get_fanout_budget,
@@ -808,6 +813,22 @@ impl ByteStream for RdmaPutBody {
 
 type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
+/// The staged bytes of `chunk`: with `zero_copy`, a `Bytes` that owns the
+/// chunk (it returns to the pool when the last clone drops), otherwise a copy.
+#[cfg(feature = "nixl")]
+fn staged_bytes(chunk: StagingChunk, zero_copy: bool) -> io::Result<Bytes> {
+    if zero_copy {
+        return Ok(Bytes::from_owner(chunk));
+    }
+    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
+}
+
+/// The staged bytes of `chunk`, copied (the cuObject chunk is not a byte owner).
+#[cfg(not(feature = "nixl"))]
+fn staged_bytes(chunk: StagingChunk, _zero_copy: bool) -> io::Result<Bytes> {
+    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
+}
+
 fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaToken, offset: u64, len: usize) -> StagedRead {
     let server = Arc::clone(server);
     let object = object.to_owned();
@@ -821,45 +842,56 @@ fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaTok
 /// Builds the streaming body for a PUT whose bytes live in the client's RDMA
 /// buffer (`x-amz-rdma-token`, empty HTTP body). The object length is the
 /// token's buffer length. Returns the body and that length.
-pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken) -> S3Result<(StreamingBlob, u64)> {
+///
+/// With `zero_copy` the body's chunks are the staging chunks themselves, so a
+/// consumer that keeps a chunk keeps it out of the pool: only callers whose
+/// body is consumed and dropped with the request (UploadPart) may set it.
+/// PutObject may hand its body to the object data cache, so it copies.
+pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(StreamingBlob, u64)> {
     let service = SERVICE
         .get()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma put is not enabled"))?;
     let server = Arc::clone(service.pick());
+    let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
     let chunk_bytes = server.chunk_bytes();
     let object = format!("{bucket}/{key}");
     let token = token.clone();
-    let first_len = usize::try_from(total.min(chunk_bytes as u64)).unwrap_or(chunk_bytes);
-    let pending = (total > 0).then(|| spawn_staged_read(&server, &object, &token, 0, first_len));
-    // State: (next read in flight, offset of the read after it).
-    let stream = futures::stream::try_unfold((pending, first_len as u64), move |(pending, next_offset)| {
+    // Keep `read_ahead` RDMA reads in flight, so the reads of the following
+    // chunks overlap the consumer's work on this one. The first ones start
+    // now, overlapping the request's setup.
+    let fill = move |server: &Arc<CuObjectServer>,
+                     object: &str,
+                     token: &RdmaToken,
+                     pending: &mut VecDeque<StagedRead>,
+                     next_offset: &mut u64| {
+        while pending.len() < read_ahead && *next_offset < total {
+            let len = usize::try_from((total - *next_offset).min(chunk_bytes as u64)).unwrap_or(chunk_bytes);
+            pending.push_back(spawn_staged_read(server, object, token, *next_offset, len));
+            *next_offset += len as u64;
+        }
+    };
+    let mut pending = VecDeque::with_capacity(read_ahead);
+    let mut next_offset = 0u64;
+    fill(&server, &object, &token, &mut pending, &mut next_offset);
+    // State: (reads in flight in offset order, offset of the next read to start).
+    let stream = futures::stream::try_unfold((pending, next_offset), move |(mut pending, mut next_offset)| {
         let server = Arc::clone(&server);
         let object = object.clone();
         let token = token.clone();
         async move {
-            let Some(pending) = pending else {
+            fill(&server, &object, &token, &mut pending, &mut next_offset);
+            let Some(read) = pending.pop_front() else {
                 return Ok(None);
             };
-            // Start the following read before waiting on this one, so the
-            // RDMA read of chunk N+1 overlaps the consumer's work on chunk N.
-            let following = if next_offset < total {
-                let len = usize::try_from((total - next_offset).min(chunk_bytes as u64)).unwrap_or(chunk_bytes);
-                Some((spawn_staged_read(&server, &object, &token, next_offset, len), next_offset + len as u64))
-            } else {
-                None
-            };
-            let chunk = pending
+            let wait_started = rustfs_io_metrics::put_stage_timer();
+            let chunk = read
                 .await
                 .map_err(|error| io::Error::other(format!("rdma put read task: {error}")))?
                 .map_err(|error| io::Error::other(format!("rdma put read: {error}")))?;
-            let bytes = Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?);
-            drop(chunk);
-            let state = match following {
-                Some((handle, offset)) => (Some(handle), offset),
-                None => (None, total),
-            };
-            Ok::<_, io::Error>(Some((bytes, state)))
+            rustfs_io_metrics::record_put_object_stage_duration_from("rdma_put_body_wait", wait_started);
+            let bytes = staged_bytes(chunk, zero_copy)?;
+            Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
         }
     });
     let stream = futures::TryStreamExt::map_err(stream, |error: io::Error| -> s3s::StdError { Box::new(error) });

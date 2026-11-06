@@ -449,6 +449,12 @@ pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES: &str = "RUSTFS_CUOBJECT_INFLIGHT_WRITES";
 pub const DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES: usize = 3;
 
+/// Staging chunks (RDMA reads from the client buffer) kept in flight per
+/// RDMA PUT body, so ingest never waits on one chunk's round trip at a time;
+/// each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_PUT_READ_AHEAD: &str = "RUSTFS_CUOBJECT_PUT_READ_AHEAD";
+pub const DEFAULT_RUSTFS_CUOBJECT_PUT_READ_AHEAD: usize = 4;
+
 /// Concurrent erasure-block-aligned segments one cuObject GET is split into
 /// on the server (each segment decodes and RDMA-writes its own stripes), so a
 /// single stream keeps several stripes in flight. 1 disables the fan-out.
