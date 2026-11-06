@@ -48,11 +48,21 @@ also enabled.
 | `RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS` | `3000` | How long the startup check watches the link counters; `0` skips the watch. |
 | `RUSTFS_INTERNODE_DATA_TRANSPORT` | `tcp-http` | `nixl` moves internode shard reads over NIXL too (see below). |
 | `RUSTFS_NIXL_INTERNODE_DEPTH` | `4` | Internode chunk requests in flight per remote shard stream. |
+| `RUSTFS_CUOBJECT_PUT_READ_AHEAD` | `4` | Staging chunks read from the client's buffer ahead of the PUT body's consumer; each holds one chunk of the pool. |
 
 The pipeline settings `RUSTFS_CUOBJECT_GET_FANOUT`,
 `RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES`, `RUSTFS_CUOBJECT_GET_FANOUT_BUDGET`,
 `RUSTFS_CUOBJECT_INFLIGHT_WRITES` and `RUSTFS_CUOBJECT_SHARD_ARENA_BYTES`
 apply unchanged.
+
+### Large-object PUT tuning
+
+Two process-level settings outside the NIXL variables decide PUT throughput on large hosts:
+
+- `RUSTFS_RUNTIME_WORKER_THREADS`: the runtime defaults to at most 16 worker threads, sized for small-object PUTs. A large PUT runs its part's MD5 and erasure encoding inline on those workers in bursts of 20-70 ms, so with 16 workers a task woken by a finished NIXL transfer waits behind them while most cores stay idle. On the 256-core staging servers 128 workers doubled 16-stream PUT throughput (12.5 to 26 GB/s).
+- `MIMALLOC_ALLOW_THP=0`: with transparent huge pages in `madvise` mode, the allocator's huge-page requests for the per-stripe buffers send the kernel into direct compaction, which took about a third of the CPU during PUTs.
+
+`RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED=true` together with `RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED=true` writes the PUT and erasure stage timings (body wait, encode, internode segment writes, part commit phases) into the local stage summary file without a metrics exporter.
 
 ## Wire contract
 
