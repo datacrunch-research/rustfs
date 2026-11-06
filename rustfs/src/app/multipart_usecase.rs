@@ -1301,7 +1301,7 @@ impl DefaultMultipartUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(&req.headers) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                let (body, total) = crate::app::object::cuobject::rdma_put_body(&bucket, &key, &token)?;
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(&bucket, &key, &token, true)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
                 (Some(body), Some(total), Some(total))
             }
@@ -1317,10 +1317,12 @@ impl DefaultMultipartUsecase {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let multipart_info_started = rustfs_io_metrics::put_stage_timer();
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(multipart_upload_api_error)?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("multipart_get_info", multipart_info_started);
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
