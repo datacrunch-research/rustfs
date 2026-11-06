@@ -59,6 +59,15 @@ use uuid::Uuid;
 
 /// Internode route of a NIXL chunk read.
 pub const READ_FILE_NIXL_PATH: &str = "/rustfs/rpc/read_file_nixl";
+/// Internode route of a NIXL shard write: the disk's node pulls the named buffers.
+pub const WRITE_FILE_NIXL_PATH: &str = "/rustfs/rpc/write_file_nixl";
+/// Comma-separated buffers a NIXL shard write pulls, in file order (signed).
+pub const NIXL_BUFFERS_QUERY: &str = "nixl_buffers";
+/// One-time nonce of a NIXL shard write (signed; recorded to refuse replays).
+pub const NIXL_NONCE_QUERY: &str = "nixl_nonce";
+/// Buffers a writer fills before it sends a segment; a part's shard file
+/// usually fits in one.
+const WRITE_SEGMENT_BUFFERS: usize = 4;
 /// The route the URL builder emits, replaced by [`READ_FILE_NIXL_PATH`].
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 /// Query parameters of a NIXL chunk read (signed with the URL).
@@ -92,10 +101,15 @@ pub trait NixlRecvPool: Send + Sync + 'static {
     fn reserve(&self) -> BoxFuture<'static, io::Result<Box<dyn NixlRecvBuffer>>>;
 }
 
-/// One registered receive buffer, back in the pool when dropped.
+/// One registered buffer, back in the pool when dropped. Reads land in it;
+/// writes stage shard bytes in it for the disk's node to pull.
 pub trait NixlRecvBuffer: Send + Sync + 'static {
     /// `<dram|vram>:<device>:<address>:<length>` as the serving node parses it.
     fn descriptor(&self) -> String;
+    /// The same for the first `len` bytes.
+    fn descriptor_for(&self, len: usize) -> String;
+    /// The whole buffer, writable.
+    fn spare_mut(&mut self) -> &mut [u8];
     /// The first `len` bytes as an owned, zero-copy `Bytes`.
     fn into_bytes(self: Box<Self>, len: usize) -> io::Result<Bytes>;
 }
@@ -189,7 +203,10 @@ impl InternodeDataTransport for NixlInternodeDataTransport {
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
-        self.tcp.open_write(request).await
+        match recv_pool() {
+            Some(pool) => Ok(Box::new(NixlFileWriter::new(pool, request))),
+            None => self.tcp.open_write(request).await,
+        }
     }
 
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
@@ -228,6 +245,11 @@ impl LentBuffer {
     fn complete(mut self, len: usize) -> io::Result<Bytes> {
         let buffer = self.buffer.take().expect("buffer present until completion");
         buffer.into_bytes(len)
+    }
+
+    /// The peer is done with the buffer: back to the pool now.
+    fn release(mut self) {
+        drop(self.buffer.take());
     }
 }
 
@@ -404,6 +426,210 @@ impl AsyncRead for NixlChunkReader {
     }
 }
 
+/// Sends one segment of a shard write: the disk's node pulls `buffers` (in
+/// file order) and writes them at the end of the file, creating it unless
+/// `append`. The buffers return to the pool only after the node answered.
+async fn send_segment(
+    pool: Arc<dyn NixlRecvPool>,
+    request: WriteStreamRequest,
+    buffers: Vec<(LentBuffer, usize)>,
+    append: bool,
+    last: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    let total: usize = buffers.iter().map(|(_, len)| *len).sum();
+    let descriptors = buffers
+        .iter()
+        .map(|(buffer, len)| {
+            buffer
+                .buffer
+                .as_ref()
+                .map(|buffer| buffer.descriptor_for(*len))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = format!(
+        "{}{WRITE_FILE_NIXL_PATH}?disk={}&volume={}&path={}&append={append}&size={}&last={last}&{NIXL_NONCE_QUERY}={}&{NIXL_AGENT_QUERY}={}&{NIXL_BUFFERS_QUERY}={}&{NIXL_METADATA_SHA256_QUERY}={}",
+        request.endpoint,
+        urlencoding::encode(&request.disk),
+        urlencoding::encode(&request.volume),
+        urlencoding::encode(&request.path),
+        request.size,
+        Uuid::new_v4(),
+        urlencoding::encode(pool.agent_name()),
+        urlencoding::encode(&descriptors),
+        pool.metadata_sha256_hex()
+    );
+    let mut headers = json_headers();
+    headers.insert(
+        NIXL_METADATA_HEADER,
+        HeaderValue::from_str(pool.metadata_base64())
+            .map_err(|_| io::Error::other("nixl agent metadata is not a header value"))?,
+    );
+    build_auth_headers(&url, &Method::PUT, &mut headers)?;
+    let (status, response_headers, body) = rustfs_rio::internode_http_request(&url, Method::PUT, headers, Some(timeout)).await?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "nixl internode write returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        )));
+    }
+    let written = response_headers
+        .get(NIXL_BYTES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if written != Some(total) {
+        return Err(io::Error::other(format!("nixl internode write stored {written:?} of {total} bytes")));
+    }
+    for (buffer, _) in buffers {
+        buffer.release();
+    }
+    Ok(())
+}
+
+type SegmentFuture = BoxFuture<'static, io::Result<()>>;
+type ReserveFuture = BoxFuture<'static, io::Result<Box<dyn NixlRecvBuffer>>>;
+
+struct WriterState {
+    pool: Arc<dyn NixlRecvPool>,
+    base: WriteStreamRequest,
+    timeout: Duration,
+    current: Option<(LentBuffer, usize)>,
+    filled: Vec<(LentBuffer, usize)>,
+    reserving: Option<ReserveFuture>,
+    sending: Option<SegmentFuture>,
+    segments_sent: usize,
+    shut_down: bool,
+}
+
+impl WriterState {
+    fn start_segment(&mut self, last: bool) {
+        let buffers = std::mem::take(&mut self.filled);
+        let append = self.base.append || self.segments_sent > 0;
+        self.segments_sent += 1;
+        self.sending = Some(Box::pin(send_segment(
+            Arc::clone(&self.pool),
+            self.base.clone(),
+            buffers,
+            append,
+            last,
+            self.timeout,
+        )));
+    }
+
+    fn poll_sending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.sending.as_mut() {
+            None => Poll::Ready(Ok(())),
+            Some(sending) => match sending.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.sending = None;
+                    Poll::Ready(result)
+                }
+            },
+        }
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        if self.shut_down {
+            return Poll::Ready(Err(io::Error::other("nixl internode writer is shut down")));
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Err(error) = futures::ready!(self.poll_sending(cx)) {
+            return Poll::Ready(Err(error));
+        }
+        if self.current.is_none() {
+            let pool = Arc::clone(&self.pool);
+            let reserving = self.reserving.get_or_insert_with(|| pool.reserve());
+            let buffer = futures::ready!(reserving.as_mut().poll(cx));
+            self.reserving = None;
+            self.current = Some((LentBuffer { buffer: Some(buffer?) }, 0));
+        }
+        let (lent, filled) = self.current.as_mut().expect("buffer reserved above");
+        let spare = lent.buffer.as_mut().expect("lent buffer present").spare_mut();
+        let n = data.len().min(spare.len() - *filled);
+        spare[*filled..*filled + n].copy_from_slice(&data[..n]);
+        *filled += n;
+        if *filled == spare.len() {
+            let full = self.current.take().expect("current buffer");
+            self.filled.push(full);
+            if self.filled.len() >= WRITE_SEGMENT_BUFFERS {
+                self.start_segment(false);
+            }
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.shut_down {
+            if let Err(error) = futures::ready!(self.poll_sending(cx)) {
+                return Poll::Ready(Err(error));
+            }
+            if let Some((buffer, filled)) = self.current.take() {
+                if filled > 0 {
+                    self.filled.push((buffer, filled));
+                } else {
+                    buffer.release();
+                }
+            }
+            self.shut_down = true;
+            if !self.filled.is_empty() || self.segments_sent == 0 {
+                // The last segment; with nothing written at all it still creates the file.
+                self.start_segment(true);
+            }
+        }
+        self.poll_sending(cx)
+    }
+}
+
+/// A remote shard file written through NIXL: bytes are staged in registered
+/// buffers and the disk's node pulls them, a segment at a time.
+pub struct NixlFileWriter {
+    // The mutex only makes the writer `Sync`; every access goes through `&mut self`.
+    state: std::sync::Mutex<WriterState>,
+}
+
+impl NixlFileWriter {
+    fn new(pool: Arc<dyn NixlRecvPool>, request: WriteStreamRequest) -> Self {
+        Self {
+            state: std::sync::Mutex::new(WriterState {
+                pool,
+                base: request,
+                timeout: DEFAULT_CHUNK_TIMEOUT,
+                current: None,
+                filled: Vec::new(),
+                reserving: None,
+                sending: None,
+                segments_sent: 0,
+                shut_down: false,
+            }),
+        }
+    }
+
+    fn state_mut(&mut self) -> &mut WriterState {
+        self.state.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl tokio::io::AsyncWrite for NixlFileWriter {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+        self.get_mut().state_mut().poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Bytes stay staged until a segment fills or the writer shuts down; a
+        // flush only waits for a segment already on its way.
+        self.get_mut().state_mut().poll_sending(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().state_mut().poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +644,14 @@ mod tests {
             "dram:0:0x1000:16".to_owned()
         }
 
+        fn descriptor_for(&self, len: usize) -> String {
+            format!("dram:0:0x1000:{len}")
+        }
+
+        fn spare_mut(&mut self) -> &mut [u8] {
+            &mut []
+        }
+
         fn into_bytes(self: Box<Self>, len: usize) -> io::Result<Bytes> {
             Ok(Bytes::from(vec![7u8; len]))
         }
@@ -427,6 +661,81 @@ mod tests {
         fn drop(&mut self) {
             self.released.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// A buffer backed by a plain vector, for the writer's staging logic.
+    struct VecBuffer(Vec<u8>);
+
+    impl NixlRecvBuffer for VecBuffer {
+        fn descriptor(&self) -> String {
+            self.descriptor_for(self.0.len())
+        }
+
+        fn descriptor_for(&self, len: usize) -> String {
+            format!("dram:0:0x2000:{len}")
+        }
+
+        fn spare_mut(&mut self) -> &mut [u8] {
+            &mut self.0
+        }
+
+        fn into_bytes(self: Box<Self>, len: usize) -> io::Result<Bytes> {
+            Ok(Bytes::copy_from_slice(&self.0[..len]))
+        }
+    }
+
+    struct VecPool;
+
+    impl NixlRecvPool for VecPool {
+        fn agent_name(&self) -> &str {
+            "test-agent"
+        }
+
+        fn metadata_base64(&self) -> &str {
+            ""
+        }
+
+        fn metadata_sha256_hex(&self) -> &str {
+            ""
+        }
+
+        fn chunk_bytes(&self) -> usize {
+            8
+        }
+
+        fn reserve(&self) -> BoxFuture<'static, io::Result<Box<dyn NixlRecvBuffer>>> {
+            Box::pin(async { Ok(Box::new(VecBuffer(vec![0; 8])) as Box<dyn NixlRecvBuffer>) })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_writer_stages_bytes_in_order_until_a_segment_fills() {
+        use tokio::io::AsyncWriteExt;
+        let request = WriteStreamRequest {
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            disk: "disk".to_owned(),
+            volume: "volume".to_owned(),
+            path: "path".to_owned(),
+            append: false,
+            size: 20,
+        };
+        let mut writer = NixlFileWriter::new(Arc::new(VecPool), request);
+        let data: Vec<u8> = (0u8..20).collect();
+        writer
+            .write_all(&data)
+            .await
+            .expect("staging never sends below a full segment");
+        let state = writer.state_mut();
+        assert!(state.sending.is_none(), "two full 8-byte buffers stay below the four-buffer segment");
+        let staged: Vec<u8> = state
+            .filled
+            .iter_mut()
+            .chain(state.current.iter_mut())
+            .flat_map(|(lent, len)| lent.buffer.as_mut().expect("buffer").spare_mut()[..*len].to_vec())
+            .collect();
+        assert_eq!(staged, data);
+        assert_eq!(state.filled.len(), 2);
+        assert_eq!(state.current.as_ref().map(|(_, len)| *len), Some(4));
     }
 
     #[tokio::test(start_paused = true)]

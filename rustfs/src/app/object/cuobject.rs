@@ -454,7 +454,16 @@ struct NixlRecvChunk(StagingChunk);
 #[cfg(feature = "nixl")]
 impl rustfs_ecstore::api::rpc::nixl::NixlRecvBuffer for NixlRecvChunk {
     fn descriptor(&self) -> String {
-        format!("dram:0:{:#x}:{}", self.0.addr(), self.0.capacity())
+        self.descriptor_for(self.0.capacity())
+    }
+
+    fn descriptor_for(&self, len: usize) -> String {
+        format!("dram:0:{:#x}:{}", self.0.addr(), len.min(self.0.capacity()))
+    }
+
+    fn spare_mut(&mut self) -> &mut [u8] {
+        // A reserved chunk starts empty, so its spare area is the whole chunk.
+        self.0.spare_mut().unwrap_or(&mut [])
     }
 
     fn into_bytes(self: Box<Self>, len: usize) -> io::Result<bytes::Bytes> {

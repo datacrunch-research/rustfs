@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Serving side of internode NIXL chunk reads.
+//! Serving side of internode NIXL chunk reads and shard writes.
 //!
 //! A peer asks for one range of a shard file on a local disk and names a
 //! buffer registered with its NIXL agent (signed query); this node reads the
@@ -22,14 +22,17 @@
 
 use crate::app::object::cuobject::nixl_server;
 use crate::storage::storage_api::rpc_consumer::nixl_read::{
-    Disk, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, find_local_disk_by_ref_for_rpc,
+    Disk, DiskAPI as _, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, WRITE_FILE_NIXL_PATH, check_and_record_signed_rpc_nonce,
+    find_local_disk_by_ref_for_rpc,
 };
 use http::{HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
+use rustfs_io_metrics::internode_metrics::{INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_RDMA};
 use rustfs_nixl::RdmaToken;
 use s3s::Body;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 const EVENT_NIXL_INTERNODE_READ: &str = "nixl_internode_read";
@@ -166,5 +169,113 @@ pub(crate) async fn handle_read_file_nixl(req: Request<Incoming>) -> Response<Bo
     response
         .headers_mut()
         .insert(NIXL_BYTES_HEADER, HeaderValue::from(landed as u64));
+    response
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NixlWriteQuery {
+    disk: String,
+    volume: String,
+    path: String,
+    append: bool,
+    size: i64,
+    last: bool,
+    nixl_nonce: uuid::Uuid,
+    nixl_agent: String,
+    nixl_buffers: String,
+    nixl_md: String,
+}
+
+/// A segment of a shard write: pull every named buffer from the writer's
+/// agent (NIXL READ) and write it at the end of the file through the same
+/// disk writer the TCP path uses. The nonce is recorded so a replayed request
+/// is refused; the signature covers the buffers and the metadata digest.
+pub(crate) async fn handle_write_file_nixl(req: Request<Incoming>) -> Response<Body> {
+    let query: NixlWriteQuery = match serde_urlencoded::from_str(req.uri().query().unwrap_or_default()) {
+        Ok(query) => query,
+        Err(error) => return refuse(StatusCode::BAD_REQUEST, "bad_query", error),
+    };
+    if let Err(error) = check_and_record_signed_rpc_nonce(
+        req.headers(),
+        query.nixl_nonce,
+        WRITE_FILE_NIXL_PATH,
+        INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_RDMA,
+    ) {
+        return refuse(StatusCode::FORBIDDEN, "nonce_rejected", error);
+    }
+    let Some(server) = nixl_server() else {
+        return reply(StatusCode::SERVICE_UNAVAILABLE, "nixl transport is not running on this node");
+    };
+    let metadata = match req.headers().get(NIXL_METADATA_HEADER).map(HeaderValue::to_str) {
+        Some(Ok(value)) => Some(value),
+        Some(Err(_)) => return refuse(StatusCode::BAD_REQUEST, "bad_metadata_header", "not ascii"),
+        None => None,
+    };
+    if let Some(encoded) = metadata {
+        let raw = match base64_simd::STANDARD.decode_to_vec(encoded) {
+            Ok(raw) => raw,
+            Err(error) => return refuse(StatusCode::BAD_REQUEST, "bad_metadata_encoding", error),
+        };
+        if sha256_hex(&raw) != query.nixl_md.to_ascii_lowercase() {
+            return refuse(StatusCode::FORBIDDEN, "metadata_digest_mismatch", &query.nixl_agent);
+        }
+    }
+    let mut tokens = Vec::new();
+    for descriptor in query.nixl_buffers.split(',').filter(|descriptor| !descriptor.is_empty()) {
+        match RdmaToken::from_headers(&query.nixl_agent, metadata, descriptor) {
+            Ok(token) if token.buffer_len as usize <= server.chunk_bytes() => tokens.push(token),
+            Ok(token) => return refuse(StatusCode::BAD_REQUEST, "buffer_too_large", token.buffer_len),
+            Err(error) => return refuse(StatusCode::BAD_REQUEST, "bad_nixl_token", error),
+        }
+    }
+
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(Some(disk)) => disk,
+        Ok(None) => return refuse(StatusCode::BAD_REQUEST, "disk_not_found", &query.disk),
+        Err(_) => return reply(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let opened = if query.append {
+        disk.append_file(&query.volume, &query.path).await
+    } else {
+        disk.create_file("", &query.volume, &query.path, query.size).await
+    };
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "open_failed", error),
+    };
+
+    let mut written: u64 = 0;
+    for token in &tokens {
+        let len = token.buffer_len as usize;
+        let chunk = match server.reserve(STAGING_WAIT).await {
+            Ok(chunk) => chunk,
+            Err(error) => return refuse(StatusCode::SERVICE_UNAVAILABLE, "staging_exhausted", error),
+        };
+        let chunk = match server.read_from_client_owned(&query.path, token, 0, len, chunk).await {
+            Ok(chunk) => chunk,
+            Err(error) => return refuse(StatusCode::BAD_GATEWAY, "nixl_read_failed", error),
+        };
+        let staged = match chunk.staged() {
+            Ok(staged) => staged,
+            Err(error) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "staging_view_failed", error),
+        };
+        if let Err(error) = file.write_all(staged).await {
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, "write_failed", error);
+        }
+        written += len as u64;
+    }
+    if !query.append && query.last && query.size > 0 && written != query.size as u64 {
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "size_mismatch",
+            format!("expected {} bytes, received {written}", query.size),
+        );
+    }
+    if let Err(error) = file.flush().await {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "flush_failed", error);
+    }
+    let mut response = reply(StatusCode::OK, "");
+    response.headers_mut().insert(NIXL_BYTES_HEADER, HeaderValue::from(written));
     response
 }

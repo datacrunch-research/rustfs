@@ -646,8 +646,9 @@ pub mod rpc {
     /// and the wire names its serving handler shares with the transport.
     pub mod nixl {
         pub use crate::cluster::rpc::nixl_internode::{
-            NIXL_AGENT_QUERY, NIXL_BUFFER_QUERY, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, NIXL_METADATA_SHA256_QUERY,
-            NixlRecvBuffer, NixlRecvPool, READ_FILE_NIXL_PATH, install_nixl_recv_pool,
+            NIXL_AGENT_QUERY, NIXL_BUFFER_QUERY, NIXL_BUFFERS_QUERY, NIXL_BYTES_HEADER, NIXL_METADATA_HEADER,
+            NIXL_METADATA_SHA256_QUERY, NIXL_NONCE_QUERY, NixlRecvBuffer, NixlRecvPool, READ_FILE_NIXL_PATH,
+            WRITE_FILE_NIXL_PATH, install_nixl_recv_pool,
         };
     }
     pub use crate::cluster::rpc::{
