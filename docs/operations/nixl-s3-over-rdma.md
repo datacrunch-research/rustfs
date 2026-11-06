@@ -93,10 +93,10 @@ is excluded. If no device passes, startup fails. The check runs once; a
 device that fails later stays in use until the next restart. Clients choose
 their own devices.
 
-## Internode reads over NIXL
+## Internode reads and writes over NIXL
 
-With `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl` the shard reads between servers
-also move over NIXL, so a cluster can run its whole data plane on the
+With `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl` the shard reads and writes between
+servers also move over NIXL, so a cluster can run its whole data plane on the
 GPU-side InfiniBand rails, which have no IP addresses. The control request
 stays on the internode HTTP connection; only the data moves over the rails.
 
@@ -113,7 +113,16 @@ stays on the internode HTTP connection; only the data moves over the rails.
   file). The buffer reaches the decoder as a zero-copy `Bytes`.
 - `RUSTFS_NIXL_INTERNODE_DEPTH` (default `4`) chunk requests run per stream;
   a chunk is one staging chunk (`RUSTFS_NIXL_CHUNK_BYTES`).
-- Writes, directory walks, unbounded reads and any stream whose first chunk
+- Shard writes: the writing node stages the file's bytes in registered
+  buffers and, once the file is complete (or every four buffers for a large
+  file), sends a signed `PUT /rustfs/rpc/write_file_nixl` naming them
+  (`nixl_buffers`, in file order), its agent, the metadata digest and a
+  one-time `nixl_nonce`. The disk's node records the nonce (a replay is
+  refused), pulls every buffer with a NIXL READ and writes it through the
+  same disk writer as the TCP path (create, or append for later segments),
+  checks the declared size on the last segment and flushes. The buffers
+  return to the writer's pool only after the node answered.
+- Directory walks, unbounded reads and any read stream whose first chunk
   fails use TCP/HTTP, which also keeps its typed errors (file not found and
   so on). A build without the `nixl` feature answers the route with `404`,
   which the reader treats the same way.

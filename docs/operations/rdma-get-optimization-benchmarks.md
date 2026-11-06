@@ -1372,6 +1372,46 @@ the servers' memory with reclaim off), and loads that run together share
 the roughly 100-110 GB/s (two engines about 30 s each, four about 1 min).
 A cold first load reads NVMe and was not measured on this layout.
 
+### NIXL shard writes and cold loads (2026-11-05)
+
+Internode shard writes now move over NIXL too: the writing node stages each
+remote shard file in registered buffers and the disk's node pulls them with
+a NIXL READ when the file is complete (`PUT /rustfs/rpc/write_file_nixl`),
+writing through the same disk writer as the TCP path. Every PUT through the
+four servers, from host memory and GPU 0, reads back byte-exact.
+
+| PutObject, 4 GiB objects, 96 MiB parts | TCP shard writes | NIXL shard writes |
+| --- | --- | --- |
+| 1 stream | 2.1 GB/s | 2.3 GB/s |
+| 4 streams | 6.5 GB/s | 8.2 GB/s |
+| 8 streams | 8.5 GB/s | 8.6 GB/s |
+| 16 streams | 9.0 GB/s | 6.5-9.5 GB/s |
+
+The transport was not PUT's limit. During a 16-stream PUT each server keeps
+40-45 cores of its runtime threads busy for about 2.4 GB/s of ingest, with no
+thread waiting on the drives and the fsync pool idle; a 96 MiB part takes
+about 400 ms with eight parts in flight per client. The part's MD5 (ETag)
+accounts for about three of those cores; the rest (erasure encoding, bitrot
+hashing, buffer copies or spinning) needs a profile with symbols, which the
+`fast` build strips (`--profile profiling` keeps them).
+
+Cold loads: a 128 GiB dataset (16 objects of 8 GiB written over NIXL) read
+after evicting only RustFS's shard files from the page cache
+(`dd iflag=nocache`, so the other workloads' cache stays), with the servers'
+NVMe read counters confirming the reads came from the drives:
+
+| reads of the dataset | warm | cold | NVMe read during the cold row |
+| --- | --- | --- | --- |
+| 16 host streams | 50.3 GB/s | 36.6 GB/s | 137.5 GB |
+| 8 GPU streams (GPUs 0, 2, 5, 7) | 122.5 GB/s | 43.3 GB/s | 68.8 GB |
+| 1 host stream (8 GiB) | | 26.4 GB/s | 8.6 GB |
+
+A cold load runs at roughly a third of the warm rate into GPUs and three
+quarters into host memory: about 35-40 s for a 1.5 TB model against about
+14 s warm. The busiest nodes read about 12 GB/s from four drives (3 GB/s per
+drive, well under their sequential rate); b300-121's two drives behind its
+x2 uplink share 7.9 GB/s.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |
