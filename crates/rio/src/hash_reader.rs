@@ -118,6 +118,29 @@ fn md5_offload_for(size: i64) -> bool {
     min_bytes > 0 && u64::try_from(size).is_ok_and(|size| size >= min_bytes)
 }
 
+/// Whether ETags of bodies without Content-MD5 use XXH3-128
+/// (`RUSTFS_OBJECT_ETAG_ALGORITHM=xxh3`, read once).
+fn xxh3_etag_enabled() -> bool {
+    static XXH3: OnceLock<bool> = OnceLock::new();
+    *XXH3.get_or_init(|| {
+        rustfs_utils::get_env_str(rustfs_config::ENV_OBJECT_ETAG_ALGORITHM, rustfs_config::DEFAULT_OBJECT_ETAG_ALGORITHM)
+            .trim()
+            .eq_ignore_ascii_case("xxh3")
+    })
+}
+
+/// The ETag reader for a body of `size` bytes: XXH3 when configured and the
+/// client sent no Content-MD5, otherwise MD5, hashed off the request's task
+/// when the body is large.
+fn etag_reader<R>(inner: R, md5hex: &Option<String>, size: i64) -> EtagReader<R> {
+    let reader = EtagReader::new(inner, md5hex.clone());
+    if md5hex.is_none() && xxh3_etag_enabled() {
+        reader.with_xxh3_etag(true)
+    } else {
+        reader.with_md5_offload(md5_offload_for(size))
+    }
+}
+
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
     fn into_inner(self) -> DynReader;
@@ -177,12 +200,12 @@ impl HashReader {
         let inner = if size > 0 {
             let hard_limit_reader = HardLimitReader::new(inner, size);
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(hard_limit_reader, md5hex.clone()).with_md5_offload(md5_offload_for(size)))
+                boxed_reader(etag_reader(hard_limit_reader, &md5hex, size))
             } else {
                 boxed_reader(hard_limit_reader)
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size))
         } else {
             boxed_reader(inner)
         };
@@ -218,14 +241,12 @@ impl HashReader {
         let inner = WarpReader::new(inner);
         let inner = if size > 0 {
             if !diskable_md5 {
-                boxed_reader(
-                    EtagReader::new(HardLimitReader::new(inner, size), md5hex.clone()).with_md5_offload(md5_offload_for(size)),
-                )
+                boxed_reader(etag_reader(HardLimitReader::new(inner, size), &md5hex, size))
             } else {
                 boxed_reader(HardLimitReader::new(inner, size))
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size))
         } else {
             boxed_reader(inner)
         };
@@ -322,11 +343,11 @@ impl HashReader {
                 inner = Box::new(hr);
 
                 if !diskable_md5 && !inner.is_hash_reader() {
-                    let er = EtagReader::new(inner, md5hex.clone()).with_md5_offload(md5_offload_for(size));
+                    let er = etag_reader(inner, &md5hex, size);
                     inner = Box::new(er);
                 }
             } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-                let er = EtagReader::new(inner, md5hex.clone());
+                let er = etag_reader(inner, &md5hex, size);
                 inner = Box::new(er);
             }
 

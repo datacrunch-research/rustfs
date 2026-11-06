@@ -78,6 +78,7 @@ pin_project! {
         encrypted_etag_mac: Option<Hmac<Sha256>>,
         delegate_inner_etag: bool,
         md5_offload: Option<Md5Offload>,
+        xxh3: Option<Box<xxhash_rust::xxh3::Xxh3>>,
     }
 }
 
@@ -92,7 +93,20 @@ impl<R> EtagReader<R> {
             encrypted_etag_mac: None,
             delegate_inner_etag: false,
             md5_offload: None,
+            xxh3: None,
         }
+    }
+
+    /// Derive the ETag from XXH3-128 instead of MD5, in the same 32-hex-digit
+    /// form. Only for a plain ETag the client does not check: with an
+    /// expected Content-MD5, an encrypted or a delegated ETag the reader
+    /// keeps MD5.
+    pub fn with_xxh3_etag(mut self, enable: bool) -> Self {
+        if enable && self.checksum.is_none() && self.encrypted_etag_mac.is_none() && !self.delegate_inner_etag {
+            self.xxh3 = Some(Box::new(xxhash_rust::xxh3::Xxh3::new()));
+            self.md5_offload = None;
+        }
+        self
     }
 
     /// Compute the MD5 on a blocking-pool thread while the body streams, so
@@ -136,8 +150,10 @@ impl<R> EtagReader<R> {
             return etag.clone();
         }
 
-        let digest = self.md5.finalize_bytes();
-        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+        let etag = match &self.xxh3 {
+            Some(xxh3) => hex_simd::encode_to_string(xxh3.digest128().to_be_bytes(), hex_simd::AsciiCase::Lower),
+            None => hex_simd::encode_to_string(self.md5.finalize_bytes(), hex_simd::AsciiCase::Lower),
+        };
         self.resolved_etag = Some(etag.clone());
         etag
     }
@@ -186,7 +202,9 @@ where
                 if let Poll::Ready(Ok(())) = &poll {
                     let filled = &buf.filled()[orig_filled..];
                     if !filled.is_empty() {
-                        if !*this.delegate_inner_etag {
+                        if let Some(xxh3) = this.xxh3.as_mut() {
+                            xxh3.update(filled);
+                        } else if !*this.delegate_inner_etag {
                             this.md5.update(filled);
                         }
                         return poll;
@@ -336,6 +354,44 @@ mod tests {
             err.get_ref().and_then(|source| source.downcast_ref::<BadDigest>()).is_some(),
             "the mismatch should surface as BadDigest"
         );
+    }
+
+    #[tokio::test]
+    async fn xxh3_etag_is_the_xxh3_128_of_the_body() {
+        let mut data = vec![0u8; 1024 * 1024 + 33];
+        rand::rng().fill(&mut data[..]);
+        let expected = hex_simd::encode_to_string(xxhash_rust::xxh3::xxh3_128(&data).to_be_bytes(), hex_simd::AsciiCase::Lower);
+        let md5 = hex_simd::encode_to_string(Md5::digest(&data), hex_simd::AsciiCase::Lower);
+
+        let reader = BufReader::with_capacity(4096, Cursor::new(data.clone()));
+        let mut etag_reader = EtagReader::new(reader, None).with_xxh3_etag(true);
+        let mut out = Vec::new();
+        etag_reader.read_to_end(&mut out).await.expect("xxh3 read should succeed");
+
+        assert_eq!(out, data);
+        let etag = etag_reader.try_resolve_etag().expect("finished reader resolves its ETag");
+        assert_eq!(etag, expected);
+        assert_eq!(etag.len(), 32, "same width as an MD5 ETag");
+        assert_ne!(etag, md5);
+    }
+
+    #[tokio::test]
+    async fn xxh3_etag_keeps_md5_when_the_client_sent_content_md5() {
+        let data = b"payload with a Content-MD5".to_vec();
+        let md5 = hex_simd::encode_to_string(Md5::digest(&data), hex_simd::AsciiCase::Lower);
+        let mut etag_reader = EtagReader::new(Cursor::new(data), Some(md5.clone())).with_xxh3_etag(true);
+        assert!(etag_reader.xxh3.is_none());
+        let mut out = Vec::new();
+        etag_reader
+            .read_to_end(&mut out)
+            .await
+            .expect("matching Content-MD5 should pass");
+        assert_eq!(etag_reader.try_resolve_etag(), Some(md5));
+
+        let wrong = hex_simd::encode_to_string(Md5::digest(b"other"), hex_simd::AsciiCase::Lower);
+        let mut etag_reader = EtagReader::new(Cursor::new(b"payload".to_vec()), Some(wrong)).with_xxh3_etag(true);
+        let mut out = Vec::new();
+        assert!(etag_reader.read_to_end(&mut out).await.is_err(), "a wrong Content-MD5 must still fail");
     }
 
     #[tokio::test]

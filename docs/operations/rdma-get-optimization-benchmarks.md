@@ -1449,8 +1449,11 @@ The PUT stage summary split a single 57 MB PUT (205 ms) into about 116 ms of enc
 | ETag MD5 on a blocking-pool thread | 0.38 GB/s (146 ms) | 4.1 GB/s | 11.0 GB/s (64 objects each) |
 | + fill-on-put off (zero-copy RDMA body) | 0.48 GB/s (113 ms) | 4.5-6.2 GB/s | 12.2-15.6 GB/s (512 objects each) |
 | + `MIMALLOC_PURGE_DELAY=-1` | 0.48-0.50 GB/s (110 ms) | 5.7-6.7 GB/s | 15.1-19.4 GB/s (512 objects each) |
+| + XXH3 ETags (`RUSTFS_OBJECT_ETAG_ALGORITHM=xxh3`) | 0.94-0.97 GB/s (55 ms) | 8.4-9.2 GB/s | 17.0-22.1 GB/s (512 objects each; MD5 16.9-18.1 in the same pass) |
 
 Short runs of 64 objects per client end within about a second and understate the aggregate; the longer runs varied by about 20% between repeats. A system-wide profile during the 4-client PUT showed the remaining MD5 (17% of the node's CPU) and about 20% in the kernel's page allocator: faulting in and zeroing fresh buffers, TLB-shootdown IPIs and compaction under the zone lock, which the allocator's purge delay mostly removes.
+
+With XXH3 ETags a single 57 MB PUT takes 66 ms: 50 ms of encode, now mostly the shard writes (the encoder waits about 6 ms per block on its producer), 6 ms of commit and under 2 ms of namespace lock; the lock and the existing-version lookup are too small at this size to be worth skipping for write-once objects. The two-server aggregate stays near 17-22 GB/s with either ETag.
 
 Raising concurrency did not add throughput: 4 clients x 32 in flight with a large-PUT admission limit of 64 reached 18.9 GB/s at a p50 of 318 ms, against about 18 GB/s at 16 in flight. With the default limit (32 per server) the same load is refused with `SlowDown` (503, foreground write concurrency limit reached), which clients should retry with backoff. Every PUT verified byte-exact with its ETag equal to the MD5 of the object.
 
