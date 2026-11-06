@@ -1437,6 +1437,23 @@ The second limit was not a resource. During a 16-stream PUT each server used 4-5
 
 The part is now bound by its encode, where the serial MD5 (ETag) of the part dominates the producer side. Raising the large-PUT admission limit beyond its 32 parts per server did not add throughput, and at 128 it ended in 503s. Every PUT through the four servers at 128 workers, from host memory and GPU 0, reads back byte-exact.
 
+### 4k-token KV objects: offloaded MD5, no fill-on-put, allocator purge (2026-11-06)
+
+LLM KV-cache objects of 4,096 tokens (Kimi K3 FP8 MLA: 24 layers x 576 B per token, 56.6 MB), each a single PutObject over NIXL, on two servers (b300-139 and b300-141, eight drives, 6+2) with the client on b300-110 and 128 runtime workers. Durability `none` changed nothing at this size (PUT 9.24 against 9.46 GB/s with four clients), so the work went into the per-byte path.
+
+The PUT stage summary split a single 57 MB PUT (205 ms) into about 116 ms of encoder waiting on its producer (the body read and the inline ETag MD5), 32 ms of fill-on-put (copying the body into the object data cache), about 28 ms of shard writes and 6 ms of commit.
+
+| Change | 1 stream, 1 in flight | 1 client, 16 in flight | 4 clients x 16 in flight |
+| --- | --- | --- | --- |
+| before | 0.27 GB/s (205 ms) | 3.4 GB/s | 9.2-9.5 GB/s (64 objects each) |
+| ETag MD5 on a blocking-pool thread | 0.38 GB/s (146 ms) | 4.1 GB/s | 11.0 GB/s (64 objects each) |
+| + fill-on-put off (zero-copy RDMA body) | 0.48 GB/s (113 ms) | 4.5-6.2 GB/s | 12.2-15.6 GB/s (512 objects each) |
+| + `MIMALLOC_PURGE_DELAY=-1` | 0.48-0.50 GB/s (110 ms) | 5.7-6.7 GB/s | 15.1-19.4 GB/s (512 objects each) |
+
+Short runs of 64 objects per client end within about a second and understate the aggregate; the longer runs varied by about 20% between repeats. A system-wide profile during the 4-client PUT showed the remaining MD5 (17% of the node's CPU) and about 20% in the kernel's page allocator: faulting in and zeroing fresh buffers, TLB-shootdown IPIs and compaction under the zone lock, which the allocator's purge delay mostly removes.
+
+Raising concurrency did not add throughput: 4 clients x 32 in flight with a large-PUT admission limit of 64 reached 18.9 GB/s at a p50 of 318 ms, against about 18 GB/s at 16 in flight. With the default limit (32 per server) the same load is refused with `SlowDown` (503, foreground write concurrency limit reached), which clients should retry with backoff. Every PUT verified byte-exact with its ETag equal to the MD5 of the object.
+
 ## Results by phase
 
 | Phase | Build | Single RDMA GET into GPU | Single HTTP GET | 16 ranged RDMA GETs in flight | 32 in flight | CPU s/GiB |

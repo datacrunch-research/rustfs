@@ -116,6 +116,15 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Smallest declared body, in bytes, whose ETag MD5 is computed on a
+/// blocking-pool thread while the body streams into the erasure encoder,
+/// instead of inline on the request's task. The ETag and Content-MD5
+/// checks are unchanged; `0` keeps every MD5 inline.
+pub const ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: &str = "RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES";
+
+/// Default: bodies of 8 MiB or more hash off the request's task.
+pub const DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Create independent shard commitments for new writes after the fleet is upgraded.
 /// Existing protected objects and multipart uploads retain their protection.
 pub const ENV_SHARD_INTEGRITY_WRITE: &str = "RUSTFS_SHARD_INTEGRITY_WRITE";
