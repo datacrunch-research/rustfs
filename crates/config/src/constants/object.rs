@@ -117,6 +117,14 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
 
+/// Comma-separated buckets that hold a content-addressed cache (an LLM KV
+/// cache) and serve PutObject, GetObject and HeadObject without distributed
+/// locks or authoritative bucket-metadata reads. See
+/// `rustfs_ecstore::bucket::lockless_cache` for what such a bucket gives up.
+///
+/// Default is empty: every bucket keeps the locked paths.
+pub const ENV_LOCKLESS_CACHE_BUCKETS: &str = "RUSTFS_LOCKLESS_CACHE_BUCKETS";
+
 /// Smallest declared body, in bytes, whose ETag MD5 is computed on a
 /// blocking-pool thread while the body streams into the erasure encoder,
 /// instead of inline on the request's task. The ETag and Content-MD5
