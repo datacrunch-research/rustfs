@@ -4671,7 +4671,11 @@ impl ECStore {
         if !is_meta_bucketname(bucket) && opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
         }
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+        // A lockless cache bucket has no Object Lock, quota or versioning (the app
+        // layer checked the cached state), so the snapshot's lifecycle and
+        // metadata-transaction locks and its authoritative metadata read guard
+        // nothing it relies on.
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) && !opts.is_lockless_cache_write() {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
