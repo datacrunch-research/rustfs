@@ -51,6 +51,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_python_bin.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	./scripts/check_embedded_secrets.sh --self-test
+	./scripts/check_bucket_engine_boundaries.sh --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
