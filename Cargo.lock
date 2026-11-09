@@ -9897,6 +9897,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-bucket-engine"
+version = "1.0.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "hotpath",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "rustfs-checksums"
 version = "1.0.2"
 dependencies = [
