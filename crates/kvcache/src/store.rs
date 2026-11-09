@@ -165,6 +165,16 @@ pub struct KvStore {
     index: Vec<RwLock<HashMap<String, Location>>>,
 }
 
+fn entry_info(location: &Location) -> EntryInfo {
+    EntryInfo {
+        drive: location.drive,
+        segment: location.segment.id(),
+        value_len: location.value_len,
+        value_crc: location.value_crc,
+        write_time_ms: location.write_time_ms,
+    }
+}
+
 fn shard_of(key: &str) -> usize {
     crate::format::crc32c(key.as_bytes()) as usize % INDEX_SHARDS
 }
@@ -520,14 +530,10 @@ impl KvStore {
         }
     }
 
+    /// Looks `key` up without touching the segment's reference count, so
+    /// concurrent lookups of entries in the same segment do not contend.
     pub fn head(&self, key: &str) -> Option<EntryInfo> {
-        self.locate(key).map(|location| EntryInfo {
-            drive: location.drive,
-            segment: location.segment.id(),
-            value_len: location.value_len,
-            value_crc: location.value_crc,
-            write_time_ms: location.write_time_ms,
-        })
+        self.index[shard_of(key)].read().get(key).map(entry_info)
     }
 
     /// Removes `key` from the index; its bytes are reclaimed with its segment.
@@ -553,16 +559,7 @@ impl KvStore {
         for shard in &self.index {
             for (key, location) in shard.read().iter() {
                 if key.starts_with(prefix) && start_after.is_none_or(|after| key.as_str() > after) {
-                    keys.push((
-                        key.clone(),
-                        EntryInfo {
-                            drive: location.drive,
-                            segment: location.segment.id(),
-                            value_len: location.value_len,
-                            value_crc: location.value_crc,
-                            write_time_ms: location.write_time_ms,
-                        },
-                    ));
+                    keys.push((key.clone(), entry_info(location)));
                 }
             }
         }
