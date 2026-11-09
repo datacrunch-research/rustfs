@@ -515,11 +515,18 @@ fn sync_application_configs(bucket: &str, bm: &BucketMetadata) {
         bm.on_demand_migration_config()
             .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
     );
+    publish_bucket_config(
+        bucket,
+        super::metadata::BUCKET_ENGINE_CONFIG,
+        bm.engine_config()
+            .map(|(bytes, stamp)| (bytes, stamp, bm.bucket_incarnation_id)),
+    );
 }
 
 /// Withdraw every application-owned configuration when the bucket leaves the cache.
 fn clear_application_configs(bucket: &str) {
     publish_bucket_config(bucket, super::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG, None);
+    publish_bucket_config(bucket, super::metadata::BUCKET_ENGINE_CONFIG, None);
 }
 
 pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {

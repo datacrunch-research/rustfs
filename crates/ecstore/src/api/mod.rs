@@ -191,7 +191,9 @@ pub mod bucket {
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
-        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+        pub use crate::bucket::metadata::{
+            BUCKET_DURABILITY_CONFIG, BUCKET_ENGINE_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+        };
     }
 
     pub mod config_parse_mode {
