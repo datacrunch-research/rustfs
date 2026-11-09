@@ -75,6 +75,9 @@ connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# Registers the node-local, non-durable `memory` bucket engine (tests and
+# benchmarks of the bucket engine framework; single-node deployments only).
+bucket-engine-memory = []
 # Linux-only internode RDMA data transport; needs libibverbs and librdmacm at build and run time.
 rdma = ["rustfs-ecstore/rdma"]
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.

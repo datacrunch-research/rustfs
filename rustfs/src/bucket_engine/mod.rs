@@ -24,6 +24,10 @@
 //! `docs/architecture/bucket-engines.md`.
 
 pub(crate) mod binding;
+pub(crate) mod dispatch;
+pub(crate) mod lifecycle;
+#[cfg(any(test, feature = "bucket-engine-memory"))]
+pub mod memory;
 mod registry;
 mod storage_api;
 
@@ -34,6 +38,8 @@ pub use registry::{BoundBucket, EngineRegistry, EngineRoute};
 /// load reaches the registry. Idempotent across embedded and server startups.
 pub(crate) fn init_bucket_engine_runtime() -> bool {
     let registry = EngineRegistry::global();
+    #[cfg(feature = "bucket-engine-memory")]
+    registry.register_engine(std::sync::Arc::new(memory::MemoryEngine::new()));
     storage_api::register_bucket_config_subscriber(
         "bucket-engine",
         storage_api::BUCKET_ENGINE_CONFIG,
