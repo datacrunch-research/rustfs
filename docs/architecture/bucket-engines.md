@@ -35,7 +35,7 @@ An engine declares and implements the following. The contract types live in `cra
 ### Configuration and publication
 
 - The engine entry is written at bucket creation (a CreateBucket extension header carrying the engine name, followed by the config) or through an admin route modelled on the per-bucket ETag routes, gated by a config-update admin action and registered in `rustfs/src/admin/route_policy.rs`.
-- Every bucket metadata install path publishes the entry to the engine registry, keyed by bucket and incarnation, and peers reload it through the existing bucket metadata notification. The single-consumer publish hook (`BUCKET_CONFIG_PUBLISH_HOOK` in `crates/ecstore/src/bucket/metadata_sys.rs`, held by on-demand migration) becomes multi-subscriber so engines and existing consumers can both observe bucket config changes.
+- Every bucket metadata install path publishes the entry to the engine registry, keyed by bucket and incarnation, and peers reload it through the existing bucket metadata notification. Application-owned bucket config entries reach their consumers through a named subscriber registry (`register_bucket_config_subscriber` in `crates/ecstore/src/bucket/metadata_sys.rs`), so engines and on-demand migration observe bucket config changes side by side.
 - A cluster accepts engine buckets only after every node reports engine support; an older node that dropped the unknown metadata field would otherwise serve the bucket as an empty object bucket.
 
 ### Request dispatch
