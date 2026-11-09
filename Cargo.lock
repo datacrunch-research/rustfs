@@ -9804,6 +9804,7 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
+ "rustfs-kvcache",
  "rustfs-license",
  "rustfs-lock",
  "rustfs-log-analyzer",
