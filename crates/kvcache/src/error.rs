@@ -30,4 +30,7 @@ pub enum KvError {
     Corrupt(String),
     #[error("segment is sealed")]
     Sealed,
+    /// The drive is above its emergency watermark; the write is skipped.
+    #[error("cache full on drive {drive}")]
+    CacheFull { drive: u16 },
 }

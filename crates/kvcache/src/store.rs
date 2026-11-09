@@ -18,10 +18,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::aligned::AlignedBuf;
+use crate::capacity::{CapacityPolicy, FsStats};
 use crate::error::{KvError, KvResult};
 use crate::format::{check_key, entry_footprint};
 use crate::segment::{SegmentFile, SegmentId, SegmentWriter, WriterOptions, scan_segment, segment_file_name};
@@ -120,8 +122,13 @@ struct SegmentInfo {
 struct DriveState {
     dir: PathBuf,
     writer: Mutex<Option<SegmentWriter>>,
+    /// Preallocated empty segments, so a rotation never waits on the
+    /// filesystem.
+    spares: Mutex<Vec<SegmentWriter>>,
     segments: RwLock<BTreeMap<SegmentId, SegmentInfo>>,
     next_id: Mutex<SegmentId>,
+    /// Above the emergency watermark: new entries are refused.
+    full: AtomicBool,
 }
 
 /// What open found on disk.
@@ -135,6 +142,21 @@ pub struct RecoveryReport {
     pub entries: usize,
     /// Entries skipped because an older segment already held the key.
     pub duplicates: usize,
+    /// Empty unsealed segments (unused spares, or a crash before the first
+    /// entry) that were removed.
+    pub empty_removed: usize,
+}
+
+/// What one eviction pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EvictionReport {
+    /// Segments dropped for exceeding the maximum age.
+    pub aged_segments: usize,
+    /// Segments dropped to bring a drive under its low watermark.
+    pub capacity_segments: usize,
+    pub keys_removed: usize,
+    /// Drives left above the emergency watermark, refusing new entries.
+    pub full_drives: Vec<u16>,
 }
 
 pub struct KvStore {
@@ -171,8 +193,10 @@ impl KvStore {
                 .map(|dir| DriveState {
                     dir,
                     writer: Mutex::new(None),
+                    spares: Mutex::new(Vec::new()),
                     segments: RwLock::new(BTreeMap::new()),
                     next_id: Mutex::new(1),
+                    full: AtomicBool::new(false),
                 })
                 .collect(),
             index: (0..INDEX_SHARDS).map(|_| RwLock::new(HashMap::new())).collect(),
@@ -205,6 +229,11 @@ impl KvStore {
                 }
                 Err(err) => return Err(err),
             };
+            if !scanned.sealed && scanned.entries.is_empty() {
+                std::fs::remove_file(&path)?;
+                report.empty_removed += 1;
+                continue;
+            }
             if !scanned.sealed {
                 let mut writer = SegmentWriter::resume(&scanned, &path, self.options.writer())?;
                 writer.seal(now_ms)?;
@@ -246,6 +275,109 @@ impl KvStore {
         Ok(())
     }
 
+    fn create_segment(&self, state: &DriveState) -> KvResult<SegmentWriter> {
+        let id = {
+            let mut next = state.next_id.lock();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        SegmentWriter::create(&state.dir, id, self.options.writer())
+    }
+
+    /// Tops every drive that is not full up to `per_drive` preallocated
+    /// spare segments. Returns the number created.
+    pub fn replenish_spares(&self, per_drive: usize) -> KvResult<usize> {
+        let mut created = 0;
+        for state in &self.drives {
+            if state.full.load(Ordering::Acquire) {
+                continue;
+            }
+            while state.spares.lock().len() < per_drive {
+                let spare = self.create_segment(state)?;
+                state.spares.lock().push(spare);
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
+    /// Whether `drive` refuses new entries.
+    pub fn is_full(&self, drive: u16) -> bool {
+        self.drives
+            .get(usize::from(drive))
+            .is_some_and(|state| state.full.load(Ordering::Acquire))
+    }
+
+    /// One capacity pass over every drive: drop sealed segments older than
+    /// the maximum age (sealing an idle open segment that aged out), then,
+    /// above the high watermark, drop the oldest sealed segments until the
+    /// drive's estimated usage is below the low watermark. A drive still at
+    /// or above the emergency watermark refuses new entries until a later
+    /// pass finds it below.
+    pub fn evict(&self, fs: &dyn FsStats, policy: &CapacityPolicy, now_ms: u64) -> KvResult<EvictionReport> {
+        let mut report = EvictionReport::default();
+        for (drive, state) in self.drives.iter().enumerate() {
+            let drive = drive as u16;
+            if let Some(max_age_ms) = policy.max_age_ms {
+                let expired = |newest_write_ms: u64| newest_write_ms.saturating_add(max_age_ms) <= now_ms;
+                {
+                    let mut writer_slot = state.writer.lock();
+                    let idle = writer_slot.as_ref().is_some_and(|writer| {
+                        state
+                            .segments
+                            .read()
+                            .get(&writer.id())
+                            .is_some_and(|info| expired(info.newest_write_ms))
+                    });
+                    if idle && let Some(mut writer) = writer_slot.take() {
+                        writer.seal(now_ms)?;
+                        if let Some(info) = state.segments.write().get_mut(&writer.id()) {
+                            info.sealed = true;
+                        }
+                    }
+                }
+                let aged: Vec<SegmentId> = self
+                    .segments(drive)
+                    .into_iter()
+                    .filter(|segment| segment.sealed && expired(segment.newest_write_ms))
+                    .map(|segment| segment.id)
+                    .collect();
+                for id in aged {
+                    report.keys_removed += self.drop_segment(drive, id)?;
+                    report.aged_segments += 1;
+                }
+            }
+
+            let usage = fs.usage(&state.dir)?;
+            let total = usage.total_bytes.max(1) as f64;
+            let mut used = usage.total_bytes.saturating_sub(usage.available_bytes) as f64;
+            if used / total >= policy.watermarks.high {
+                let mut candidates: Vec<SegmentStat> =
+                    self.segments(drive).into_iter().filter(|segment| segment.sealed).collect();
+                candidates.sort_by_key(|segment| (segment.newest_write_ms, segment.id));
+                for segment in candidates {
+                    if used / total < policy.watermarks.low {
+                        break;
+                    }
+                    report.keys_removed += self.drop_segment(drive, segment.id)?;
+                    report.capacity_segments += 1;
+                    used -= self.options.segment_bytes as f64;
+                }
+            }
+            let full = used / total >= policy.watermarks.emergency;
+            state.full.store(full, Ordering::Release);
+            if full {
+                // Spares hold space a full drive needs; release them.
+                for spare in state.spares.lock().drain(..) {
+                    let _ = std::fs::remove_file(spare.path());
+                }
+                report.full_drives.push(drive);
+            }
+        }
+        Ok(report)
+    }
+
     fn insert_if_absent(&self, key: &str, location: Location) -> bool {
         let mut shard = self.index[shard_of(key)].write();
         if shard.contains_key(key) {
@@ -277,6 +409,9 @@ impl KvStore {
         if self.contains(key) {
             return Ok(PutOutcome::Exists);
         }
+        if state.full.load(Ordering::Acquire) {
+            return Err(KvError::CacheFull { drive });
+        }
         if !SegmentWriter::fits_empty(key, value.len() as u64, self.options.segment_bytes) {
             return Err(KvError::ValueTooLarge {
                 len: value.len() as u64,
@@ -292,13 +427,11 @@ impl KvStore {
         }
         loop {
             if writer_slot.is_none() {
-                let id = {
-                    let mut next = state.next_id.lock();
-                    let id = *next;
-                    *next += 1;
-                    id
+                let writer = match state.spares.lock().pop() {
+                    Some(spare) => spare,
+                    None => self.create_segment(state)?,
                 };
-                let writer = SegmentWriter::create(&state.dir, id, self.options.writer())?;
+                let id = writer.id();
                 let file = Arc::new(SegmentFile::open(writer.path(), id, self.options.direct_io)?);
                 state.segments.write().insert(
                     id,
@@ -529,6 +662,7 @@ impl KvStore {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::capacity::DiskUsage;
 
     const SEGMENT: u64 = 256 * 1024;
 
@@ -674,6 +808,143 @@ mod tests {
         assert!(!open_segment.sealed);
         assert!(store.drop_segment(0, open_segment.id).is_err(), "the open segment cannot be dropped");
         assert_eq!(store.drop_segment(0, first.id).expect("again"), 0);
+    }
+
+    struct FakeFs {
+        usage: parking_lot::Mutex<HashMap<PathBuf, DiskUsage>>,
+    }
+
+    impl FakeFs {
+        fn new() -> Self {
+            Self {
+                usage: parking_lot::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// Sets the drive's usage fraction on a 10-segment filesystem.
+        fn set(&self, dir: &Path, used_fraction: f64) {
+            let total = 10 * SEGMENT;
+            self.usage.lock().insert(
+                dir.to_owned(),
+                DiskUsage {
+                    total_bytes: total,
+                    available_bytes: total - (total as f64 * used_fraction) as u64,
+                },
+            );
+        }
+    }
+
+    impl FsStats for FakeFs {
+        fn usage(&self, dir: &Path) -> std::io::Result<DiskUsage> {
+            Ok(*self.usage.lock().get(dir).expect("usage set for drive"))
+        }
+    }
+
+    /// Fills `segments` sealed segments (five 40 KB entries each) with
+    /// write times 100, 200, ... per segment.
+    fn fill(store: &KvStore, segments: u64) {
+        for segment in 0..segments {
+            for entry in 0..5 {
+                store
+                    .put(0, &format!("s{segment}e{entry}"), &value(entry as u8, 40_000), 100 * (segment + 1))
+                    .expect("put");
+            }
+        }
+    }
+
+    #[test]
+    fn eviction_drops_oldest_sealed_segments_down_to_the_low_watermark() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dirs = drives(root.path(), 1);
+        let (store, _) = open(&dirs);
+        fill(&store, 6);
+        let policy = CapacityPolicy::default();
+        let fs = FakeFs::new();
+
+        fs.set(&dirs[0], 0.75);
+        assert_eq!(store.evict(&fs, &policy, 1_000).expect("evict"), EvictionReport::default());
+
+        // 85% of ten segments: drop oldest until below 70% (two segments).
+        fs.set(&dirs[0], 0.85);
+        let report = store.evict(&fs, &policy, 1_000).expect("evict");
+        assert_eq!(report.capacity_segments, 2);
+        assert_eq!(report.keys_removed, 10);
+        assert!(report.full_drives.is_empty());
+        assert!(!store.contains("s0e0") && !store.contains("s1e4"));
+        assert!(store.contains("s2e0") && store.contains("s5e4"));
+        assert!(
+            store.segments(0).iter().any(|segment| !segment.sealed),
+            "the open segment is never evicted"
+        );
+    }
+
+    #[test]
+    fn a_drive_above_the_emergency_watermark_refuses_writes_until_it_recovers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dirs = drives(root.path(), 1);
+        let (store, _) = open(&dirs);
+        store.put(0, "only", &value(1, 1_000), 1).expect("put");
+        store.replenish_spares(2).expect("spares");
+        let fs = FakeFs::new();
+        let policy = CapacityPolicy::default();
+
+        // Nothing sealed to drop: still at 95% after the pass.
+        fs.set(&dirs[0], 0.95);
+        let report = store.evict(&fs, &policy, 10).expect("evict");
+        assert_eq!(report.full_drives, vec![0]);
+        assert!(store.is_full(0));
+        assert!(matches!(store.put(0, "new", b"x", 11), Err(KvError::CacheFull { drive: 0 })));
+        assert_eq!(store.put(0, "only", b"x", 11).expect("existing key"), PutOutcome::Exists);
+        assert!(store.get("only").expect("get").is_some(), "reads continue");
+        assert_eq!(store.replenish_spares(2).expect("spares"), 0, "a full drive gets no spares");
+
+        fs.set(&dirs[0], 0.50);
+        assert!(store.evict(&fs, &policy, 12).expect("evict").full_drives.is_empty());
+        assert_eq!(store.put(0, "new", b"x", 13).expect("put"), PutOutcome::Written);
+    }
+
+    #[test]
+    fn aged_segments_are_dropped_even_with_space_left() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dirs = drives(root.path(), 1);
+        let (store, _) = open(&dirs);
+        fill(&store, 3); // segments written at 100, 200, 300; the last stays open
+        let fs = FakeFs::new();
+        fs.set(&dirs[0], 0.10);
+        let policy = CapacityPolicy {
+            max_age_ms: Some(1_000),
+            ..CapacityPolicy::default()
+        };
+
+        let report = store.evict(&fs, &policy, 1_150).expect("evict");
+        assert_eq!(report.aged_segments, 1, "only the segment written at 100 is older than 1000 ms");
+        assert!(!store.contains("s0e0") && store.contains("s1e0"));
+
+        // Much later the idle open segment is sealed and ages out too.
+        let report = store.evict(&fs, &policy, 10_000).expect("evict");
+        assert_eq!(report.aged_segments, 2);
+        assert!(store.is_empty());
+        assert!(store.segments(0).is_empty());
+    }
+
+    #[test]
+    fn spares_are_used_for_rotation_and_removed_at_recovery_when_unused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dirs = drives(root.path(), 1);
+        let count_files = || std::fs::read_dir(&dirs[0]).expect("read_dir").count();
+        {
+            let (store, _) = open(&dirs);
+            assert_eq!(store.replenish_spares(3).expect("spares"), 3);
+            assert_eq!(count_files(), 3);
+            store.put(0, "k", b"value", 1).expect("put");
+            assert_eq!(count_files(), 3, "the first segment came from the spares");
+            assert_eq!(store.replenish_spares(3).expect("spares"), 1);
+        }
+        let (store, report) = open(&dirs);
+        assert_eq!(report.empty_removed, 3, "{report:?}");
+        assert_eq!(report.resealed, 1);
+        assert_eq!(count_files(), 1);
+        assert!(store.get("k").expect("get").is_some());
     }
 
     #[test]
