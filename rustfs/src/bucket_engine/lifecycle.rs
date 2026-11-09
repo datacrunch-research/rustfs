@@ -20,7 +20,12 @@ use rustfs_bucket_engine::{BucketEngineBinding, BucketFeature, CREATE_BUCKET_ENG
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 use super::binding::{RequestedBinding, engine_error, resolve_binding};
-use super::{EngineRegistry, EngineRoute};
+use super::{EngineRegistry, EngineRoute, peer};
+use tracing::warn;
+
+const EVENT_BUCKET_ENGINE_PURGE: &str = "bucket_engine_purge";
+const LOG_COMPONENT_APP: &str = "app";
+const LOG_SUBSYSTEM_BUCKET_ENGINE: &str = "bucket_engine";
 
 /// The binding a CreateBucket request asks for through the
 /// `x-rustfs-bucket-engine` header (an engine name; the engine's default
@@ -64,19 +69,38 @@ pub(crate) fn create_bucket_binding(
 }
 
 /// Runs before the object layer deletes `bucket`. An engine-bound bucket is
-/// refused while its engine holds data unless the delete is forced; the
-/// engine's data for the bucket is then purged on this node.
+/// refused while its engine holds data on any node (or a node cannot say)
+/// unless the delete is forced; the engine's data for the bucket is then
+/// purged on every node.
 pub(crate) async fn before_delete_bucket(registry: &EngineRegistry, bucket: &str, force: bool) -> S3Result<()> {
     match registry.route(bucket) {
         EngineRoute::Object => Ok(()),
         EngineRoute::Engine(bound) => {
-            if !force && bound.engine.holds_data(&bound.context).await.map_err(engine_error)? {
+            if !force
+                && (bound.engine.holds_data(&bound.context).await.map_err(engine_error)?
+                    || peer::any_peer_holds_data(&bound).await.map_err(engine_error)?)
+            {
                 return Err(S3Error::with_message(
                     S3ErrorCode::BucketNotEmpty,
                     format!("engine {} still holds data for this bucket", bound.context.binding.engine.as_str()),
                 ));
             }
-            bound.engine.purge(&bound.context).await.map_err(engine_error)
+            bound.engine.purge(&bound.context).await.map_err(engine_error)?;
+            for failed in peer::purge_on_peers(&bound).await {
+                if let Err(err) = failed.result {
+                    warn!(
+                        event = EVENT_BUCKET_ENGINE_PURGE,
+                        component = LOG_COMPONENT_APP,
+                        subsystem = LOG_SUBSYSTEM_BUCKET_ENGINE,
+                        result = "peer_failed",
+                        bucket = %bucket,
+                        peer = %failed.peer,
+                        error = %err,
+                        "Bucket engine purge failed on a peer; its files are left for the engine to collect"
+                    );
+                }
+            }
+            Ok(())
         }
         // A forced delete of a bucket whose engine is unavailable here
         // proceeds; the engine's files are left for the engine to collect.

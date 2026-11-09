@@ -51,3 +51,14 @@ pub const CREATE_BUCKET_ENGINE_HEADER: &str = "x-rustfs-bucket-engine";
 
 /// Query parameter that names an engine custom operation on a bucket request.
 pub const ENGINE_OPERATION_QUERY: &str = "x-rustfs-engine-op";
+
+/// Prefix of internode operations the engine registry answers itself
+/// instead of passing them to an engine's `handle_peer_call`. Engines must
+/// not use operation names with this prefix.
+pub const FRAMEWORK_OPERATION_PREFIX: &str = "framework-";
+/// Framework operation: list the engines this node implements (no bucket).
+pub const FRAMEWORK_DESCRIBE_ENGINES: &str = "framework-describe-engines";
+/// Framework operation: whether this node's engine holds data for a bucket.
+pub const FRAMEWORK_HOLDS_DATA: &str = "framework-holds-data";
+/// Framework operation: purge this node's engine data for a bucket.
+pub const FRAMEWORK_PURGE: &str = "framework-purge";

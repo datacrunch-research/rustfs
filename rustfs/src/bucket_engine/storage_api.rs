@@ -16,5 +16,5 @@
 
 pub(super) use crate::storage_api::bucket_engine::{
     BUCKET_ENGINE_CONFIG, BucketMetadata, ECStore, ListOperations, capture_bucket_metadata_incarnation, delete_if_incarnation,
-    get_bucket_metadata, register_bucket_config_subscriber, update_if_incarnation,
+    get_bucket_metadata, get_global_notification_sys, register_bucket_config_subscriber, update_if_incarnation,
 };

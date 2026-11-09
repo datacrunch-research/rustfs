@@ -154,6 +154,13 @@ impl EngineRegistry {
         self.engines.read().get(name).cloned()
     }
 
+    /// Names of the engines this node implements, sorted.
+    pub fn engine_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.engines.read().keys().map(|name| name.as_str().to_owned()).collect();
+        names.sort();
+        names
+    }
+
     /// Route for a bucket. Buckets never bound to an engine take the fast
     /// path to the object layer.
     pub fn route(&self, bucket: &str) -> EngineRoute {
