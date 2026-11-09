@@ -30,6 +30,8 @@ Contract crates stay below implementation crates. Forbidden edges:
 | `security-governance -> rustfs` | Governance contracts stay below the binary crate |
 | `extension-schema -> rustfs` | The extension schema is consumed by the binary, never the reverse |
 | `extension-schema -> ecstore` | The extension schema must not reach storage internals |
+| `bucket-engine -> rustfs` | Engine contracts are implemented and dispatched by the binary, never the reverse |
+| `bucket-engine -> ecstore` | Engine contracts must not reach the object layer; engines get storage through their own crates |
 
 - `rustfs-storage-api` exposes storage-facing replication status/state contracts only through `crates/storage-api/src/replication.rs`, so its temporary dependency on `rustfs-filemeta` wire types stays centralized and no `rustfs-replication` / `rustfs-storage-api` cycle appears.
 - Leaf crates (`config`, `credentials`, `crypto`, `io-metrics`, `madmin`) may not depend on other `rustfs-*` crates, in either TOML spelling, except the adjudicated edges pinned in the guard's leaf allowlist: `io-metrics -> rustfs-s3-ops` (pure contract crates sharing the `S3Operation` vocabulary) and `madmin -> rustfs-signer` (the SigV4-signed admin SDK client). A new leaf exception must be a pure contract dependency (types and enums only, no I/O, no globals, no non-contract internal dependencies) and land together with its allowlist entry.
