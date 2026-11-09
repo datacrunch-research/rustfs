@@ -50,6 +50,9 @@ struct BucketEngineResponse {
     route: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// This node's engine status snapshot for the bucket, when attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<serde_json::Value>,
 }
 
 pub struct SetBucketEngineHandler;
@@ -121,13 +124,22 @@ fn route_summary(route: EngineRoute) -> (&'static str, Option<String>) {
     }
 }
 
-fn engine_response(bucket: String, binding: Option<BucketEngineBinding>) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let (route, reason) = route_summary(EngineRegistry::global().route(&bucket));
+async fn engine_response(bucket: String, binding: Option<BucketEngineBinding>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let route = EngineRegistry::global().route(&bucket);
+    let status = match &route {
+        EngineRoute::Engine(bound) => Some(match bound.engine.status(&bound.context).await {
+            Ok(status) => status,
+            Err(err) => serde_json::json!({ "error": err.to_string() }),
+        }),
+        _ => None,
+    };
+    let (route, reason) = route_summary(route);
     let response = BucketEngineResponse {
         bucket,
         binding,
         route,
         reason,
+        status,
     };
     let json = serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     Ok(S3Response::new((StatusCode::OK, Body::from(json))))
@@ -167,7 +179,7 @@ impl Operation for SetBucketEngineHandler {
             notify_peers_reload(bucket.clone(), "set bucket engine binding");
         }
 
-        engine_response(bucket, Some(stored))
+        engine_response(bucket, Some(stored)).await
     }
 }
 
@@ -179,7 +191,7 @@ impl Operation for GetBucketEngineHandler {
 
         let bucket = bucket_from_params(&params)?;
         let state = binding::bucket_state(&bucket).await?;
-        engine_response(bucket, state.current)
+        engine_response(bucket, state.current).await
     }
 }
 
@@ -202,6 +214,6 @@ impl Operation for DeleteBucketEngineHandler {
             notify_peers_reload(bucket.clone(), "clear bucket engine binding");
         }
 
-        engine_response(bucket, None)
+        engine_response(bucket, None).await
     }
 }

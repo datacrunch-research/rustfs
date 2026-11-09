@@ -135,6 +135,14 @@ impl BucketEngine for MemoryEngine {
             .is_some_and(|objects| !objects.is_empty()))
     }
 
+    async fn status(&self, bucket: &BucketContext) -> EngineResult<serde_json::Value> {
+        let buckets = self.buckets.read();
+        let (objects, bytes) = buckets.get(&bucket.incarnation).map_or((0, 0), |objects| {
+            (objects.len(), objects.values().map(|object| object.info.size).sum::<u64>())
+        });
+        Ok(serde_json::json!({ "objects": objects, "bytes": bytes }))
+    }
+
     async fn purge(&self, bucket: &BucketContext) -> EngineResult<()> {
         self.buckets.write().remove(&bucket.incarnation);
         Ok(())

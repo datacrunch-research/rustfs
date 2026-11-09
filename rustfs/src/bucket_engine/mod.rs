@@ -35,6 +35,33 @@ mod storage_api;
 
 pub use registry::{BoundBucket, EngineRegistry, EngineRoute};
 
+const EVENT_BUCKET_ENGINE_SHUTDOWN: &str = "bucket_engine_shutdown";
+const LOG_COMPONENT_APP: &str = "app";
+const LOG_SUBSYSTEM_BUCKET_ENGINE: &str = "bucket_engine";
+
+/// Detaches every engine before the runtime shuts down, bounded by
+/// `timeout`; engines still detaching when it expires are abandoned.
+pub(crate) async fn shutdown(timeout: std::time::Duration) {
+    match tokio::time::timeout(timeout, EngineRegistry::global().shutdown()).await {
+        Ok(detached) => tracing::info!(
+            event = EVENT_BUCKET_ENGINE_SHUTDOWN,
+            component = LOG_COMPONENT_APP,
+            subsystem = LOG_SUBSYSTEM_BUCKET_ENGINE,
+            state = "stopped",
+            detached,
+            "Bucket engines detached"
+        ),
+        Err(_) => tracing::warn!(
+            event = EVENT_BUCKET_ENGINE_SHUTDOWN,
+            component = LOG_COMPONENT_APP,
+            subsystem = LOG_SUBSYSTEM_BUCKET_ENGINE,
+            state = "timed_out",
+            timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            "Bucket engine detach did not finish before the shutdown deadline"
+        ),
+    }
+}
+
 /// Registers the built-in engines and subscribes the registry to bucket
 /// engine bindings. Must run before bucket metadata is loaded so the initial
 /// load reaches the registry. Idempotent across embedded and server startups.

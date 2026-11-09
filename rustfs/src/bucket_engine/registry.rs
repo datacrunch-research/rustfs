@@ -23,6 +23,7 @@
 //! newer publication arrived while the reconcile ran.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -38,6 +39,7 @@ const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_BUCKET_ENGINE: &str = "bucket_engine";
 
 const REASON_ATTACHING: &str = "bucket engine is attaching";
+const REASON_SHUTTING_DOWN: &str = "server is shutting down";
 
 /// A bucket attached to its engine.
 pub struct BoundBucket {
@@ -127,6 +129,9 @@ pub struct EngineRegistry {
     /// This node's drives and placement view; absent when the process has no
     /// local drives (then no engine directories are managed).
     environment: OnceLock<Arc<NodeEnvironment>>,
+    /// Set by [`EngineRegistry::shutdown`]: publications are ignored and no
+    /// engine is attached again.
+    shutting_down: AtomicBool,
 }
 
 static GLOBAL_REGISTRY: OnceLock<Arc<EngineRegistry>> = OnceLock::new();
@@ -199,6 +204,9 @@ impl EngineRegistry {
     /// and the bucket incarnation, `None` when the bucket or entry is gone.
     /// Returns the reconcile task when the binding changed.
     pub fn publish(self: &Arc<Self>, bucket: &str, stored: Option<(&[u8], u128)>) -> Option<JoinHandle<()>> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         let desired = self.desired(bucket, stored);
         let route = match &desired {
             Desired::Object => EngineRoute::Object,
@@ -316,6 +324,10 @@ impl EngineRegistry {
             return;
         };
         let mut attached = attached.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            // Shutdown detached (or will detach) this bucket; never re-attach.
+            return;
+        }
         let Some((generation, desired)) = self
             .buckets
             .read()
@@ -394,6 +406,43 @@ impl EngineRegistry {
                 slot.failed = true;
             }
         }
+    }
+}
+
+impl EngineRegistry {
+    /// Detaches every attached engine so engine workers stop before the
+    /// runtime shuts down. Afterwards publications are ignored and bound
+    /// buckets answer unavailable. Returns the number of engines detached.
+    pub async fn shutdown(&self) -> usize {
+        self.shutting_down.store(true, Ordering::Release);
+        let slots: Vec<(String, Attached)> = {
+            let mut buckets = self.buckets.write();
+            for slot in buckets.values_mut() {
+                // Invalidate in-flight reconciles so none publishes a route.
+                slot.generation += 1;
+                let engine = match &slot.route {
+                    EngineRoute::Engine(bound) => bound.context.binding.engine.as_str().to_owned(),
+                    EngineRoute::Unavailable { engine, .. } => engine.clone(),
+                    EngineRoute::Object => continue,
+                };
+                slot.route = EngineRoute::Unavailable {
+                    engine,
+                    reason: REASON_SHUTTING_DOWN.to_owned(),
+                };
+            }
+            buckets
+                .iter()
+                .map(|(bucket, slot)| (bucket.clone(), Arc::clone(&slot.attached)))
+                .collect()
+        };
+        let mut detached = 0;
+        for (bucket, attached) in slots {
+            if let Some(previous) = attached.lock().await.take() {
+                detach(&bucket, &previous).await;
+                detached += 1;
+            }
+        }
+        detached
     }
 }
 
@@ -669,6 +718,31 @@ mod tests {
         publish(&registry, "kv", Some((&stored, 7))).await;
         assert_eq!(bound(registry.route("kv")).context.incarnation, 7);
         assert_eq!(engine.events(), vec!["attach:kv:7:{}", "attach:kv:7:{}"]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_detaches_everything_and_ignores_later_publications() {
+        let engine = RecordingEngine::new("kv-cache");
+        let registry = registry_with(&engine);
+        publish(&registry, "a", Some((&binding("kv-cache", "{}"), 7))).await;
+        publish(&registry, "b", Some((&binding("kv-cache", "{}"), 8))).await;
+        // Published before shutdown, reconciled after it: must not attach.
+        let pending = registry.publish("c", Some((&binding("kv-cache", "{}"), 9)));
+
+        assert_eq!(registry.shutdown().await, 2);
+        if let Some(task) = pending {
+            task.await.expect("reconcile task");
+        }
+        assert!(registry.publish("d", Some((&binding("kv-cache", "{}"), 10))).is_none());
+
+        for bucket in ["a", "b", "c"] {
+            assert_unavailable(registry.route(bucket), REASON_SHUTTING_DOWN);
+        }
+        assert!(registry.route("d").is_object());
+        let events = engine.events();
+        let attaches = events.iter().filter(|e| e.starts_with("attach")).count();
+        let detaches = events.iter().filter(|e| e.starts_with("detach")).count();
+        assert_eq!((attaches, detaches), (2, 2), "{events:?}");
     }
 
     #[tokio::test]
