@@ -18,6 +18,7 @@
 //! a key hands it to the owner through the framework's internode engine
 //! call. See `docs/architecture/kv-cache-buckets.md`.
 
+mod batch;
 mod config;
 mod wire;
 
@@ -29,15 +30,21 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use rustfs_bucket_engine::{
-    BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, EngineCapabilities, EngineDescriptor,
-    EngineError, EngineName, EngineObject, EngineObjectInfo, EngineObjectOperation, EngineResult, ListPage, NodeEnvironment,
-    ObjectWriteMeta, OperationName, RdmaTransfer,
+    BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, CustomOperationSpec, CustomRequest,
+    CustomResponse, EngineCapabilities, EngineDescriptor, EngineError, EngineName, EngineObject, EngineObjectInfo,
+    EngineObjectOperation, EngineResult, ListPage, NodeEnvironment, ObjectWriteMeta, OperationAction, OperationName,
+    RdmaTransfer,
 };
 use rustfs_kvcache::{EntryInfo, KvError, KvStore, PutOutcome, StatvfsFs};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bucket_engine::peer::{PeerCall, call_peer};
+use batch::{
+    BATCH_READ, BATCH_WRITE, ContainsReply, KeysRequest, MAX_KEYS_REQUEST_BYTES, MAX_READ_RESPONSE_BYTES,
+    MAX_WRITE_REQUEST_BYTES, PEER_CONTAINS, PEER_GET_BATCH, PEER_PUT_BATCH, PREFIX_QUERY, PeerKeys, PeerWrite, PrefixQueryReply,
+    ValuesHeader, WriteHeader, WriteItem, WriteReply, WriteResult,
+};
 use config::{CONFIG_VERSION, KvCacheConfig};
 use wire::{EntryHeader, KeyRequest, ListReply, ListRequest, PEER_DELETE, PEER_GET, PEER_HEAD, PEER_LIST, PEER_PUT};
 
@@ -98,6 +105,37 @@ fn info_of(header: EntryHeader) -> EngineObjectInfo {
     }
 }
 
+fn operation_spec(name: &str, action: OperationAction, max_request_bytes: u64) -> CustomOperationSpec {
+    CustomOperationSpec {
+        name: OperationName::new(name).expect("static operation name is valid"),
+        action,
+        max_request_bytes,
+    }
+}
+
+fn json_response<T: serde::Serialize>(value: &T) -> EngineResult<CustomResponse> {
+    Ok(CustomResponse {
+        body: Bytes::from(serde_json::to_vec(value).map_err(|err| EngineError::Internal(err.to_string()))?),
+        headers: Vec::new(),
+    })
+}
+
+fn write_result(result: Result<PutOutcome, KvError>) -> WriteResult {
+    match result {
+        Ok(PutOutcome::Written) => WriteResult::Written,
+        Ok(PutOutcome::Exists) => WriteResult::Exists,
+        Err(KvError::CacheFull { .. }) => WriteResult::CacheFull,
+        Err(err) => WriteResult::Error(err.to_string()),
+    }
+}
+
+/// Keys of one batch split by owner: (index, drive) for local keys, and the
+/// indices owned by each other node.
+struct Grouped {
+    local: Vec<(usize, u16)>,
+    remote: HashMap<String, Vec<usize>>,
+}
+
 /// A bound bucket incarnation on this node.
 struct BucketStore {
     store: Arc<KvStore>,
@@ -139,7 +177,11 @@ impl KvCacheEngine {
                     ]
                     .into_iter()
                     .collect(),
-                    custom_operations: Vec::new(),
+                    custom_operations: vec![
+                        operation_spec(PREFIX_QUERY, OperationAction::GetObject, MAX_KEYS_REQUEST_BYTES),
+                        operation_spec(BATCH_READ, OperationAction::GetObject, MAX_KEYS_REQUEST_BYTES),
+                        operation_spec(BATCH_WRITE, OperationAction::PutObject, MAX_WRITE_REQUEST_BYTES),
+                    ],
                     consistent_listing: false,
                     refused_features: BucketFeature::ALL.into_iter().collect(),
                 },
@@ -249,6 +291,217 @@ impl KvCacheEngine {
             entries: entries.iter().map(|(key, info)| header_of(&object_info(key, info))).collect(),
             truncated,
         })
+    }
+
+    fn group(&self, keys: &[&str]) -> EngineResult<Grouped> {
+        let mut grouped = Grouped {
+            local: Vec::new(),
+            remote: HashMap::new(),
+        };
+        for (index, key) in keys.iter().enumerate() {
+            match self.owner(key)? {
+                Owner::Local(drive) => grouped.local.push((index, drive)),
+                Owner::Remote(node) => grouped.remote.entry(node).or_default().push(index),
+            }
+        }
+        Ok(grouped)
+    }
+
+    /// Whether each key is stored, asking every owner once in parallel. An
+    /// owner that cannot answer reports its keys as missing.
+    async fn contains_many(&self, bucket: &BucketContext, keys: &[String]) -> EngineResult<Vec<bool>> {
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let grouped = self.group(&refs)?;
+        let mut present = vec![false; keys.len()];
+        if !grouped.local.is_empty() {
+            let store = self.bucket(bucket)?;
+            for (index, _) in &grouped.local {
+                present[*index] = store.store.contains(&keys[*index]);
+            }
+        }
+        let view = self.environment.placement().version;
+        let replies = futures::future::join_all(grouped.remote.iter().map(|(node, indices)| async move {
+            let request = PeerKeys {
+                keys: indices.iter().map(|index| keys[*index].clone()).collect(),
+                view,
+            };
+            let reply = self
+                .forward(bucket, node.clone(), PEER_CONTAINS, wire::encode(&request, &[])?)
+                .await?;
+            Ok::<_, EngineError>((indices, wire::decode::<ContainsReply>(reply)?.0))
+        }))
+        .await;
+        for reply in replies {
+            // An unreachable or stale owner is a miss for its keys.
+            if let Ok((indices, reply)) = reply
+                && reply.present.len() == indices.len()
+            {
+                for (index, found) in indices.iter().zip(reply.present) {
+                    present[*index] = found;
+                }
+            }
+        }
+        Ok(present)
+    }
+
+    /// Reads every key from its owner in parallel; a miss, an unreachable
+    /// owner or a value past the response budget is `None`.
+    async fn read_many(&self, bucket: &BucketContext, keys: &[String]) -> EngineResult<Vec<Option<Bytes>>> {
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let grouped = self.group(&refs)?;
+        let mut values: Vec<Option<Bytes>> = vec![None; keys.len()];
+        let local_keys: Vec<(usize, String)> = grouped
+            .local
+            .iter()
+            .map(|(index, _)| (*index, keys[*index].clone()))
+            .collect();
+        let local = async {
+            if local_keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let state = self.bucket(bucket)?;
+            tokio::task::spawn_blocking(move || {
+                local_keys
+                    .into_iter()
+                    .map(|(index, key)| {
+                        let value = state.store.get(&key).ok().flatten();
+                        (index, value.map(|value| Bytes::copy_from_slice(value.as_slice())))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(join_error)
+        };
+        let view = self.environment.placement().version;
+        let remote = futures::future::join_all(grouped.remote.iter().map(|(node, indices)| async move {
+            let request = PeerKeys {
+                keys: indices.iter().map(|index| keys[*index].clone()).collect(),
+                view,
+            };
+            let reply = self
+                .forward(bucket, node.clone(), PEER_GET_BATCH, wire::encode(&request, &[])?)
+                .await?;
+            let (header, payload): (ValuesHeader, Bytes) = wire::decode(reply)?;
+            Ok::<_, EngineError>((indices, batch::unjoin_values(&header, &payload)?))
+        }));
+        let (local, remote) = tokio::join!(local, remote);
+        for (index, value) in local? {
+            values[index] = value;
+        }
+        for reply in remote.into_iter().flatten() {
+            let (indices, read) = reply;
+            if read.len() == indices.len() {
+                for (index, value) in indices.iter().zip(read) {
+                    values[*index] = value;
+                }
+            }
+        }
+        // Keep the response bounded: values past the budget become misses
+        // the client fetches in another request.
+        let mut budget = MAX_READ_RESPONSE_BYTES;
+        for value in &mut values {
+            if let Some(bytes) = value {
+                if bytes.len() as u64 > budget {
+                    *value = None;
+                } else {
+                    budget -= bytes.len() as u64;
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// Writes every value to its owner in parallel; each item gets its own
+    /// result, and a failed owner fails only its items.
+    async fn write_many(
+        &self,
+        bucket: &BucketContext,
+        items: Vec<WriteItem>,
+        values: Vec<Bytes>,
+    ) -> EngineResult<Vec<WriteResult>> {
+        let refs: Vec<&str> = items.iter().map(|item| item.key.as_str()).collect();
+        let grouped = self.group(&refs)?;
+        let mut results = vec![WriteResult::Error("not attempted".to_owned()); items.len()];
+        let local_items: Vec<(usize, u16, String, Bytes)> = grouped
+            .local
+            .iter()
+            .map(|(index, drive)| (*index, *drive, items[*index].key.clone(), values[*index].clone()))
+            .collect();
+        let local = async {
+            if local_items.is_empty() {
+                return Ok(Vec::new());
+            }
+            let state = self.bucket(bucket)?;
+            tokio::task::spawn_blocking(move || {
+                local_items
+                    .into_iter()
+                    .map(|(index, drive, key, value)| (index, write_result(state.store.put(drive, &key, &value, now_ms()))))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(join_error)
+        };
+        let view = self.environment.placement().version;
+        let (items_ref, values_ref) = (&items, &values);
+        let remote = futures::future::join_all(grouped.remote.iter().map(|(node, indices)| async move {
+            let request = PeerWrite {
+                items: indices.iter().map(|index| items_ref[*index].clone()).collect(),
+                view,
+            };
+            let mut payload = bytes::BytesMut::new();
+            for index in indices {
+                payload.extend_from_slice(&values_ref[*index]);
+            }
+            let outcome = async {
+                let reply = self
+                    .forward(bucket, node.clone(), PEER_PUT_BATCH, wire::encode(&request, &payload)?)
+                    .await?;
+                Ok::<_, EngineError>(wire::decode::<WriteReply>(reply)?.0.results)
+            }
+            .await;
+            (indices, node, outcome)
+        }));
+        let (local, remote) = tokio::join!(local, remote);
+        for (index, result) in local? {
+            results[index] = result;
+        }
+        for (indices, node, outcome) in remote {
+            match outcome {
+                Ok(owner_results) if owner_results.len() == indices.len() => {
+                    for (index, result) in indices.iter().zip(owner_results) {
+                        results[*index] = result;
+                    }
+                }
+                Ok(_) => {
+                    for index in indices {
+                        results[*index] = WriteResult::Error(format!("owner {node} answered a different batch"));
+                    }
+                }
+                Err(err) => {
+                    for index in indices {
+                        results[*index] = WriteResult::Error(format!("owner {node}: {err}"));
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Checks a forwarded batch's view and returns, for each key, the local
+    /// drive when this node owns it.
+    fn owned_drives(&self, keys: &[&str], view: u64) -> EngineResult<Vec<Option<u16>>> {
+        let current = self.environment.placement().version;
+        if view != current {
+            return Err(EngineError::StalePlacement { client: view, current });
+        }
+        keys.iter()
+            .map(|key| {
+                self.owner(key).map(|owner| match owner {
+                    Owner::Local(drive) => Some(drive),
+                    Owner::Remote(_) => None,
+                })
+            })
+            .collect()
     }
 
     /// Starts the capacity task of a bucket store: evict and replenish spare
@@ -525,8 +778,103 @@ impl BucketEngine for KvCacheEngine {
         })
     }
 
+    async fn custom_operation(&self, bucket: &BucketContext, request: CustomRequest) -> EngineResult<CustomResponse> {
+        match request.operation.as_str() {
+            PREFIX_QUERY => {
+                let keys: KeysRequest =
+                    serde_json::from_slice(&request.body).map_err(|err| EngineError::InvalidRequest(err.to_string()))?;
+                keys.validate()?;
+                let present = self.contains_many(bucket, &keys.keys).await?;
+                let hits = batch::longest_prefix(&present);
+                let mut response = json_response(&PrefixQueryReply { hits })?;
+                response.headers.push(("x-rustfs-engine-hits".to_owned(), hits.to_string()));
+                Ok(response)
+            }
+            BATCH_READ => {
+                let keys: KeysRequest =
+                    serde_json::from_slice(&request.body).map_err(|err| EngineError::InvalidRequest(err.to_string()))?;
+                keys.validate()?;
+                let values = self.read_many(bucket, &keys.keys).await?;
+                let (header, payload) = batch::join_values(&values);
+                Ok(CustomResponse {
+                    body: wire::encode(&header, &payload)?,
+                    headers: Vec::new(),
+                })
+            }
+            BATCH_WRITE => {
+                let (header, payload): (WriteHeader, Bytes) = wire::decode(request.body)?;
+                let values = batch::split_values(&header.items, &payload)?;
+                let results = self.write_many(bucket, header.items, values).await?;
+                json_response(&WriteReply { results })
+            }
+            _ => Err(EngineError::UnknownOperation {
+                engine: self.descriptor.name.clone(),
+                operation: request.operation,
+            }),
+        }
+    }
+
     async fn handle_peer_call(&self, bucket: &BucketContext, operation: &OperationName, body: Bytes) -> EngineResult<Bytes> {
         match operation.as_str() {
+            PEER_CONTAINS => {
+                let (request, _): (PeerKeys, Bytes) = wire::decode(body)?;
+                let keys: Vec<&str> = request.keys.iter().map(String::as_str).collect();
+                let drives = self.owned_drives(&keys, request.view)?;
+                let state = self.bucket(bucket)?;
+                let present = keys
+                    .iter()
+                    .zip(drives)
+                    .map(|(key, drive)| drive.is_some() && state.store.contains(key))
+                    .collect();
+                wire::encode(&ContainsReply { present }, &[])
+            }
+            PEER_GET_BATCH => {
+                let (request, _): (PeerKeys, Bytes) = wire::decode(body)?;
+                let keys: Vec<&str> = request.keys.iter().map(String::as_str).collect();
+                let drives = self.owned_drives(&keys, request.view)?;
+                let state = self.bucket(bucket)?;
+                let owned: Vec<Option<String>> = request
+                    .keys
+                    .into_iter()
+                    .zip(drives)
+                    .map(|(key, drive)| drive.map(|_| key))
+                    .collect();
+                let values = tokio::task::spawn_blocking(move || {
+                    owned
+                        .into_iter()
+                        .map(|key| {
+                            key.and_then(|key| state.store.get(&key).ok().flatten())
+                                .map(|value| Bytes::copy_from_slice(value.as_slice()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(join_error)?;
+                let (header, payload) = batch::join_values(&values);
+                wire::encode(&header, &payload)
+            }
+            PEER_PUT_BATCH => {
+                let (request, payload): (PeerWrite, Bytes) = wire::decode(body)?;
+                let values = batch::split_values(&request.items, &payload)?;
+                let keys: Vec<&str> = request.items.iter().map(|item| item.key.as_str()).collect();
+                let drives = self.owned_drives(&keys, request.view)?;
+                let state = self.bucket(bucket)?;
+                let items = request.items;
+                let results = tokio::task::spawn_blocking(move || {
+                    items
+                        .iter()
+                        .zip(values)
+                        .zip(drives)
+                        .map(|((item, value), drive)| match drive {
+                            Some(drive) => write_result(state.store.put(drive, &item.key, &value, now_ms())),
+                            None => WriteResult::Error("this node does not own the key".to_owned()),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(join_error)?;
+                wire::encode(&WriteReply { results }, &[])
+            }
             PEER_LIST => {
                 let (request, _): (ListRequest, Bytes) = wire::decode(body)?;
                 wire::encode(&self.local_list(bucket, &request)?, &[])
@@ -680,6 +1028,160 @@ mod tests {
             .await
             .expect("local put");
         assert!(engine.holds_data(&bucket).await.expect("holds data"));
+    }
+
+    fn custom(name: &str, body: Bytes) -> CustomRequest {
+        CustomRequest {
+            operation: OperationName::new(name).expect("valid operation name"),
+            body,
+            rdma: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_operations_query_read_and_write_in_prefix_order() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let engine = KvCacheEngine::new(environment(root.path(), &["a:9000"]));
+        let bucket = bucket(small_segments());
+        engine.attach(&bucket).await.expect("attach");
+        assert_eq!(engine.descriptor().capabilities.custom_operations.len(), 3);
+
+        let keys: Vec<String> = (0..5).map(|i| format!("prompt/page-{i}")).collect();
+        let items: Vec<WriteItem> = keys[..3]
+            .iter()
+            .enumerate()
+            .map(|(i, key)| WriteItem {
+                key: key.clone(),
+                size: 10 * (i as u64 + 1),
+            })
+            .collect();
+        let payload: Vec<u8> = items
+            .iter()
+            .flat_map(|item| vec![item.size as u8; item.size as usize])
+            .collect();
+        let write = engine
+            .custom_operation(
+                &bucket,
+                custom(
+                    BATCH_WRITE,
+                    wire::encode(&WriteHeader { items: items.clone() }, &payload).expect("encode"),
+                ),
+            )
+            .await
+            .expect("batch write");
+        let reply: WriteReply = serde_json::from_slice(&write.body).expect("json");
+        assert_eq!(reply.results, vec![WriteResult::Written; 3]);
+        let again = engine
+            .custom_operation(
+                &bucket,
+                custom(BATCH_WRITE, wire::encode(&WriteHeader { items }, &payload).expect("encode")),
+            )
+            .await
+            .expect("batch write");
+        let reply: WriteReply = serde_json::from_slice(&again.body).expect("json");
+        assert_eq!(reply.results, vec![WriteResult::Exists; 3]);
+
+        let query = serde_json::to_vec(&KeysRequest { keys: keys.clone() }).expect("json");
+        let response = engine
+            .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(query.clone())))
+            .await
+            .expect("prefix query");
+        let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
+        assert_eq!(reply.hits, 3);
+        assert_eq!(response.headers, vec![("x-rustfs-engine-hits".to_owned(), "3".to_owned())]);
+
+        let response = engine
+            .custom_operation(&bucket, custom(BATCH_READ, Bytes::from(query)))
+            .await
+            .expect("batch read");
+        let (header, payload): (ValuesHeader, Bytes) = wire::decode(response.body).expect("decode");
+        assert_eq!(header.sizes, [Some(10), Some(20), Some(30), None, None]);
+        let values = batch::unjoin_values(&header, &payload).expect("values");
+        assert_eq!(values[1].as_deref(), Some(&[20u8; 20][..]));
+
+        let short = wire::encode(
+            &WriteHeader {
+                items: vec![WriteItem {
+                    key: "k".to_owned(),
+                    size: 99,
+                }],
+            },
+            b"x",
+        )
+        .expect("encode");
+        assert!(engine.custom_operation(&bucket, custom(BATCH_WRITE, short)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn owners_answer_forwarded_batches_and_skip_keys_they_do_not_own() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let engine = KvCacheEngine::new(environment(root.path(), &["a:9000", "b:9000"]));
+        let bucket = bucket(small_segments());
+        engine.attach(&bucket).await.expect("attach");
+        let view = engine.environment.placement().version;
+        let op = |name: &str| OperationName::new(name).expect("valid operation name");
+        let ours = key_owned_by(&engine, true);
+        let theirs = key_owned_by(&engine, false);
+
+        let write = PeerWrite {
+            items: vec![
+                WriteItem {
+                    key: ours.clone(),
+                    size: 2,
+                },
+                WriteItem {
+                    key: theirs.clone(),
+                    size: 1,
+                },
+            ],
+            view,
+        };
+        let reply = engine
+            .handle_peer_call(&bucket, &op(PEER_PUT_BATCH), wire::encode(&write, b"abc").expect("encode"))
+            .await
+            .expect("peer put batch");
+        let (reply, _): (WriteReply, Bytes) = wire::decode(reply).expect("decode");
+        assert_eq!(reply.results[0], WriteResult::Written);
+        assert!(matches!(reply.results[1], WriteResult::Error(_)));
+
+        let keys = PeerKeys {
+            keys: vec![ours.clone(), theirs.clone()],
+            view,
+        };
+        let reply = engine
+            .handle_peer_call(&bucket, &op(PEER_CONTAINS), wire::encode(&keys, &[]).expect("encode"))
+            .await
+            .expect("peer contains");
+        let (contains, _): (ContainsReply, Bytes) = wire::decode(reply).expect("decode");
+        assert_eq!(contains.present, [true, false]);
+
+        let reply = engine
+            .handle_peer_call(&bucket, &op(PEER_GET_BATCH), wire::encode(&keys, &[]).expect("encode"))
+            .await
+            .expect("peer get batch");
+        let (header, payload): (ValuesHeader, Bytes) = wire::decode(reply).expect("decode");
+        assert_eq!(header.sizes, [Some(2), None]);
+        assert_eq!(&payload[..], b"ab");
+
+        let stale = PeerKeys {
+            keys: vec![ours],
+            view: view + 1,
+        };
+        assert!(matches!(
+            engine
+                .handle_peer_call(&bucket, &op(PEER_CONTAINS), wire::encode(&stale, &[]).expect("encode"))
+                .await,
+            Err(EngineError::StalePlacement { .. })
+        ));
+
+        // From the client side, keys of an unreachable owner are misses.
+        let query = serde_json::to_vec(&KeysRequest { keys: vec![theirs] }).expect("json");
+        let response = engine
+            .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(query)))
+            .await
+            .expect("prefix query");
+        let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
+        assert_eq!(reply.hits, 0);
     }
 
     #[tokio::test]
