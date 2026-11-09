@@ -17,7 +17,7 @@ A bucket engine is a built-in implementation that owns a bucket's data plane. Th
 
 ## Engine contract
 
-An engine declares and implements the following. The contract types live in an ECStore-free crate so that engines and the dispatch layer can depend on them without new reverse edges (see [crate-boundaries.md](crate-boundaries.md)).
+An engine declares and implements the following. The contract types live in `crates/bucket-engine` (`rustfs-bucket-engine`), an ECStore-free crate, so that engines and the dispatch layer can depend on them without new reverse edges (see [crate-boundaries.md](crate-boundaries.md)). It defines the engine trait (`BucketEngine`), descriptors and capabilities, the bucket binding (`BucketEngineBinding`, stored as `engine.json`), and the placement view with rendezvous ownership (`PlacementView::owners`).
 
 | Part | Responsibility |
 |---|---|
