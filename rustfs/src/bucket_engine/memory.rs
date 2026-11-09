@@ -94,6 +94,7 @@ impl MemoryEngine {
                         .into_iter()
                         .filter(|f| *f != BucketFeature::Notifications)
                         .collect(),
+                    rdma: false,
                 },
             },
             buckets: RwLock::default(),

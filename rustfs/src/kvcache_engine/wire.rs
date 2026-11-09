@@ -25,6 +25,10 @@ pub(crate) const PEER_HEAD: &str = "peer-head";
 pub(crate) const PEER_PUT: &str = "peer-put";
 pub(crate) const PEER_DELETE: &str = "peer-delete";
 pub(crate) const PEER_LIST: &str = "peer-list";
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+pub(crate) const PEER_GET_RDMA: &str = "peer-get-rdma";
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+pub(crate) const PEER_PUT_RDMA: &str = "peer-put-rdma";
 
 /// Largest JSON header accepted from a peer.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -35,6 +39,31 @@ pub(crate) struct KeyRequest {
     pub key: String,
     /// Placement view version the sender routed with.
     pub view: u64,
+}
+
+/// A forwarded single-key operation whose data the owner moves to or from
+/// the client over RDMA. The internode call is body bound, so the client's
+/// agent metadata arrives authenticated.
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RdmaKeyRequest {
+    pub key: String,
+    pub view: u64,
+    /// Byte range of the entry to push (reads only).
+    #[serde(default)]
+    pub range: Option<(u64, u64)>,
+    pub agent: String,
+    pub metadata: String,
+    pub buffer: String,
+}
+
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RdmaReply {
+    pub entry: EntryHeader,
+    pub moved: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

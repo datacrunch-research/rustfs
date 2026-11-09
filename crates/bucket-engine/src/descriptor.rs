@@ -87,6 +87,11 @@ pub struct EngineCapabilities {
     pub consistent_listing: bool,
     /// Bucket features refused when configured on a bound bucket.
     pub refused_features: BTreeSet<BucketFeature>,
+    /// The engine moves object data over RDMA when a request carries a
+    /// transfer descriptor (`ObjectWriteMeta::rdma`, the `rdma` argument of
+    /// `get_object`). Engines without it never receive RDMA requests.
+    #[serde(default)]
+    pub rdma: bool,
 }
 
 impl EngineCapabilities {
@@ -130,6 +135,7 @@ mod tests {
             }],
             consistent_listing: false,
             refused_features: BTreeSet::from(BucketFeature::ALL),
+            rdma: false,
         };
         assert!(caps.serves(EngineObjectOperation::GetObject));
         assert!(!caps.serves(EngineObjectOperation::PutObject));
