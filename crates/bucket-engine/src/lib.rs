@@ -27,6 +27,7 @@
 mod binding;
 mod descriptor;
 mod engine;
+mod environment;
 mod error;
 mod name;
 mod placement;
@@ -39,6 +40,7 @@ pub use engine::{
     BucketContext, BucketEngine, ByteRange, CustomRequest, CustomResponse, EngineObject, EngineObjectInfo, ListPage,
     ObjectWriteMeta, RdmaTransfer,
 };
+pub use environment::{ENGINES_DIR, NodeEnvironment, SYSTEM_DIR, engine_dir};
 pub use error::{EngineError, EngineResult};
 pub use name::{EngineName, NameError, OperationName};
 pub use placement::{NodeTargets, PlacementView, TargetId};

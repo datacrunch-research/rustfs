@@ -26,7 +26,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
-use rustfs_bucket_engine::{BucketContext, BucketEngine, BucketEngineBinding, EngineName, OBJECT_ENGINE};
+use rustfs_bucket_engine::{
+    BucketContext, BucketEngine, BucketEngineBinding, EngineError, EngineName, NodeEnvironment, OBJECT_ENGINE,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -122,6 +124,9 @@ struct BucketSlot {
 pub struct EngineRegistry {
     engines: RwLock<HashMap<EngineName, Arc<dyn BucketEngine>>>,
     buckets: RwLock<HashMap<String, BucketSlot>>,
+    /// This node's drives and placement view; absent when the process has no
+    /// local drives (then no engine directories are managed).
+    environment: OnceLock<Arc<NodeEnvironment>>,
 }
 
 static GLOBAL_REGISTRY: OnceLock<Arc<EngineRegistry>> = OnceLock::new();
@@ -148,6 +153,26 @@ impl EngineRegistry {
         }
         engines.insert(name, engine);
         true
+    }
+
+    /// Sets this node's environment once, at startup; later calls are ignored.
+    pub fn set_environment(&self, environment: Arc<NodeEnvironment>) -> bool {
+        self.environment.set(environment).is_ok()
+    }
+
+    pub fn environment(&self) -> Option<Arc<NodeEnvironment>> {
+        self.environment.get().cloned()
+    }
+
+    /// Removes a purged bucket incarnation's engine directories from this
+    /// node's drives.
+    pub(crate) async fn remove_engine_dirs(&self, bucket: &BucketContext) -> Result<(), EngineError> {
+        match self.environment.get() {
+            Some(environment) => super::environment::remove_engine_dirs(environment, bucket)
+                .await
+                .map_err(EngineError::from),
+            None => Ok(()),
+        }
     }
 
     pub fn engine(&self, name: &EngineName) -> Option<Arc<dyn BucketEngine>> {
@@ -317,7 +342,13 @@ impl EngineRegistry {
                         if let Some(previous) = attached.take() {
                             detach(bucket, &previous).await;
                         }
-                        engine.attach(&context).await
+                        match self.environment.get() {
+                            Some(environment) => match super::environment::create_engine_dirs(environment, &context).await {
+                                Ok(()) => engine.attach(&context).await,
+                                Err(err) => Err(EngineError::from(err)),
+                            },
+                            None => engine.attach(&context).await,
+                        }
                     }
                 };
                 match result {
