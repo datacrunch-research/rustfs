@@ -96,6 +96,14 @@ pub enum PutOutcome {
     Exists,
 }
 
+/// Where an append landed.
+struct Appended {
+    id: SegmentId,
+    file: Arc<SegmentFile>,
+    offset: u64,
+    value_crc: u32,
+}
+
 /// A segment as the evictor sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentStat {
@@ -145,6 +153,8 @@ pub struct RecoveryReport {
     /// Empty unsealed segments (unused spares, or a crash before the first
     /// entry) that were removed.
     pub empty_removed: usize,
+    /// Tombstones replayed (persisted deletes).
+    pub tombstones: usize,
 }
 
 /// What one eviction pass did.
@@ -259,6 +269,26 @@ impl KvStore {
             };
             for (offset, meta) in scanned.entries {
                 info.newest_write_ms = info.newest_write_ms.max(meta.write_time_ms);
+                if meta.tombstone {
+                    // A delete replayed in write order: drop the key if a
+                    // segment replayed before this one (or this one) holds it.
+                    let removed = self.index[shard_of(&meta.key)].write().remove(&meta.key);
+                    if let Some(removed) = removed {
+                        let footprint = entry_footprint(removed.value_len);
+                        if removed.segment.id() == id && usize::from(removed.drive) == usize::from(drive) {
+                            info.live_bytes = info.live_bytes.saturating_sub(footprint);
+                        } else if let Some(owner) = self.drives[usize::from(removed.drive)]
+                            .segments
+                            .write()
+                            .get_mut(&removed.segment.id())
+                        {
+                            owner.live_bytes = owner.live_bytes.saturating_sub(footprint);
+                        }
+                        report.entries -= 1;
+                    }
+                    report.tombstones += 1;
+                    continue;
+                }
                 let location = Location {
                     drive,
                     segment: Arc::clone(&file),
@@ -435,6 +465,35 @@ impl KvStore {
         if self.contains(key) {
             return Ok(PutOutcome::Exists);
         }
+        let appended = self.append_locked(state, &mut writer_slot, key, value, now_ms, false)?;
+        let location = Location {
+            drive,
+            segment: Arc::clone(&appended.file),
+            offset: appended.offset,
+            value_len: value.len() as u64,
+            value_crc: appended.value_crc,
+            write_time_ms: now_ms,
+        };
+        let inserted = self.insert_if_absent(key, location);
+        if inserted && let Some(info) = state.segments.write().get_mut(&appended.id) {
+            info.keys.push(key.to_owned());
+            info.live_bytes += entry_footprint(value.len() as u64);
+        }
+        Ok(if inserted { PutOutcome::Written } else { PutOutcome::Exists })
+    }
+
+    /// Appends an entry (or a tombstone) to the drive's open segment under
+    /// its writer lock, opening a segment (a spare when one is ready) and
+    /// rotating full ones as needed.
+    fn append_locked(
+        &self,
+        state: &DriveState,
+        writer_slot: &mut Option<SegmentWriter>,
+        key: &str,
+        value: &[u8],
+        now_ms: u64,
+        tombstone: bool,
+    ) -> KvResult<Appended> {
         loop {
             if writer_slot.is_none() {
                 let writer = match state.spares.lock().pop() {
@@ -456,27 +515,24 @@ impl KvStore {
                 *writer_slot = Some(writer);
             }
             let writer = writer_slot.as_mut().expect("writer was just installed");
-            match writer.append(key, value, now_ms)? {
+            let offset = if tombstone {
+                writer.append_tombstone(key, now_ms)?
+            } else {
+                writer.append(key, value, now_ms)?
+            };
+            match offset {
                 Some(offset) => {
                     let id = writer.id();
-                    let file = Arc::clone(&state.segments.read().get(&id).expect("open segment is registered").file);
-                    let location = Location {
-                        drive,
-                        segment: file,
-                        offset,
-                        value_len: value.len() as u64,
-                        value_crc: writer.entries().last().expect("entry was just appended").1.value_crc,
-                        write_time_ms: now_ms,
-                    };
-                    let inserted = self.insert_if_absent(key, location);
+                    let value_crc = writer.entries().last().expect("entry was just appended").1.value_crc;
                     let mut segments = state.segments.write();
                     let info = segments.get_mut(&id).expect("open segment is registered");
                     info.newest_write_ms = info.newest_write_ms.max(now_ms);
-                    if inserted {
-                        info.keys.push(key.to_owned());
-                        info.live_bytes += entry_footprint(value.len() as u64);
-                    }
-                    return Ok(if inserted { PutOutcome::Written } else { PutOutcome::Exists });
+                    return Ok(Appended {
+                        id,
+                        file: Arc::clone(&info.file),
+                        offset,
+                        value_crc,
+                    });
                 }
                 None => {
                     // Full: seal it and start the next segment.
@@ -536,15 +592,21 @@ impl KvStore {
         self.index[shard_of(key)].read().get(key).map(entry_info)
     }
 
-    /// Removes `key` from the index; its bytes are reclaimed with its segment.
-    pub fn delete(&self, key: &str) -> bool {
-        match self.locate(key) {
-            Some(location) => {
-                self.forget(key, &location);
-                true
-            }
-            None => false,
+    /// Deletes `key`: a tombstone is appended to its drive so the delete
+    /// survives a restart, then the key leaves the index; its bytes are
+    /// reclaimed with its segment. Allowed on a full drive (a tombstone is
+    /// one block). Returns whether the key was stored.
+    pub fn delete(&self, key: &str, now_ms: u64) -> KvResult<bool> {
+        let Some(location) = self.locate(key) else {
+            return Ok(false);
+        };
+        let state = &self.drives[usize::from(location.drive)];
+        {
+            let mut writer_slot = state.writer.lock();
+            self.append_locked(state, &mut writer_slot, key, &[], now_ms, true)?;
         }
+        self.forget(key, &location);
+        Ok(true)
     }
 
     /// How many leading `keys` are stored.
@@ -698,8 +760,8 @@ mod tests {
         assert!(store.get("missing").expect("get").is_none());
         assert_eq!(store.head("b").map(|info| (info.drive, info.value_len)), Some((1, 3)));
 
-        assert!(store.delete("a"));
-        assert!(!store.delete("a"));
+        assert!(store.delete("a", 8).expect("delete"));
+        assert!(!store.delete("a", 9).expect("delete"));
         assert!(store.get("a").expect("get").is_none());
         assert_eq!(store.len(), 1);
     }
@@ -761,6 +823,39 @@ mod tests {
         let (reopened, report) = open(&dirs);
         assert_eq!(report.resealed, 1, "only the segment written after recovery was open");
         assert_eq!(reopened.len(), 12);
+    }
+
+    #[test]
+    fn deletes_survive_reopen_and_a_later_put_wins_over_the_delete() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dirs = drives(root.path(), 1);
+        {
+            let (store, _) = open(&dirs);
+            for i in 0..12u8 {
+                store
+                    .put(0, &format!("k{i:02}"), &value(i, 40_000), u64::from(i))
+                    .expect("put");
+            }
+            // k00 lives in an older, sealed segment; its tombstone lands in the open one.
+            assert!(store.delete("k00", 20).expect("delete"));
+            assert!(store.delete("k11", 21).expect("delete"));
+            assert!(!store.delete("missing", 22).expect("delete"));
+            assert!(store.delete("k05", 23).expect("delete"));
+            assert_eq!(store.put(0, "k05", &value(99, 10), 24).expect("put"), PutOutcome::Written);
+            assert_eq!(store.len(), 10);
+        }
+
+        let (store, report) = open(&dirs);
+        assert_eq!(report.tombstones, 3, "{report:?}");
+        assert_eq!(store.len(), 10);
+        assert!(store.get("k00").expect("get").is_none(), "a delete survives restart");
+        assert!(store.get("k11").expect("get").is_none());
+        assert_eq!(
+            store.get("k05").expect("get").expect("rewritten").as_slice(),
+            &value(99, 10)[..],
+            "a put after the delete wins"
+        );
+        assert_eq!(store.get("k03").expect("get").expect("kept").as_slice(), &value(3, 40_000)[..]);
     }
 
     #[test]

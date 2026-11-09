@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use crate::aligned::{AlignedBuf, BLOCK_SIZE, round_up};
 use crate::error::{KvError, KvResult};
 use crate::format::{
-    EntryMeta, Trailer, check_key, crc32c, decode_entry_header, decode_footer, decode_trailer, encode_entry_header,
-    encode_footer, encode_trailer, entry_footprint, footer_blocks, footer_len,
+    EntryMeta, FOOTER_RECORD_FIXED, Trailer, check_key, crc32c, decode_entry_header, decode_footer, decode_trailer,
+    encode_entry_header, encode_footer, encode_trailer, entry_footprint, footer_blocks, footer_len,
 };
 
 pub type SegmentId = u64;
@@ -230,7 +230,7 @@ impl SegmentWriter {
     /// Whether an entry with this key and value length still fits, leaving
     /// room for the footer and the trailer.
     pub fn fits(&self, key: &str, value_len: u64) -> bool {
-        let footer = round_up(self.footer_len + 30 + key.len()) as u64;
+        let footer = round_up(self.footer_len + FOOTER_RECORD_FIXED + key.len()) as u64;
         self.offset + entry_footprint(value_len) + footer + BLOCK <= self.options.segment_bytes
     }
 
@@ -243,6 +243,16 @@ impl SegmentWriter {
     /// Appends an entry; returns its offset, or `None` when the segment is
     /// full and must be sealed.
     pub fn append(&mut self, key: &str, value: &[u8], write_time_ms: u64) -> KvResult<Option<u64>> {
+        self.append_entry(key, value, write_time_ms, false)
+    }
+
+    /// Appends a tombstone, a persisted delete of `key`; returns its offset,
+    /// or `None` when the segment is full.
+    pub fn append_tombstone(&mut self, key: &str, write_time_ms: u64) -> KvResult<Option<u64>> {
+        self.append_entry(key, &[], write_time_ms, true)
+    }
+
+    fn append_entry(&mut self, key: &str, value: &[u8], write_time_ms: u64, tombstone: bool) -> KvResult<Option<u64>> {
         if self.sealed {
             return Err(KvError::Sealed);
         }
@@ -262,6 +272,7 @@ impl SegmentWriter {
             value_len,
             value_crc: crc32c(value),
             write_time_ms,
+            tombstone,
         };
         let footprint = entry_footprint(value_len) as usize;
         let mut buf = AlignedBuf::zeroed(footprint);
@@ -271,7 +282,7 @@ impl SegmentWriter {
 
         let offset = self.offset;
         self.offset += footprint as u64;
-        self.footer_len += 30 + key.len();
+        self.footer_len += FOOTER_RECORD_FIXED + key.len();
         self.entries.push((offset, meta));
         Ok(Some(offset))
     }
