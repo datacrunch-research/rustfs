@@ -525,6 +525,11 @@ pub(crate) mod table {
     };
 }
 
+pub(crate) mod bucket_engine {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_ENGINE_CONFIG;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::register_bucket_config_subscriber;
+}
+
 pub(crate) mod on_demand_migration {
     pub(crate) use crate::storage::storage_api::ECStore;
     pub(crate) use crate::storage::storage_api::StorageObjectOptions as ObjectOptions;
