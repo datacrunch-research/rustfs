@@ -20,6 +20,8 @@
 
 mod batch;
 mod config;
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+mod rdma;
 mod wire;
 
 use std::collections::HashMap;
@@ -47,12 +49,18 @@ use batch::{
 };
 use config::{CONFIG_VERSION, KvCacheConfig};
 use wire::{EntryHeader, KeyRequest, ListReply, ListRequest, PEER_DELETE, PEER_GET, PEER_HEAD, PEER_LIST, PEER_PUT};
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+use wire::{PEER_GET_RDMA, PEER_PUT_RDMA, RdmaKeyRequest, RdmaReply};
 
 pub const KV_CACHE_ENGINE: &str = "kv-cache";
 
 /// Deadline for a forwarded single-key operation (a 28 MB value on a loaded
 /// link stays well inside it).
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest value pulled from a client over RDMA (the inline PUT limit).
+#[cfg(all(feature = "nixl", target_os = "linux"))]
+const MAX_RDMA_VALUE_BYTES: u64 = 256 << 20;
 
 const EVENT_KV_CACHE_MAINTENANCE: &str = "kv_cache_maintenance";
 const LOG_COMPONENT_APP: &str = "app";
@@ -85,6 +93,24 @@ fn object_info(key: &str, info: &EntryInfo) -> EngineObjectInfo {
         etag: format!("{:08x}", info.value_crc),
         last_modified_unix_secs: i64::try_from(info.write_time_ms / 1000).unwrap_or(i64::MAX),
     }
+}
+
+/// The bytes of `value` a read range selects; the range must start inside
+/// the value and is clipped at its end.
+#[cfg_attr(not(all(feature = "nixl", target_os = "linux")), cfg(test))]
+fn range_of(value: &Bytes, range: Option<ByteRange>) -> EngineResult<&[u8]> {
+    let Some(range) = range else {
+        return Ok(value);
+    };
+    let len = value.len() as u64;
+    if range.start >= len && !(range.start == 0 && len == 0) {
+        return Err(EngineError::InvalidRequest(format!(
+            "range starting at {} is outside the {len}-byte entry",
+            range.start
+        )));
+    }
+    let end = range.start.saturating_add(range.length).min(len);
+    Ok(&value[range.start as usize..end as usize])
 }
 
 fn header_of(info: &EngineObjectInfo) -> EntryHeader {
@@ -185,6 +211,7 @@ impl KvCacheEngine {
                     ],
                     consistent_listing: false,
                     refused_features: BucketFeature::ALL.into_iter().collect(),
+                    rdma: cfg!(all(feature = "nixl", target_os = "linux")),
                 },
             },
             environment,
@@ -221,6 +248,18 @@ impl KvCacheEngine {
             body,
         };
         call_peer(&node, call, PEER_TIMEOUT).await
+    }
+
+    #[cfg(all(feature = "nixl", target_os = "linux"))]
+    fn rdma_request(&self, key: &str, transfer: &RdmaTransfer) -> RdmaKeyRequest {
+        RdmaKeyRequest {
+            key: key.to_owned(),
+            view: self.environment.placement().version,
+            range: None,
+            agent: transfer.agent.clone(),
+            metadata: transfer.metadata.clone(),
+            buffer: transfer.buffer.clone(),
+        }
     }
 
     fn key_request(&self, key: &str) -> KeyRequest {
@@ -671,9 +710,34 @@ impl BucketEngine for KvCacheEngine {
         &self,
         bucket: &BucketContext,
         key: &str,
-        _range: Option<ByteRange>,
-        _rdma: Option<RdmaTransfer>,
+        range: Option<ByteRange>,
+        rdma: Option<RdmaTransfer>,
     ) -> EngineResult<EngineObject> {
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        if let Some(transfer) = rdma {
+            let (info, moved) = match self.owner(key)? {
+                Owner::Local(_) => {
+                    let (info, value) = self.local_get(bucket, key.to_owned()).await?;
+                    (info, rdma::push(key, &transfer, range_of(&value, range)?).await?)
+                }
+                Owner::Remote(node) => {
+                    let mut request = self.rdma_request(key, &transfer);
+                    request.range = range.map(|range| (range.start, range.length));
+                    let reply = self
+                        .forward(bucket, node, PEER_GET_RDMA, wire::encode(&request, &[])?)
+                        .await?;
+                    let (reply, _): (RdmaReply, Bytes) = wire::decode(reply)?;
+                    (info_of(reply.entry), reply.moved)
+                }
+            };
+            return Ok(EngineObject {
+                info,
+                body: Bytes::new(),
+                rdma_bytes: Some(moved),
+            });
+        }
+        #[cfg(not(all(feature = "nixl", target_os = "linux")))]
+        let _ = (rdma, range);
         let (info, body) = match self.owner(key)? {
             Owner::Local(_) => self.local_get(bucket, key.to_owned()).await?,
             Owner::Remote(node) => {
@@ -715,8 +779,27 @@ impl BucketEngine for KvCacheEngine {
         bucket: &BucketContext,
         key: &str,
         body: Bytes,
-        _meta: ObjectWriteMeta,
+        meta: ObjectWriteMeta,
     ) -> EngineResult<EngineObjectInfo> {
+        #[cfg(all(feature = "nixl", target_os = "linux"))]
+        if let Some(transfer) = meta.rdma {
+            return match self.owner(key)? {
+                Owner::Local(drive) => {
+                    let value = rdma::pull(key, &transfer, MAX_RDMA_VALUE_BYTES).await?;
+                    self.local_put(bucket, drive, key.to_owned(), Bytes::from(value)).await
+                }
+                Owner::Remote(node) => {
+                    let request = self.rdma_request(key, &transfer);
+                    let reply = self
+                        .forward(bucket, node, PEER_PUT_RDMA, wire::encode(&request, &[])?)
+                        .await?;
+                    let (reply, _): (RdmaReply, Bytes) = wire::decode(reply)?;
+                    Ok(info_of(reply.entry))
+                }
+            };
+        }
+        #[cfg(not(all(feature = "nixl", target_os = "linux")))]
+        let _ = meta;
         match self.owner(key)? {
             Owner::Local(drive) => self.local_put(bucket, drive, key.to_owned(), body).await,
             Owner::Remote(node) => {
@@ -897,6 +980,52 @@ impl BucketEngine for KvCacheEngine {
                 .await
                 .map_err(join_error)?;
                 wire::encode(&WriteReply { results }, &[])
+            }
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            PEER_GET_RDMA => {
+                let (request, _): (RdmaKeyRequest, Bytes) = wire::decode(body)?;
+                self.local_drive_for(&KeyRequest {
+                    key: request.key.clone(),
+                    view: request.view,
+                })?;
+                let transfer = RdmaTransfer {
+                    agent: request.agent,
+                    metadata: request.metadata,
+                    buffer: request.buffer,
+                };
+                let (info, value) = self.local_get(bucket, request.key.clone()).await?;
+                let range = request.range.map(|(start, length)| ByteRange { start, length });
+                let moved = rdma::push(&request.key, &transfer, range_of(&value, range)?).await?;
+                wire::encode(
+                    &RdmaReply {
+                        entry: header_of(&info),
+                        moved,
+                    },
+                    &[],
+                )
+            }
+            #[cfg(all(feature = "nixl", target_os = "linux"))]
+            PEER_PUT_RDMA => {
+                let (request, _): (RdmaKeyRequest, Bytes) = wire::decode(body)?;
+                let drive = self.local_drive_for(&KeyRequest {
+                    key: request.key.clone(),
+                    view: request.view,
+                })?;
+                let transfer = RdmaTransfer {
+                    agent: request.agent,
+                    metadata: request.metadata,
+                    buffer: request.buffer,
+                };
+                let value = rdma::pull(&request.key, &transfer, MAX_RDMA_VALUE_BYTES).await?;
+                let moved = value.len() as u64;
+                let info = self.local_put(bucket, drive, request.key, Bytes::from(value)).await?;
+                wire::encode(
+                    &RdmaReply {
+                        entry: header_of(&info),
+                        moved,
+                    },
+                    &[],
+                )
             }
             PEER_LIST => {
                 let (request, _): (ListRequest, Bytes) = wire::decode(body)?;
@@ -1221,6 +1350,18 @@ mod tests {
             .expect("prefix query");
         let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
         assert_eq!(reply.hits, 0);
+    }
+
+    #[test]
+    fn read_ranges_select_and_clip_the_entry() {
+        let value = Bytes::from_static(b"0123456789");
+        assert_eq!(range_of(&value, None).expect("whole"), b"0123456789");
+        let range = |start, length| Some(ByteRange { start, length });
+        assert_eq!(range_of(&value, range(2, 3)).expect("middle"), b"234");
+        assert_eq!(range_of(&value, range(8, u64::MAX)).expect("open"), b"89");
+        assert_eq!(range_of(&value, range(0, 10)).expect("exact"), b"0123456789");
+        assert!(range_of(&value, range(10, 1)).is_err());
+        assert_eq!(range_of(&Bytes::new(), range(0, 1)).expect("empty"), b"");
     }
 
     #[tokio::test]

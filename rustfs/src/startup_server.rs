@@ -94,7 +94,13 @@ async fn init_rdma_internode_listener() -> Result<Option<ShutdownHandle>> {
 /// cuObject S3-over-RDMA servers live for the process lifetime; they stop with it.
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 async fn init_cuobject_servers() -> Result<()> {
-    crate::app::object::cuobject::init_cuobject_service().await
+    crate::app::object::cuobject::init_cuobject_service().await?;
+    // Bucket engines move data over the same NIXL server.
+    #[cfg(feature = "nixl")]
+    if let Some(server) = crate::app::object::cuobject::nixl_server() {
+        crate::bucket_engine::rdma::set_server(server);
+    }
+    Ok(())
 }
 
 #[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]

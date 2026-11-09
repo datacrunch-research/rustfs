@@ -35,6 +35,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use time::OffsetDateTime;
 
 use super::binding::engine_error;
+use super::rdma::{self, RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER};
 use super::{BoundBucket, EngineRegistry, EngineRoute};
 
 /// Largest object body the framework buffers for an engine PutObject.
@@ -137,18 +138,75 @@ fn resolve_range(range: &Range, size: u64) -> S3Result<(std::ops::Range<u64>, St
     Ok((span, content_range))
 }
 
+/// The RDMA transfer a request asks for, when the engine moves data over
+/// RDMA and the RDMA service runs.
+fn rdma_transfer(bound: &BoundBucket, headers: &http::HeaderMap) -> Option<rustfs_bucket_engine::RdmaTransfer> {
+    if !bound.engine.descriptor().capabilities.rdma {
+        return None;
+    }
+    rdma::transfer_from_headers(headers)
+}
+
+fn rdma_reply_headers(headers: &mut http::HeaderMap, moved: u64, ranged: bool) {
+    let status = if ranged { "206" } else { "200" };
+    headers.insert(RDMA_REPLY_HEADER, http::HeaderValue::from_static(status));
+    headers.insert(RDMA_BYTES_TRANSFERRED_HEADER, http::HeaderValue::from(moved));
+}
+
 pub(crate) async fn get_object(bound: &BoundBucket, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
     require(bound, EngineObjectOperation::GetObject, "GetObject")?;
+    let headers = req.headers;
     let input = req.input;
     refuse_version_id(input.version_id.as_deref())?;
     if input.part_number.is_some() {
         return Err(not_served(bound, "GetObject with partNumber"));
     }
+    // Ranged reads stay on HTTP; whole entries move over RDMA when asked.
+    // Over RDMA the engine pushes the entry, or one byte range of it, into
+    // the client's buffer. Suffix ranges need the size first and stay on HTTP.
+    let rdma_range = match &input.range {
+        None => Some(None),
+        Some(Range::Int { first, last }) => Some(Some(rustfs_bucket_engine::ByteRange {
+            start: *first,
+            length: last.map_or(u64::MAX, |last| last.saturating_sub(*first).saturating_add(1)),
+        })),
+        Some(Range::Suffix { .. }) => None,
+    };
+    let transfer = rdma_range.is_some().then(|| rdma_transfer(bound, &headers)).flatten();
     let object = bound
         .engine
-        .get_object(&bound.context, &input.key, None, None)
+        .get_object(
+            &bound.context,
+            &input.key,
+            if transfer.is_some() { rdma_range.flatten() } else { None },
+            transfer,
+        )
         .await
         .map_err(object_error)?;
+    if let Some(moved) = object.rdma_bytes {
+        let content_range = match &input.range {
+            Some(Range::Int { first, .. }) if moved > 0 => {
+                Some(format!("bytes {first}-{}/{}", first + moved - 1, object.info.size))
+            }
+            _ => None,
+        };
+        let ranged = input.range.is_some();
+        let output = GetObjectOutput {
+            content_length: Some(0),
+            body: Some(StreamingBlob::from(s3s::Body::empty())),
+            content_range,
+            e_tag: etag(&object.info),
+            last_modified: last_modified(&object.info),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_owned()),
+            ..Default::default()
+        };
+        let mut response = S3Response::new(output);
+        rdma_reply_headers(&mut response.headers, moved, ranged);
+        if ranged {
+            response.status = Some(http::StatusCode::PARTIAL_CONTENT);
+        }
+        return Ok(response);
+    }
     let size = object.body.len() as u64;
     let (body, content_range) = match &input.range {
         None => (object.body, None),
@@ -229,11 +287,42 @@ async fn read_body(body: Option<StreamingBlob>, content_length: u64) -> S3Result
 
 pub(crate) async fn put_object(bound: &BoundBucket, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
     require(bound, EngineObjectOperation::PutObject, "PutObject")?;
+    let headers = req.headers;
     let input = req.input;
     let content_length = input
         .content_length
         .and_then(|length| u64::try_from(length).ok())
         .ok_or_else(|| s3_error!(MissingContentLength, "engine buckets need a Content-Length"))?;
+    // A bodiless PUT with a transfer descriptor: the owner pulls the value
+    // from the client's buffer, whose length is the object size.
+    if content_length == 0
+        && let Some(transfer) = rdma_transfer(bound, &headers)
+    {
+        let size = rdma::buffer_len(&transfer).ok_or_else(|| s3_error!(InvalidArgument, "invalid RDMA buffer"))?;
+        if size > MAX_INLINE_OBJECT_BYTES {
+            return Err(s3_error!(
+                EntityTooLarge,
+                "engine buckets accept objects up to {} bytes",
+                MAX_INLINE_OBJECT_BYTES
+            ));
+        }
+        let meta = ObjectWriteMeta {
+            content_length: size,
+            rdma: Some(transfer),
+        };
+        let info = bound
+            .engine
+            .put_object(&bound.context, &input.key, Bytes::new(), meta)
+            .await
+            .map_err(object_error)?;
+        let mut response = S3Response::new(PutObjectOutput {
+            e_tag: etag(&info),
+            size: Some(size_i64(info.size)),
+            ..Default::default()
+        });
+        rdma_reply_headers(&mut response.headers, size, false);
+        return Ok(response);
+    }
     if content_length > MAX_INLINE_OBJECT_BYTES {
         return Err(s3_error!(
             EntityTooLarge,

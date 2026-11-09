@@ -30,6 +30,7 @@ pub(crate) mod lifecycle;
 #[cfg(any(test, feature = "bucket-engine-memory"))]
 pub mod memory;
 pub(crate) mod peer;
+pub(crate) mod rdma;
 mod registry;
 mod storage_api;
 
