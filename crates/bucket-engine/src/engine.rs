@@ -123,6 +123,13 @@ pub trait BucketEngine: Send + Sync + 'static {
         Ok(())
     }
 
+    /// A side-effect-free snapshot of this node's state for the bucket
+    /// (usage, worker progress), shown by the admin API. Must not block on
+    /// I/O for long or change any state.
+    async fn status(&self, _bucket: &BucketContext) -> EngineResult<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+
     async fn get_object(
         &self,
         _bucket: &BucketContext,
