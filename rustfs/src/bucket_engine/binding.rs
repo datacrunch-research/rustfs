@@ -22,11 +22,11 @@ use std::sync::Arc;
 use rustfs_bucket_engine::{BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, EngineError};
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 
-use super::EngineRegistry;
 use super::storage_api::{
     BUCKET_ENGINE_CONFIG, BucketMetadata, ECStore, ListOperations as _, capture_bucket_metadata_incarnation,
     delete_if_incarnation, get_bucket_metadata, update_if_incarnation,
 };
+use super::{EngineRegistry, peer};
 use crate::bucket_engine::EngineRoute;
 
 /// Bucket state a binding change is checked against.
@@ -189,6 +189,11 @@ pub(crate) async fn set_binding(store: Arc<ECStore>, bucket: &str, requested: Re
             if bucket_has_objects(store, bucket).await? {
                 return Err(s3_error!(BucketNotEmpty, "only an empty bucket can be bound to an engine"));
             }
+            // Every node must serve the bucket's requests; a node without the
+            // engine would answer them from an empty object namespace.
+            peer::require_engine_on_every_node(requested.binding.engine.as_str())
+                .await
+                .map_err(engine_error)?;
             let context = BucketContext {
                 bucket: bucket.to_owned(),
                 incarnation: expected_incarnation_id.as_u128(),
