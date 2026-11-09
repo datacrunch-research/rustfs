@@ -23,6 +23,7 @@
 //! whose namespace does not hold that bucket's data. See
 //! `docs/architecture/bucket-engines.md`.
 
+pub(crate) mod binding;
 mod registry;
 mod storage_api;
 
