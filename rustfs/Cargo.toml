@@ -102,6 +102,7 @@ hotpath = [
     "hotpath/parking_lot",
     "hotpath/reqwest-0-13",
     "rustfs-audit/hotpath",
+    "rustfs-bucket-engine/hotpath",
     "rustfs-common/hotpath",
     "rustfs-concurrency/hotpath",
     "rustfs-config/hotpath",
@@ -272,6 +273,7 @@ rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
+rustfs-bucket-engine = { workspace = true }
 rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-storage-api = { workspace = true }
