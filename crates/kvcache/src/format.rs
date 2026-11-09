@@ -17,15 +17,17 @@
 //! Entry, at a block-aligned offset:
 //!
 //! - header block (`BLOCK_SIZE` bytes): magic `KVCE`, format version (u16),
-//!   key length (u16), value length (u64), value CRC32C (u32), write time in
-//!   unix milliseconds (u64), key bytes, then the CRC32C of everything before
-//!   it in the block (u32); the rest of the block is zero.
-//! - value, starting at the next block and padded with zeros to a block.
+//!   key length (u16), flags (u16; bit 0 marks a tombstone), reserved (u16),
+//!   value length (u64), value CRC32C (u32), write time in unix milliseconds
+//!   (u64), key bytes, then the CRC32C of everything before it in the block
+//!   (u32); the rest of the block is zero.
+//! - value, starting at the next block and padded with zeros to a block. A
+//!   tombstone (a persisted delete of the key) has no value.
 //!
 //! Footer, written at seal after the last entry: magic `KVCF`, version (u16),
 //! reserved (u16), entry count (u32), then per entry its offset (u64),
-//! value length (u64), value CRC32C (u32), write time (u64), key length
-//! (u16) and key, and finally the CRC32C of all of the above (u32).
+//! value length (u64), value CRC32C (u32), write time (u64), flags (u16),
+//! key length (u16) and key, and finally the CRC32C of all of the above (u32).
 //!
 //! Trailer, the last block of a sealed segment: magic `KVCT`, version
 //! (u16), reserved (u16), footer offset (u64), footer length (u64), entry
@@ -41,9 +43,10 @@ pub const MAX_KEY_LEN: usize = 1024;
 const ENTRY_MAGIC: &[u8; 4] = b"KVCE";
 const FOOTER_MAGIC: &[u8; 4] = b"KVCF";
 const TRAILER_MAGIC: &[u8; 4] = b"KVCT";
-const ENTRY_FIXED: usize = 28;
+const ENTRY_FIXED: usize = 32;
 const FOOTER_FIXED: usize = 12;
-const FOOTER_RECORD_FIXED: usize = 30;
+pub(crate) const FOOTER_RECORD_FIXED: usize = 32;
+const FLAG_TOMBSTONE: u16 = 1;
 const TRAILER_LEN: usize = 40;
 
 pub(crate) fn crc32c(data: &[u8]) -> u32 {
@@ -58,6 +61,22 @@ pub struct EntryMeta {
     pub value_len: u64,
     pub value_crc: u32,
     pub write_time_ms: u64,
+    /// A persisted delete of the key: recovery removes the key when it
+    /// replays this entry.
+    pub tombstone: bool,
+}
+
+impl EntryMeta {
+    fn flags(&self) -> u16 {
+        if self.tombstone { FLAG_TOMBSTONE } else { 0 }
+    }
+}
+
+fn tombstone_from(flags: u16) -> KvResult<bool> {
+    if flags & !FLAG_TOMBSTONE != 0 {
+        return Err(KvError::Corrupt(format!("unknown entry flags {flags:#x}")));
+    }
+    Ok(flags & FLAG_TOMBSTONE != 0)
 }
 
 /// Bytes an entry occupies in its segment: one header block plus the value
@@ -94,9 +113,11 @@ pub(crate) fn encode_entry_header(meta: &EntryMeta, block: &mut [u8]) {
     block[0..4].copy_from_slice(ENTRY_MAGIC);
     block[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     block[6..8].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    block[8..16].copy_from_slice(&meta.value_len.to_le_bytes());
-    block[16..20].copy_from_slice(&meta.value_crc.to_le_bytes());
-    block[20..28].copy_from_slice(&meta.write_time_ms.to_le_bytes());
+    block[8..10].copy_from_slice(&meta.flags().to_le_bytes());
+    block[10..12].copy_from_slice(&0u16.to_le_bytes());
+    block[12..20].copy_from_slice(&meta.value_len.to_le_bytes());
+    block[20..24].copy_from_slice(&meta.value_crc.to_le_bytes());
+    block[24..32].copy_from_slice(&meta.write_time_ms.to_le_bytes());
     let end = ENTRY_FIXED + key.len();
     block[ENTRY_FIXED..end].copy_from_slice(key);
     let crc = crc32c(&block[..end]);
@@ -124,9 +145,10 @@ pub(crate) fn decode_entry_header(block: &[u8]) -> KvResult<EntryMeta> {
         .to_owned();
     Ok(EntryMeta {
         key,
-        value_len: u64_at(block, 8),
-        value_crc: u32_at(block, 16),
-        write_time_ms: u64_at(block, 20),
+        value_len: u64_at(block, 12),
+        value_crc: u32_at(block, 20),
+        write_time_ms: u64_at(block, 24),
+        tombstone: tombstone_from(u16_at(block, 8))?,
     })
 }
 
@@ -146,6 +168,7 @@ pub(crate) fn encode_footer(entries: &[(u64, EntryMeta)]) -> Vec<u8> {
         out.extend_from_slice(&meta.value_len.to_le_bytes());
         out.extend_from_slice(&meta.value_crc.to_le_bytes());
         out.extend_from_slice(&meta.write_time_ms.to_le_bytes());
+        out.extend_from_slice(&meta.flags().to_le_bytes());
         out.extend_from_slice(&(meta.key.len() as u16).to_le_bytes());
         out.extend_from_slice(meta.key.as_bytes());
     }
@@ -177,7 +200,8 @@ pub(crate) fn decode_footer(bytes: &[u8]) -> KvResult<Vec<(u64, EntryMeta)>> {
         let value_len = u64_at(bytes, at + 8);
         let value_crc = u32_at(bytes, at + 16);
         let write_time_ms = u64_at(bytes, at + 20);
-        let key_len = usize::from(u16_at(bytes, at + 28));
+        let tombstone = tombstone_from(u16_at(bytes, at + 28)).map_err(|_| corrupt("entry flags"))?;
+        let key_len = usize::from(u16_at(bytes, at + 30));
         let key_start = at + FOOTER_RECORD_FIXED;
         if key_len == 0 || key_len > MAX_KEY_LEN || key_start + key_len > body {
             return Err(corrupt("key length"));
@@ -192,6 +216,7 @@ pub(crate) fn decode_footer(bytes: &[u8]) -> KvResult<Vec<(u64, EntryMeta)>> {
                 value_len,
                 value_crc,
                 write_time_ms,
+                tombstone,
             },
         ));
         at = key_start + key_len;
@@ -253,6 +278,7 @@ mod tests {
             value_len,
             value_crc: crc32c(key.as_bytes()),
             write_time_ms: 1_794_000_000_000,
+            tombstone: false,
         }
     }
 
@@ -268,6 +294,15 @@ mod tests {
         encode_entry_header(&original, &mut block);
         assert_eq!(decode_entry_header(&block).expect("decode"), original);
 
+        let tombstone = EntryMeta {
+            tombstone: true,
+            value_len: 0,
+            ..original
+        };
+        let mut tombstone_block = vec![0u8; BLOCK_SIZE];
+        encode_entry_header(&tombstone, &mut tombstone_block);
+        assert_eq!(decode_entry_header(&tombstone_block).expect("decode"), tombstone);
+
         for flip in [0, 5, 9, 17, 30] {
             let mut damaged = block.clone();
             damaged[flip] ^= 0x40;
@@ -278,7 +313,11 @@ mod tests {
 
     #[test]
     fn footers_and_trailers_round_trip_and_reject_damage() {
-        let entries = vec![(0, meta("a", 1)), (8192, meta("bb", 5000)), (20480, meta("ccc", 0))];
+        let deleted = EntryMeta {
+            tombstone: true,
+            ..meta("ccc", 0)
+        };
+        let entries = vec![(0, meta("a", 1)), (8192, meta("bb", 5000)), (20480, deleted)];
         let footer = encode_footer(&entries);
         assert_eq!(footer.len(), footer_len(entries.iter().map(|(_, m)| m.key.as_str())));
         assert_eq!(decode_footer(&footer).expect("decode"), entries);
