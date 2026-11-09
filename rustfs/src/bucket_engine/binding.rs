@@ -85,7 +85,11 @@ pub(crate) struct RequestedBinding {
 /// Parses a binding from a client and checks it against the engine
 /// registered under its name.
 pub(crate) fn requested_binding(registry: &EngineRegistry, bytes: &[u8]) -> S3Result<RequestedBinding> {
-    let binding = BucketEngineBinding::from_slice(bytes).map_err(engine_error)?;
+    resolve_binding(registry, BucketEngineBinding::from_slice(bytes).map_err(engine_error)?)
+}
+
+/// Checks a binding against the engine registered under its name.
+pub(crate) fn resolve_binding(registry: &EngineRegistry, binding: BucketEngineBinding) -> S3Result<RequestedBinding> {
     if binding.is_object_engine() {
         return Err(s3_error!(
             InvalidArgument,
