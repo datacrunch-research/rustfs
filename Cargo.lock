@@ -10462,6 +10462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-kvcache"
+version = "1.0.2"
+dependencies = [
+ "crc-fast",
+ "libc",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rustfs-license"
 version = "1.0.2"
 dependencies = [
