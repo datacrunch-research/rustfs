@@ -533,7 +533,7 @@ pub(crate) mod on_demand_migration {
     };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
-        BUCKET_CONFIG_PUBLISH_HOOK, get_on_demand_migration_config, get_on_demand_migration_config_in,
+        get_on_demand_migration_config, get_on_demand_migration_config_in, register_bucket_config_subscriber,
     };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::remote_s3_client;
     pub(crate) use crate::storage::storage_api::ecstore_config::com::{read_config_with_metadata, save_config_with_opts};

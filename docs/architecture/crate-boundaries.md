@@ -110,8 +110,9 @@ internal PUT and multipart use cases, including the atomic create-only commit,
 delete-marker protection, encryption, quota and notification rules.
 
 ECStore stores the existing ODM bytes and update timestamp without interpreting
-the JSON. Every metadata cache install or removal publishes those bytes through
-`BUCKET_CONFIG_PUBLISH_HOOK`; the application decodes them and synchronously
+the JSON. Every metadata cache install or removal publishes those bytes to the
+application's bucket config subscription (`register_bucket_config_subscriber`
+in `crates/ecstore/src/bucket/metadata_sys.rs`); the application decodes them and synchronously
 withdraws corrupt configurations. Configuration writes validate structure and
 deployment constraints in the admin use case before the incarnation-fenced
 metadata update. Backfill reads metadata from its store's instance context and
