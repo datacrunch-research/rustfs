@@ -86,6 +86,7 @@ pub(crate) async fn before_delete_bucket(registry: &EngineRegistry, bucket: &str
                 ));
             }
             bound.engine.purge(&bound.context).await.map_err(engine_error)?;
+            registry.remove_engine_dirs(&bound.context).await.map_err(engine_error)?;
             for failed in peer::purge_on_peers(&bound).await {
                 if let Err(err) = failed.result {
                     warn!(

@@ -44,8 +44,10 @@ pub struct NodeTargets {
 }
 
 /// The cluster as engines see it: nodes in configured endpoint order, their
-/// drives, and liveness. The version changes whenever any of that changes, so
-/// requests can carry it and owners can reject stale ones.
+/// drives, and liveness. The version is derived from membership (nodes and
+/// drive counts) so every node computes the same version from the same
+/// topology and requests can carry it for owners to reject stale ones.
+/// Liveness is each node's own observation and does not change the version.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PlacementView {
     pub version: u64,
@@ -53,6 +55,20 @@ pub struct PlacementView {
 }
 
 impl PlacementView {
+    /// Builds a view and derives its version from membership.
+    pub fn from_nodes(nodes: Vec<NodeTargets>) -> Self {
+        let mut membership = Vec::new();
+        for node in &nodes {
+            membership.extend_from_slice(&(node.node.len() as u64).to_be_bytes());
+            membership.extend_from_slice(node.node.as_bytes());
+            membership.extend_from_slice(&node.drives.to_be_bytes());
+        }
+        Self {
+            version: xxh3_64(&membership),
+            nodes,
+        }
+    }
+
     /// Every target in the view, online or not, in node then drive order.
     pub fn targets(&self) -> impl Iterator<Item = TargetId> + '_ {
         self.nodes.iter().flat_map(|node| {
@@ -98,6 +114,27 @@ impl PlacementView {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn version_tracks_membership_but_not_liveness() {
+        let node = |name: &str, drives: u16, online: bool| NodeTargets {
+            node: name.to_owned(),
+            drives,
+            online,
+        };
+        let base = PlacementView::from_nodes(vec![node("a:9000", 4, true), node("b:9000", 4, true)]);
+        let same = PlacementView::from_nodes(vec![node("a:9000", 4, true), node("b:9000", 4, false)]);
+        assert_eq!(base.version, same.version, "liveness is local and must not change the version");
+
+        for changed in [
+            vec![node("a:9000", 4, true), node("b:9000", 3, true)],
+            vec![node("a:9000", 4, true)],
+            vec![node("a:9000", 4, true), node("c:9000", 4, true)],
+            vec![node("b:9000", 4, true), node("a:9000", 4, true)],
+        ] {
+            assert_ne!(base.version, PlacementView::from_nodes(changed).version);
+        }
+    }
 
     fn view(nodes: &[(&str, u16)]) -> PlacementView {
         PlacementView {

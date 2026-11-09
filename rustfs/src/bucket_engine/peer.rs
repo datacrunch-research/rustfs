@@ -160,6 +160,7 @@ pub(crate) async fn serve(registry: &EngineRegistry, call: PeerCall) -> EngineRe
         FRAMEWORK_PURGE => {
             let bound = bound_for_call(registry, &call)?;
             bound.engine.purge(&bound.context).await?;
+            registry.remove_engine_dirs(&bound.context).await?;
             Ok(Bytes::new())
         }
         operation if operation.starts_with(FRAMEWORK_OPERATION_PREFIX) => {

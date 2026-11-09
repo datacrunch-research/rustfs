@@ -545,7 +545,7 @@ pub(crate) mod bucket_engine {
         capture_bucket_metadata_incarnation, delete_if_incarnation, get as get_bucket_metadata,
         register_bucket_config_subscriber, update_if_incarnation,
     };
-    pub(crate) use crate::storage::storage_api::get_global_notification_sys;
+    pub(crate) use crate::storage::storage_api::{get_global_endpoints_opt, get_global_notification_sys};
 }
 
 pub(crate) mod on_demand_migration {
