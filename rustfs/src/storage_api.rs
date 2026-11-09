@@ -207,6 +207,18 @@ pub(crate) mod server {
             pub(crate) type FS = crate::storage::storage_api::FS;
         }
 
+        pub(crate) mod engine_operation_route {
+            pub(crate) fn with_engine_operation_route<R>(
+                inner: R,
+                host: Option<s3s::host::MultiDomain>,
+            ) -> impl s3s::route::S3Route
+            where
+                R: s3s::route::S3Route,
+            {
+                crate::app::engine_operation_route::with_engine_operation_route(inner, host)
+            }
+        }
+
         pub(crate) mod metadata_route {
             pub(crate) fn with_metadata_route<A>(
                 admin: A,

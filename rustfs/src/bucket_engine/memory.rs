@@ -24,13 +24,33 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use rustfs_bucket_engine::{
-    BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, EngineCapabilities, EngineDescriptor,
-    EngineError, EngineName, EngineObject, EngineObjectInfo, EngineObjectOperation, EngineResult, ListPage, ObjectWriteMeta,
-    RdmaTransfer,
+    BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, CustomOperationSpec, CustomRequest,
+    CustomResponse, EngineCapabilities, EngineDescriptor, EngineError, EngineName, EngineObject, EngineObjectInfo,
+    EngineObjectOperation, EngineResult, ListPage, ObjectWriteMeta, OperationAction, OperationName, RdmaTransfer,
 };
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub const MEMORY_ENGINE: &str = "memory";
+
+/// Custom operation: the longest prefix of `keys` that is stored, the
+/// lookup a KV cache client makes before reading a prompt's pages.
+pub const PREFIX_QUERY_OPERATION: &str = "prefix-query";
+const PREFIX_QUERY_MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrefixQueryRequest {
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefixQueryResponse {
+    /// Number of leading keys that are stored.
+    pub hits: usize,
+    /// Total size of those entries.
+    pub bytes: u64,
+}
 
 struct StoredObject {
     body: Bytes,
@@ -64,7 +84,11 @@ impl MemoryEngine {
                         EngineObjectOperation::DeleteObject,
                         EngineObjectOperation::ListObjects,
                     ]),
-                    custom_operations: Vec::new(),
+                    custom_operations: vec![CustomOperationSpec {
+                        name: OperationName::new(PREFIX_QUERY_OPERATION).expect("static operation name is valid"),
+                        action: OperationAction::GetObject,
+                        max_request_bytes: PREFIX_QUERY_MAX_REQUEST_BYTES,
+                    }],
                     consistent_listing: true,
                     refused_features: BucketFeature::ALL
                         .into_iter()
@@ -188,6 +212,32 @@ impl BucketEngine for MemoryEngine {
             .and_then(|objects| objects.remove(key))
             .map(|_| ())
             .ok_or(EngineError::NotFound)
+    }
+
+    async fn custom_operation(&self, bucket: &BucketContext, request: CustomRequest) -> EngineResult<CustomResponse> {
+        if request.operation.as_str() != PREFIX_QUERY_OPERATION {
+            return Err(EngineError::UnknownOperation {
+                engine: self.descriptor.name.clone(),
+                operation: request.operation,
+            });
+        }
+        let query: PrefixQueryRequest =
+            serde_json::from_slice(&request.body).map_err(|err| EngineError::InvalidRequest(err.to_string()))?;
+        let buckets = self.buckets.read();
+        let objects = buckets.get(&bucket.incarnation);
+        let mut response = PrefixQueryResponse { hits: 0, bytes: 0 };
+        for key in &query.keys {
+            let Some(object) = objects.and_then(|objects| objects.get(key)) else {
+                break;
+            };
+            response.hits += 1;
+            response.bytes += object.info.size;
+        }
+        let body = serde_json::to_vec(&response).map_err(|err| EngineError::Internal(err.to_string()))?;
+        Ok(CustomResponse {
+            body: Bytes::from(body),
+            headers: vec![("x-rustfs-engine-hits".to_owned(), response.hits.to_string())],
+        })
     }
 
     async fn list_objects(
