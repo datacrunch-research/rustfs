@@ -535,8 +535,13 @@ pub(crate) mod table {
 }
 
 pub(crate) mod bucket_engine {
-    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_ENGINE_CONFIG;
-    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::register_bucket_config_subscriber;
+    pub(crate) use crate::storage::storage_api::ECStore;
+    pub(crate) use crate::storage::storage_api::contract::list::ListOperations;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{BUCKET_ENGINE_CONFIG, BucketMetadata};
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+        capture_bucket_metadata_incarnation, delete_if_incarnation, get as get_bucket_metadata,
+        register_bucket_config_subscriber, update_if_incarnation,
+    };
 }
 
 pub(crate) mod on_demand_migration {
