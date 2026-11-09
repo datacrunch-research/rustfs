@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 pub(crate) const PREFIX_QUERY: &str = "prefix-query";
 pub(crate) const BATCH_READ: &str = "batch-read";
 pub(crate) const BATCH_WRITE: &str = "batch-write";
+pub(crate) const PLACEMENT_VIEW: &str = "placement-view";
+
+/// How owners are chosen, so clients can route keys to owners themselves:
+/// xxh3-64 rendezvous hashing over every (node, drive) target of the view
+/// (`rustfs_bucket_engine::TargetId::score`).
+pub(crate) const PLACEMENT_HASH: &str = "xxh3-64-rendezvous-v1";
 
 pub(crate) const PEER_CONTAINS: &str = "peer-contains";
 pub(crate) const PEER_GET_BATCH: &str = "peer-get-batch";
@@ -32,8 +38,12 @@ pub(crate) const PEER_PUT_BATCH: &str = "peer-put-batch";
 /// Most keys in one query or read request.
 pub(crate) const MAX_BATCH_KEYS: usize = 4096;
 /// Request body limits the framework enforces before the engine runs.
-pub(crate) const MAX_KEYS_REQUEST_BYTES: u64 = 4 << 20;
-pub(crate) const MAX_WRITE_REQUEST_BYTES: u64 = 512 << 20;
+pub(crate) const MAX_KEYS_REQUEST_BYTES: u64 = 1 << 20;
+/// Inline batch writes are for small entries: the S3 layer caps every
+/// custom-route request body at 1 MiB (shared with admin routes). Bulk
+/// writes use single-key PUT or, with NIXL, carry buffer descriptors only.
+pub(crate) const MAX_WRITE_REQUEST_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_VIEW_REQUEST_BYTES: u64 = 1024;
 /// Largest batch-read response; a client asks for more in several requests.
 pub(crate) const MAX_READ_RESPONSE_BYTES: u64 = 1 << 30;
 
@@ -42,6 +52,10 @@ pub(crate) const MAX_READ_RESPONSE_BYTES: u64 = 1 << 30;
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeysRequest {
     pub keys: Vec<String>,
+    /// Placement view version the client routed with; a request with an
+    /// older view is refused so the client refreshes it.
+    #[serde(default)]
+    pub view: Option<u64>,
 }
 
 impl KeysRequest {
@@ -85,6 +99,18 @@ pub(crate) struct WriteItem {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WriteHeader {
     pub items: Vec<WriteItem>,
+    #[serde(default)]
+    pub view: Option<u64>,
+}
+
+/// `placement-view` reply: everything a client needs to route keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlacementReply {
+    pub version: u64,
+    pub hash: String,
+    pub replicas: u8,
+    pub nodes: Vec<rustfs_bucket_engine::NodeTargets>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +262,7 @@ mod tests {
         assert_eq!(longest_prefix(&[]), 0);
         let too_many = KeysRequest {
             keys: vec!["k".to_owned(); MAX_BATCH_KEYS + 1],
+            view: None,
         };
         assert!(too_many.validate().is_err());
         assert_eq!(

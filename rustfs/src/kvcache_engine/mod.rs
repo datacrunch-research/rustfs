@@ -41,9 +41,9 @@ use tracing::{debug, warn};
 
 use crate::bucket_engine::peer::{PeerCall, call_peer};
 use batch::{
-    BATCH_READ, BATCH_WRITE, ContainsReply, KeysRequest, MAX_KEYS_REQUEST_BYTES, MAX_READ_RESPONSE_BYTES,
-    MAX_WRITE_REQUEST_BYTES, PEER_CONTAINS, PEER_GET_BATCH, PEER_PUT_BATCH, PREFIX_QUERY, PeerKeys, PeerWrite, PrefixQueryReply,
-    ValuesHeader, WriteHeader, WriteItem, WriteReply, WriteResult,
+    BATCH_READ, BATCH_WRITE, ContainsReply, KeysRequest, MAX_KEYS_REQUEST_BYTES, MAX_READ_RESPONSE_BYTES, MAX_VIEW_REQUEST_BYTES,
+    MAX_WRITE_REQUEST_BYTES, PEER_CONTAINS, PEER_GET_BATCH, PEER_PUT_BATCH, PLACEMENT_HASH, PLACEMENT_VIEW, PREFIX_QUERY,
+    PeerKeys, PeerWrite, PlacementReply, PrefixQueryReply, ValuesHeader, WriteHeader, WriteItem, WriteReply, WriteResult,
 };
 use config::{CONFIG_VERSION, KvCacheConfig};
 use wire::{EntryHeader, KeyRequest, ListReply, ListRequest, PEER_DELETE, PEER_GET, PEER_HEAD, PEER_LIST, PEER_PUT};
@@ -181,6 +181,7 @@ impl KvCacheEngine {
                         operation_spec(PREFIX_QUERY, OperationAction::GetObject, MAX_KEYS_REQUEST_BYTES),
                         operation_spec(BATCH_READ, OperationAction::GetObject, MAX_KEYS_REQUEST_BYTES),
                         operation_spec(BATCH_WRITE, OperationAction::PutObject, MAX_WRITE_REQUEST_BYTES),
+                        operation_spec(PLACEMENT_VIEW, OperationAction::GetObject, MAX_VIEW_REQUEST_BYTES),
                     ],
                     consistent_listing: false,
                     refused_features: BucketFeature::ALL.into_iter().collect(),
@@ -487,6 +488,16 @@ impl KvCacheEngine {
         Ok(results)
     }
 
+    /// Refuses a client request routed with an older placement view, so the
+    /// client refreshes the view and routes again.
+    fn check_client_view(&self, view: Option<u64>) -> EngineResult<()> {
+        let current = self.environment.placement().version;
+        match view {
+            Some(view) if view != current => Err(EngineError::StalePlacement { client: view, current }),
+            _ => Ok(()),
+        }
+    }
+
     /// Checks a forwarded batch's view and returns, for each key, the local
     /// drive when this node owns it.
     fn owned_drives(&self, keys: &[&str], view: u64) -> EngineResult<Vec<Option<u16>>> {
@@ -784,6 +795,7 @@ impl BucketEngine for KvCacheEngine {
                 let keys: KeysRequest =
                     serde_json::from_slice(&request.body).map_err(|err| EngineError::InvalidRequest(err.to_string()))?;
                 keys.validate()?;
+                self.check_client_view(keys.view)?;
                 let present = self.contains_many(bucket, &keys.keys).await?;
                 let hits = batch::longest_prefix(&present);
                 let mut response = json_response(&PrefixQueryReply { hits })?;
@@ -794,6 +806,7 @@ impl BucketEngine for KvCacheEngine {
                 let keys: KeysRequest =
                     serde_json::from_slice(&request.body).map_err(|err| EngineError::InvalidRequest(err.to_string()))?;
                 keys.validate()?;
+                self.check_client_view(keys.view)?;
                 let values = self.read_many(bucket, &keys.keys).await?;
                 let (header, payload) = batch::join_values(&values);
                 Ok(CustomResponse {
@@ -803,9 +816,19 @@ impl BucketEngine for KvCacheEngine {
             }
             BATCH_WRITE => {
                 let (header, payload): (WriteHeader, Bytes) = wire::decode(request.body)?;
+                self.check_client_view(header.view)?;
                 let values = batch::split_values(&header.items, &payload)?;
                 let results = self.write_many(bucket, header.items, values).await?;
                 json_response(&WriteReply { results })
+            }
+            PLACEMENT_VIEW => {
+                let placement = self.environment.placement();
+                json_response(&PlacementReply {
+                    version: placement.version,
+                    hash: PLACEMENT_HASH.to_owned(),
+                    replicas: 1,
+                    nodes: placement.nodes.clone(),
+                })
             }
             _ => Err(EngineError::UnknownOperation {
                 engine: self.descriptor.name.clone(),
@@ -1044,7 +1067,7 @@ mod tests {
         let engine = KvCacheEngine::new(environment(root.path(), &["a:9000"]));
         let bucket = bucket(small_segments());
         engine.attach(&bucket).await.expect("attach");
-        assert_eq!(engine.descriptor().capabilities.custom_operations.len(), 3);
+        assert_eq!(engine.descriptor().capabilities.custom_operations.len(), 4);
 
         let keys: Vec<String> = (0..5).map(|i| format!("prompt/page-{i}")).collect();
         let items: Vec<WriteItem> = keys[..3]
@@ -1064,7 +1087,14 @@ mod tests {
                 &bucket,
                 custom(
                     BATCH_WRITE,
-                    wire::encode(&WriteHeader { items: items.clone() }, &payload).expect("encode"),
+                    wire::encode(
+                        &WriteHeader {
+                            items: items.clone(),
+                            view: None,
+                        },
+                        &payload,
+                    )
+                    .expect("encode"),
                 ),
             )
             .await
@@ -1074,14 +1104,18 @@ mod tests {
         let again = engine
             .custom_operation(
                 &bucket,
-                custom(BATCH_WRITE, wire::encode(&WriteHeader { items }, &payload).expect("encode")),
+                custom(BATCH_WRITE, wire::encode(&WriteHeader { items, view: None }, &payload).expect("encode")),
             )
             .await
             .expect("batch write");
         let reply: WriteReply = serde_json::from_slice(&again.body).expect("json");
         assert_eq!(reply.results, vec![WriteResult::Exists; 3]);
 
-        let query = serde_json::to_vec(&KeysRequest { keys: keys.clone() }).expect("json");
+        let query = serde_json::to_vec(&KeysRequest {
+            keys: keys.clone(),
+            view: None,
+        })
+        .expect("json");
         let response = engine
             .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(query.clone())))
             .await
@@ -1105,6 +1139,7 @@ mod tests {
                     key: "k".to_owned(),
                     size: 99,
                 }],
+                view: None,
             },
             b"x",
         )
@@ -1175,13 +1210,62 @@ mod tests {
         ));
 
         // From the client side, keys of an unreachable owner are misses.
-        let query = serde_json::to_vec(&KeysRequest { keys: vec![theirs] }).expect("json");
+        let query = serde_json::to_vec(&KeysRequest {
+            keys: vec![theirs],
+            view: None,
+        })
+        .expect("json");
         let response = engine
             .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(query)))
             .await
             .expect("prefix query");
         let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
         assert_eq!(reply.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn clients_get_the_placement_view_and_stale_views_are_refused() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let engine = KvCacheEngine::new(environment(root.path(), &["a:9000", "b:9000"]));
+        let bucket = bucket(small_segments());
+        engine.attach(&bucket).await.expect("attach");
+
+        let response = engine
+            .custom_operation(&bucket, custom(PLACEMENT_VIEW, Bytes::new()))
+            .await
+            .expect("placement view");
+        let view: PlacementReply = serde_json::from_slice(&response.body).expect("json");
+        assert_eq!(view.version, engine.environment.placement().version);
+        assert_eq!(view.hash, PLACEMENT_HASH);
+        assert_eq!(view.nodes.len(), 2);
+        // A client computing owners from the reply agrees with the engine.
+        let routed = PlacementView {
+            version: view.version,
+            nodes: view.nodes.clone(),
+        };
+        let key = key_owned_by(&engine, true);
+        assert_eq!(routed.owner(key.as_bytes()).expect("owner").node, "a:9000");
+
+        let stale = serde_json::to_vec(&KeysRequest {
+            keys: vec![key.clone()],
+            view: Some(view.version + 1),
+        })
+        .expect("json");
+        assert!(matches!(
+            engine
+                .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(stale)))
+                .await,
+            Err(EngineError::StalePlacement { .. })
+        ));
+        let current = serde_json::to_vec(&KeysRequest {
+            keys: vec![key],
+            view: Some(view.version),
+        })
+        .expect("json");
+        engine
+            .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(current)))
+            .await
+            .expect("current view");
     }
 
     #[tokio::test]
