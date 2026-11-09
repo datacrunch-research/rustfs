@@ -10277,6 +10277,7 @@ version = "1.0.2"
 dependencies = [
  "crc-fast",
  "libc",
+ "parking_lot 0.13.0",
  "rustix",
  "tempfile",
  "thiserror 2.0.21",

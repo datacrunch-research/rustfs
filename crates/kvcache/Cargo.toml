@@ -33,6 +33,7 @@ workspace = true
 [dependencies]
 crc-fast.workspace = true
 libc.workspace = true
+parking_lot.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 

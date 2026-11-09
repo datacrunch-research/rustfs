@@ -29,8 +29,10 @@ mod aligned;
 mod error;
 mod format;
 mod segment;
+mod store;
 
 pub use aligned::{AlignedBuf, BLOCK_SIZE};
 pub use error::{KvError, KvResult};
 pub use format::{EntryMeta, MAX_KEY_LEN, entry_footprint};
 pub use segment::{ScannedSegment, SegmentFile, SegmentId, SegmentWriter, WriterOptions, scan_segment, segment_file_name};
+pub use store::{EntryInfo, KvStore, PutOutcome, RecoveryReport, SegmentStat, StoreOptions, Value};
