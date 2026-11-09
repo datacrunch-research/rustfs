@@ -881,7 +881,7 @@ impl BucketEngine for KvCacheEngine {
                 self.check_client_view(keys.view)?;
                 let present = self.contains_many(bucket, &keys.keys).await?;
                 let hits = batch::longest_prefix(&present);
-                let mut response = json_response(&PrefixQueryReply { hits })?;
+                let mut response = json_response(&PrefixQueryReply { hits, present })?;
                 response.headers.push(("x-rustfs-engine-hits".to_owned(), hits.to_string()));
                 Ok(response)
             }
@@ -1251,7 +1251,21 @@ mod tests {
             .expect("prefix query");
         let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
         assert_eq!(reply.hits, 3);
+        assert_eq!(reply.present, vec![true, true, true, false, false]);
         assert_eq!(response.headers, vec![("x-rustfs-engine-hits".to_owned(), "3".to_owned())]);
+
+        // A gap ends the prefix; keys after it are still reported.
+        let gapped = serde_json::to_vec(&KeysRequest {
+            keys: vec![keys[0].clone(), keys[3].clone(), keys[2].clone()],
+            view: None,
+        })
+        .expect("json");
+        let response = engine
+            .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(gapped)))
+            .await
+            .expect("gapped prefix query");
+        let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
+        assert_eq!((reply.hits, reply.present), (1, vec![true, false, true]));
 
         let response = engine
             .custom_operation(&bucket, custom(BATCH_READ, Bytes::from(query)))
@@ -1349,7 +1363,7 @@ mod tests {
             .await
             .expect("prefix query");
         let reply: PrefixQueryReply = serde_json::from_slice(&response.body).expect("json");
-        assert_eq!(reply.hits, 0);
+        assert_eq!((reply.hits, reply.present), (0, vec![false]));
     }
 
     #[test]

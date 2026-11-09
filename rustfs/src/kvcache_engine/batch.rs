@@ -75,6 +75,10 @@ impl KeysRequest {
 pub(crate) struct PrefixQueryReply {
     /// Number of leading keys stored.
     pub hits: usize,
+    /// Whether each requested key is stored, in request order, so a client
+    /// can also check keys that do not form one prefix (group ends, sidecar
+    /// state) in a single request.
+    pub present: Vec<bool>,
 }
 
 /// `batch-read` response header (followed by the values of the hits,

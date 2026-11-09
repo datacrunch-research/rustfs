@@ -226,4 +226,22 @@ mod tests {
         assert_eq!(owners_before, owners_after);
         assert!(!v.is_online("n2:9000"));
     }
+
+    /// Clients route keys with their own copy of this hash (the SGLang HiCache
+    /// backend pins the same vector); a change here breaks their routing.
+    #[test]
+    fn owners_match_the_pinned_client_vector() {
+        let v = view(&[("10.0.0.1:9000", 4), ("10.0.0.2:9000", 4), ("10.0.0.3:9000", 2)]);
+        for (key, node, drive) in [
+            ("hicache/a", "10.0.0.1:9000", 2),
+            ("hicache/b", "10.0.0.2:9000", 3),
+            ("hicache/c", "10.0.0.1:9000", 2),
+            ("hicache/d", "10.0.0.3:9000", 1),
+            ("hicache/e", "10.0.0.2:9000", 3),
+            ("hicache/f", "10.0.0.1:9000", 2),
+        ] {
+            let owner = v.owner(key.as_bytes()).expect("owner");
+            assert_eq!((owner.node.as_str(), owner.drive), (node, drive), "{key}");
+        }
+    }
 }
