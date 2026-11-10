@@ -69,6 +69,13 @@ pub struct EntryInfo {
     pub write_time_ms: u64,
 }
 
+/// One name of a listing: a stored key, or a common prefix of keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListItem {
+    Entry(String, EntryInfo),
+    Prefix(String),
+}
+
 /// A value read from a segment: an aligned buffer and the value's length.
 pub struct Value {
     buf: AlignedBuf,
@@ -616,18 +623,43 @@ impl KvStore {
 
     /// Up to `max` stored keys with `prefix`, after `start_after`, sorted.
     /// Best effort: concurrent writes may or may not appear.
-    pub fn list(&self, prefix: &str, start_after: Option<&str>, max: usize) -> Vec<(String, EntryInfo)> {
-        let mut keys: Vec<(String, EntryInfo)> = Vec::new();
+    /// The first `max` names after `start_after` under `prefix`, in key
+    /// order. With a delimiter, keys that contain it after the prefix are
+    /// listed once as their common prefix (S3 ListObjects rules), so a page
+    /// of a few common prefixes costs one pass over the index however many
+    /// keys they hold. Only the names kept are copied.
+    pub fn list(&self, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, max: usize) -> Vec<ListItem> {
+        let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
+        let mut names: BTreeMap<String, Option<EntryInfo>> = BTreeMap::new();
+        if max == 0 {
+            return Vec::new();
+        }
         for shard in &self.index {
             for (key, location) in shard.read().iter() {
-                if key.starts_with(prefix) && start_after.is_none_or(|after| key.as_str() > after) {
-                    keys.push((key.clone(), entry_info(location)));
+                let Some(rest) = key.strip_prefix(prefix) else {
+                    continue;
+                };
+                let common = delimiter.and_then(|delimiter| rest.find(delimiter).map(|at| prefix.len() + at + delimiter.len()));
+                let name = common.map_or(key.as_str(), |end| &key[..end]);
+                if start_after.is_some_and(|after| name <= after)
+                    || (names.len() == max && names.last_key_value().is_some_and(|(last, _)| name >= last.as_str()))
+                    || names.contains_key(name)
+                {
+                    continue;
+                }
+                names.insert(name.to_owned(), common.is_none().then(|| entry_info(location)));
+                if names.len() > max {
+                    names.pop_last();
                 }
             }
         }
-        keys.sort_by(|left, right| left.0.cmp(&right.0));
-        keys.truncate(max);
-        keys
+        names
+            .into_iter()
+            .map(|(name, info)| match info {
+                Some(info) => ListItem::Entry(name, info),
+                None => ListItem::Prefix(name),
+            })
+            .collect()
     }
 
     /// Number of keys in the index.
@@ -783,8 +815,42 @@ mod tests {
             assert_eq!(read.as_slice(), &value(i, 40_000)[..]);
         }
         assert_eq!(store.prefix_query(["k00", "k01", "k02", "zz", "k03"]), 3);
-        let listed: Vec<_> = store.list("k1", Some("k12"), 3).into_iter().map(|(key, _)| key).collect();
+        let listed: Vec<_> = store
+            .list("k1", None, Some("k12"), 3)
+            .into_iter()
+            .map(|item| match item {
+                ListItem::Entry(key, _) => key,
+                ListItem::Prefix(prefix) => panic!("no delimiter, got prefix {prefix}"),
+            })
+            .collect();
         assert_eq!(listed, ["k13", "k14", "k15"]);
+    }
+
+    #[test]
+    fn listing_with_a_delimiter_rolls_keys_up_to_common_prefixes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (store, _) = open(&drives(root.path(), 2));
+        for (i, key) in ["a/1", "a/2", "b/1", "c", "d/x/1", "d/x/2", "d/y"].iter().enumerate() {
+            store.put((i % 2) as u16, key, &value(i as u8, 100), 1).expect("put");
+        }
+        let names = |prefix, start_after, max| -> Vec<String> {
+            store
+                .list(prefix, Some("/"), start_after, max)
+                .into_iter()
+                .map(|item| match item {
+                    ListItem::Entry(key, _) => key,
+                    ListItem::Prefix(prefix) => format!("[{prefix}]"),
+                })
+                .collect()
+        };
+        assert_eq!(names("", None, 10), ["[a/]", "[b/]", "c", "[d/]"]);
+        // A common prefix given as the start skips every key under it.
+        assert_eq!(names("", Some("a/"), 10), ["[b/]", "c", "[d/]"]);
+        assert_eq!(names("", None, 2), ["[a/]", "[b/]"]);
+        assert_eq!(names("d/", None, 10), ["[d/x/]", "d/y"]);
+        assert!(names("", None, 0).is_empty());
+        // Without a delimiter every key is listed.
+        assert_eq!(store.list("d/", None, None, 10).len(), 3);
     }
 
     #[test]

@@ -74,7 +74,7 @@ Batch operations are custom operations of the engine. The framework authorizes e
 - **Prefix query:** ordered entry keys in, the length of the longest stored prefix and each entry's location out. One round trip per owner replaces one metadata lookup per page.
 - **Batch read:** (key, destination buffer, length) tuples in; owners push the values into the destination GPU or host memory.
 - **Batch write:** (key, source buffer, length) tuples in; owners pull and append the values and acknowledge once each entry is readable from its owner.
-- **S3 operations:** GetObject, HeadObject, PutObject, and DeleteObject on single keys stay available for debugging and tooling, served by the owner. ListObjects is best effort over the owners' indexes.
+- **S3 operations:** GetObject, HeadObject, PutObject, and DeleteObject on single keys stay available for debugging and tooling, served by the owner. ListObjects (v1 and v2, with or without a delimiter) is best effort over the owners' indexes: every node lists its own keys, rolling keys up to common prefixes in the same pass, and the pages are merged, so a key written during a listing may be missing from it.
 
 ## Memory tier
 

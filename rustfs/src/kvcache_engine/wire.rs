@@ -67,6 +67,8 @@ pub(crate) struct RdmaReply {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListRequest {
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
     pub start_after: Option<String>,
     pub max_keys: usize,
 }
@@ -84,6 +86,9 @@ pub(crate) struct EntryHeader {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ListReply {
     pub entries: Vec<EntryHeader>,
+    /// Common prefixes, when listed with a delimiter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<String>,
     pub truncated: bool,
 }
 
@@ -156,6 +161,7 @@ mod tests {
                     last_modified_unix_secs: 1_762_700_000,
                 })
                 .collect(),
+            prefixes: Vec::new(),
             truncated: true,
         };
         let message = encode(&reply, b"").expect("encode");

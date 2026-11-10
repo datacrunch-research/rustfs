@@ -34,10 +34,10 @@ use parking_lot::RwLock;
 use rustfs_bucket_engine::{
     BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, CustomOperationSpec, CustomRequest,
     CustomResponse, EngineCapabilities, EngineDescriptor, EngineError, EngineName, EngineObject, EngineObjectInfo,
-    EngineObjectOperation, EngineResult, ListPage, NodeEnvironment, ObjectWriteMeta, OperationAction, OperationName,
-    RdmaTransfer,
+    EngineObjectOperation, EngineResult, ListPage, ListPageBuilder, ListQuery, NodeEnvironment, ObjectWriteMeta, OperationAction,
+    OperationName, RdmaTransfer,
 };
-use rustfs_kvcache::{EntryInfo, KvError, KvStore, PutOutcome, StatvfsFs};
+use rustfs_kvcache::{EntryInfo, KvError, KvStore, ListItem, PutOutcome, StatvfsFs};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -322,15 +322,26 @@ impl KvCacheEngine {
 
     fn local_list(&self, bucket: &BucketContext, request: &ListRequest) -> EngineResult<ListReply> {
         let state = self.bucket(bucket)?;
-        let mut entries = state
-            .store
-            .list(&request.prefix, request.start_after.as_deref(), request.max_keys.saturating_add(1));
-        let truncated = entries.len() > request.max_keys;
-        entries.truncate(request.max_keys);
-        Ok(ListReply {
-            entries: entries.iter().map(|(key, info)| header_of(&object_info(key, info))).collect(),
+        let mut items = state.store.list(
+            &request.prefix,
+            request.delimiter.as_deref(),
+            request.start_after.as_deref(),
+            request.max_keys.saturating_add(1),
+        );
+        let truncated = items.len() > request.max_keys;
+        items.truncate(request.max_keys);
+        let mut reply = ListReply {
+            entries: Vec::new(),
+            prefixes: Vec::new(),
             truncated,
-        })
+        };
+        for item in items {
+            match item {
+                ListItem::Entry(key, info) => reply.entries.push(header_of(&object_info(&key, &info))),
+                ListItem::Prefix(prefix) => reply.prefixes.push(prefix),
+            }
+        }
+        Ok(reply)
     }
 
     fn group(&self, keys: &[&str]) -> EngineResult<Grouped> {
@@ -822,21 +833,22 @@ impl BucketEngine for KvCacheEngine {
     }
 
     /// Best effort: every node lists its own keys and the pages are merged.
-    async fn list_objects(
-        &self,
-        bucket: &BucketContext,
-        prefix: &str,
-        start_after: Option<&str>,
-        max_keys: usize,
-    ) -> EngineResult<ListPage> {
+    async fn list_objects(&self, bucket: &BucketContext, query: &ListQuery<'_>) -> EngineResult<ListPage> {
         let request = ListRequest {
-            prefix: prefix.to_owned(),
-            start_after: start_after.map(str::to_owned),
-            max_keys,
+            prefix: query.prefix.to_owned(),
+            delimiter: query.delimiter.filter(|delimiter| !delimiter.is_empty()).map(str::to_owned),
+            start_after: query.start_after.map(str::to_owned),
+            max_keys: query.max_keys,
         };
-        let local = self.local_list(bucket, &request)?;
-        let mut entries = local.entries;
-        let mut truncated = local.truncated;
+        let mut page = ListPageBuilder::new(query.max_keys);
+        let mut add = |reply: ListReply| {
+            if reply.truncated {
+                page.mark_truncated();
+            }
+            reply.entries.into_iter().for_each(|entry| page.push_object(info_of(entry)));
+            reply.prefixes.into_iter().for_each(|prefix| page.push_prefix(prefix));
+        };
+        add(self.local_list(bucket, &request)?);
         let peers = self.environment.placement();
         let message = wire::encode(&request, &[])?;
         let others: Vec<String> = peers
@@ -853,23 +865,9 @@ impl BucketEngine for KvCacheEngine {
         .await;
         for reply in replies {
             let (reply, _): (ListReply, Bytes) = wire::decode(reply?)?;
-            truncated |= reply.truncated;
-            entries.extend(reply.entries);
+            add(reply);
         }
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        entries.dedup_by(|left, right| left.key == right.key);
-        if entries.len() > max_keys {
-            truncated = true;
-            entries.truncate(max_keys);
-        }
-        Ok(ListPage {
-            next_start_after: if truncated {
-                entries.last().map(|entry| entry.key.clone())
-            } else {
-                None
-            },
-            objects: entries.into_iter().map(info_of).collect(),
-        })
+        Ok(page.finish())
     }
 
     async fn custom_operation(&self, bucket: &BucketContext, request: CustomRequest) -> EngineResult<CustomResponse> {
@@ -1136,7 +1134,12 @@ mod tests {
         let got = engine.get_object(&bucket, "page-1", None, None).await.expect("get");
         assert_eq!(got.body, value);
         assert_eq!(engine.head_object(&bucket, "page-2").await.expect("head").size, 1);
-        let listed = engine.list_objects(&bucket, "page-", None, 1).await.expect("list");
+        let first_page = ListQuery {
+            prefix: "page-",
+            max_keys: 1,
+            ..ListQuery::default()
+        };
+        let listed = engine.list_objects(&bucket, &first_page).await.expect("list");
         assert_eq!(listed.objects.len(), 1);
         assert_eq!(listed.next_start_after.as_deref(), Some("page-1"));
         assert!(engine.holds_data(&bucket).await.expect("holds data"));
@@ -1421,6 +1424,69 @@ mod tests {
             .custom_operation(&bucket, custom(PREFIX_QUERY, Bytes::from(current)))
             .await
             .expect("current view");
+    }
+
+    #[tokio::test]
+    async fn listing_with_a_delimiter_returns_common_prefixes_locally_and_to_peers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let engine = KvCacheEngine::new(environment(root.path(), &["a:9000"]));
+        let bucket = bucket(small_segments());
+        engine.attach(&bucket).await.expect("attach");
+        for key in ["hicache/kimi/1", "hicache/kimi/2", "hicache/dsv4/1", "hicache/top", "other"] {
+            engine
+                .put_object(&bucket, key, Bytes::from_static(b"v"), ObjectWriteMeta::default())
+                .await
+                .expect("put");
+        }
+        let root_query = ListQuery {
+            delimiter: Some("/"),
+            max_keys: 1000,
+            ..ListQuery::default()
+        };
+        let root_page = engine.list_objects(&bucket, &root_query).await.expect("list root");
+        assert_eq!(root_page.common_prefixes, ["hicache/"]);
+        assert_eq!(root_page.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["other"]);
+        assert_eq!(root_page.next_start_after, None);
+
+        let folder = ListQuery {
+            prefix: "hicache/",
+            delimiter: Some("/"),
+            max_keys: 2,
+            ..ListQuery::default()
+        };
+        let page = engine.list_objects(&bucket, &folder).await.expect("list folder");
+        assert_eq!(page.common_prefixes, ["hicache/dsv4/", "hicache/kimi/"]);
+        assert!(page.objects.is_empty());
+        assert_eq!(page.next_start_after.as_deref(), Some("hicache/kimi/"));
+        let rest = engine
+            .list_objects(
+                &bucket,
+                &ListQuery {
+                    start_after: page.next_start_after.as_deref(),
+                    ..folder
+                },
+            )
+            .await
+            .expect("next page");
+        assert_eq!(rest.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["hicache/top"]);
+        assert_eq!(rest.next_start_after, None);
+
+        // A peer asked to list answers with its common prefixes.
+        let op = |name: &str| OperationName::new(name).expect("valid operation name");
+        let request = ListRequest {
+            prefix: String::new(),
+            delimiter: Some("/".to_owned()),
+            start_after: None,
+            max_keys: 10,
+        };
+        let reply = engine
+            .handle_peer_call(&bucket, &op(PEER_LIST), wire::encode(&request, &[]).expect("encode"))
+            .await
+            .expect("peer list");
+        let (reply, _): (ListReply, Bytes) = wire::decode(reply).expect("decode");
+        assert_eq!(reply.prefixes, ["hicache/"]);
+        assert_eq!(reply.entries.len(), 1);
+        assert!(!reply.truncated);
     }
 
     #[tokio::test]
