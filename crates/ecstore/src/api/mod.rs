@@ -681,19 +681,6 @@ pub mod rpc {
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
         verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
-
-    /// Server side of the internode RDMA data plane, consumed by the RustFS binary.
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
-    pub mod rdma {
-        pub use crate::cluster::rpc::internode_data_transport::{InternodeDataTransport, ReadStreamRequest};
-        pub use crate::cluster::rpc::rdma::proto::ErrorCode as RdmaErrorCode;
-        pub use crate::cluster::rpc::rdma::proto::{StreamOp as RdmaStreamOp, WriteRequest as RdmaWriteRequestWire};
-        pub use crate::cluster::rpc::rdma::{
-            PositionalRead, RdmaBodyStream, RdmaInternodeDataTransport, RdmaReadRequest, RdmaReject, RdmaRequestHandler,
-            RdmaServer, RdmaSettings, RdmaWriteRequest, RegisteredPool, default_listen_addrs, server_enabled, settings,
-            shared_pool,
-        };
-    }
 }
 
 pub mod set_disk {

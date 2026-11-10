@@ -22,12 +22,10 @@ Current implementation status:
 
 - `InternodeDataTransport` exists in
   `crates/ecstore/src/rpc/internode_data_transport.rs`.
-- The default production backend is `tcp-http`; `tcp` is accepted as an
-  alias. An optional `rdma` backend (Linux, `rdma` feature) serves shard
-  reads and writes; see `docs/operations/internode-rdma-transport.md`.
+- The default and only production backend is `tcp-http`; `tcp` is accepted as
+  an alias.
 - `RUSTFS_INTERNODE_DATA_TRANSPORT` selects the backend. Blank or unset values
-  use `tcp-http`; invalid values fail closed, and `rdma` fails closed on
-  builds without the feature.
+  use `tcp-http`; invalid values fail closed.
 - `RemoteDisk::read_file_stream`, `RemoteDisk::create_file`,
   `RemoteDisk::append_file`, and `RemoteDisk::walk_dir` delegate to the
   transport.
@@ -53,10 +51,11 @@ The OSS scope is:
   tooling;
 - document buffer ownership, fallback, and capability expectations for
   maintainable transport code;
-- keep optional backends explicit, feature-gated, and fail-closed.
+- avoid adding dependencies or backend implementations.
 
 The OSS scope is not:
 
+- adding another transport backend;
 - replacing the gRPC control plane;
 - adding benchmark plans for another transport;
 - adding runtime plugin loading;
@@ -466,7 +465,7 @@ claim support or performance for any other transport.
 
 The current adapter boundary has these constraints:
 
-- `tcp-http` is the default OSS backend; `rdma` is optional and feature-gated.
+- `tcp-http` is the default and only OSS backend.
 - Backend selection is explicit and fail-closed.
 - The gRPC control plane remains responsible for metadata, health, locks, and
   coordination.

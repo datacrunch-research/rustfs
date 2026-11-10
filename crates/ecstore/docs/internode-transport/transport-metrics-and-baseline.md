@@ -8,9 +8,8 @@ does not add a backend, change runtime behavior, or make performance claims.
 
 The current OSS adapter scope is:
 
-- `tcp-http` is the default internode data transport backend;
+- `tcp-http` is the default and only supported internode data transport backend;
 - `tcp` is a legacy alias for `tcp-http`;
-- `rdma` is an optional, feature-gated backend for shard streams;
 - unsupported backend values fail closed during transport construction;
 - metrics and baseline artifacts are used to understand the current data-plane
   behavior.
@@ -44,12 +43,11 @@ Current backend label values are:
 | --- | --- |
 | `tcp-http` | Current HTTP stream backend for adapter-routed operations. |
 | `grpc` | Current gRPC path for `ReadAll` and `WriteAll`. |
-| `rdma` | Optional RDMA stream backend for adapter-routed shard reads and writes (`docs/operations/internode-rdma-transport.md`). |
 | `unknown` | Aggregate internode metric path when an operation-specific backend is not available. |
 
-The `backend` label reflects the instrumentation source, for example the
-`tcp-http` stream path, the `rdma` stream path, the gRPC path, or the
-aggregate unknown path.
+The `backend` label reflects the current instrumentation source, for example
+the `tcp-http` stream path, gRPC path, or aggregate unknown path. It does not
+imply additional supported transport backends.
 
 Metric labels must stay low cardinality. Do not add object names, full paths,
 full URLs, peer-specific dynamic strings, request IDs, or other per-request

@@ -6,7 +6,6 @@ This document describes the design and the invariants of the S3-over-RDMA work o
 
 - [nixl-s3-over-rdma.md](../operations/nixl-s3-over-rdma.md): NIXL build, settings, wire contract, device check, internode NIXL, large-PUT tuning, per-bucket ETag API.
 - [cuobject-s3-over-rdma.md](../operations/cuobject-s3-over-rdma.md): the earlier cuObject transport.
-- [internode-rdma-transport.md](../operations/internode-rdma-transport.md): the verbs-based internode shard transport.
 - [rdma-get-optimization-benchmarks.md](../operations/rdma-get-optimization-benchmarks.md): the measurement record behind every server-side number below.
 
 ## Goals
@@ -25,9 +24,8 @@ This document describes the design and the invariants of the S3-over-RDMA work o
 | Client last hop, NIXL | `crates/nixl/src/lib.rs` (`RdmaToken::from_headers`, `ensure_remote`), `crates/nixl/src/mem.rs` | NIXL/UCX transport selected by the `nixl` feature. The client names a registered `dram` or `vram` buffer; the server WRITEs (GET) or READs (PUT) it. |
 | Shared pipeline | `rustfs/src/app/object/cuobject.rs` | Segment fan-out of large GETs, staging chunks, shard arena, completion handling. The same pipeline serves both transports; only the transfer layer differs. |
 | Device health | `crates/nixl/src/devices.rs` | Startup check that leaves out RDMA devices that are down, slow or flapping. |
-| Internode, verbs | `crates/ecstore/src/cluster/rpc/rdma/mod.rs`, `rustfs/src/storage/rpc/rdma_service.rs` | `RUSTFS_INTERNODE_DATA_TRANSPORT=rdma`: shard streams over RDMA connections. |
 | Internode, NIXL | `crates/ecstore/src/cluster/rpc/nixl_internode.rs`, `rustfs/src/storage/rpc/nixl_read.rs` | `RUSTFS_INTERNODE_DATA_TRANSPORT=nixl`: signed control request over HTTP, data over NIXL, for shard reads and writes. |
-| Transport selection | `crates/ecstore/src/cluster/rpc/internode_data_transport.rs` | `tcp-http`, `rdma` or `nixl`. |
+| Transport selection | `crates/ecstore/src/cluster/rpc/internode_data_transport.rs` | `tcp-http` or `nixl`. Internode RDMA runs over NIXL only; the earlier verbs-based `rdma` backend was removed, and a node still configured with `rdma` fails at startup. |
 | Erasure read path | `crates/ecstore/src/erasure/codec/shard_buf.rs`, `crates/ecstore/src/erasure/codec/shard_emit.rs`, `crates/ecstore/src/erasure/coding/bitrot.rs` | Two buffer generations per shard slot, zero-copy emit from registered shard buffers, bitrot verification off the decode task. |
 | PUT path | `rustfs/src/app/object/put.rs`, `rustfs/src/app/multipart_usecase.rs`, `crates/rio/src/etag_reader.rs` (`with_md5_offload`), `crates/rio/src/hash_reader.rs` (`EtagAlgorithm`) | Zero-copy RDMA PutObject body, read-ahead, zero-copy UploadPart chunks, ETag MD5 on a blocking-pool thread, per-bucket XXH3 ETags. |
 | Per-bucket ETag | `crates/ecstore/src/bucket/etag.rs` (`set_bucket_xxh3_etag`, `bucket_uses_xxh3_etag`), `rustfs/src/admin/handlers/etag.rs` | `etag.json` bucket-metadata entry; admin `GET/PUT/DELETE /rustfs/admin/v3/bucket-etag/{bucket}`. |

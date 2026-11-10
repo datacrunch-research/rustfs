@@ -8,9 +8,8 @@ RustFS writes the object bytes straight into that buffer with one-sided RDMA
 writes. The HTTP response carries no body.
 
 This is the Phase 1 "last hop" of the S3-over-RDMA plan. It is independent of
-the internode `rdma` shard transport described in
-[internode-rdma-transport.md](internode-rdma-transport.md); either can be
-enabled on its own.
+the internode shard transport selected by `RUSTFS_INTERNODE_DATA_TRANSPORT`;
+either can be enabled on its own.
 
 ## Build
 

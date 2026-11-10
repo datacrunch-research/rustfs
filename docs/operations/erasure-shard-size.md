@@ -28,9 +28,6 @@ Rules:
 - Memory per in-flight stripe grows with the block: about 64 MiB per GET with
   4 MiB shards on 12+4, 128 MiB when a stripe is prefetched. Time to first byte
   of a small ranged read inside a large object grows with the block as well.
-- Internode streams move whole shards, so raise the RDMA window to cover one
-  shard: `RUSTFS_RDMA_CHUNK_SIZE=4194304` with the default 4 slots, and size
-  `RUSTFS_RDMA_POOL_BYTES` for the expected number of concurrent streams.
 
 ## Bitrot verification with large shards
 

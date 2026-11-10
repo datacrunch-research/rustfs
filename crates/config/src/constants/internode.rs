@@ -323,9 +323,6 @@ pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 /// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
 pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 
-/// Internode RDMA data-plane backend. Requires a build with the `rdma` Cargo feature.
-pub const INTERNODE_DATA_TRANSPORT_RDMA: &str = "rdma";
-
 /// Internode reads whose data moves over NIXL/UCX (InfiniBand rails or RoCE by
 /// LID/GID, no IP needed); requests, writes and walks stay on TCP/HTTP. Requires
 /// a binary built with the `nixl` feature and `RUSTFS_NIXL_ENABLE`; until the
@@ -336,7 +333,6 @@ pub const INTERNODE_DATA_TRANSPORT_NIXL: &str = "nixl";
 pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[
     DEFAULT_INTERNODE_DATA_TRANSPORT,
     INTERNODE_DATA_TRANSPORT_TCP,
-    INTERNODE_DATA_TRANSPORT_RDMA,
     INTERNODE_DATA_TRANSPORT_NIXL,
 ];
 
@@ -355,58 +351,6 @@ pub const DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: u64 = 3_000;
 /// NIXL internode reads in flight per remote shard stream.
 pub const ENV_RUSTFS_NIXL_INTERNODE_DEPTH: &str = "RUSTFS_NIXL_INTERNODE_DEPTH";
 pub const DEFAULT_RUSTFS_NIXL_INTERNODE_DEPTH: usize = 4;
-
-/// Added to a peer's internode HTTP port to derive its RDMA listener port.
-pub const ENV_RUSTFS_RDMA_PORT_OFFSET: &str = "RUSTFS_RDMA_PORT_OFFSET";
-pub const DEFAULT_RUSTFS_RDMA_PORT_OFFSET: u16 = 1000;
-
-/// Comma-separated IP addresses the RDMA listener binds. Defaults to the local endpoint hosts.
-pub const ENV_RUSTFS_RDMA_LISTEN_ADDRS: &str = "RUSTFS_RDMA_LISTEN_ADDRS";
-
-/// Whether this node serves internode shard streams over RDMA. Defaults to true when the
-/// `rdma` data transport is selected, so a rolling upgrade can enable the server first.
-pub const ENV_RUSTFS_RDMA_SERVER_ENABLE: &str = "RUSTFS_RDMA_SERVER_ENABLE";
-
-/// Registered buffer slot size in bytes for one RDMA write.
-pub const ENV_RUSTFS_RDMA_CHUNK_SIZE: &str = "RUSTFS_RDMA_CHUNK_SIZE";
-pub const DEFAULT_RUSTFS_RDMA_CHUNK_SIZE: usize = 1024 * 1024;
-
-/// Registered slots per stream window on each side of a transfer.
-pub const ENV_RUSTFS_RDMA_STREAM_SLOTS: &str = "RUSTFS_RDMA_STREAM_SLOTS";
-pub const DEFAULT_RUSTFS_RDMA_STREAM_SLOTS: usize = 4;
-
-/// Idle RDMA connections kept per peer for reuse. Every shard read is one
-/// stream on its own connection; a stream that finds no idle connection
-/// dials a fresh one and a returning connection beyond this count is torn
-/// down, so under many concurrent shard reads a small pool turns into a
-/// connect per read. Size it for the concurrent streams per peer expected.
-pub const ENV_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: &str = "RUSTFS_RDMA_IDLE_CONNS_PER_PEER";
-pub const DEFAULT_RUSTFS_RDMA_IDLE_CONNS_PER_PEER: usize = 64;
-
-/// Idle RDMA connections the transport keeps ready per peer. Whenever a
-/// stream takes a connection and fewer than this many remain, background
-/// dials refill the pool, so a dial (QP creation plus the connection-manager
-/// handshake, tens of milliseconds on a busy node) leaves the shard-open path.
-/// Must not exceed `RUSTFS_RDMA_IDLE_CONNS_PER_PEER`; `0` disables refills.
-pub const ENV_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER: &str = "RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER";
-pub const DEFAULT_RUSTFS_RDMA_MIN_IDLE_CONNS_PER_PEER: usize = 16;
-
-/// Total pinned, registered memory per process shared by all RDMA streams.
-pub const ENV_RUSTFS_RDMA_POOL_BYTES: &str = "RUSTFS_RDMA_POOL_BYTES";
-pub const DEFAULT_RUSTFS_RDMA_POOL_BYTES: usize = 256 * 1024 * 1024;
-const _: () = assert!(DEFAULT_RUSTFS_RDMA_POOL_BYTES >= DEFAULT_RUSTFS_RDMA_CHUNK_SIZE * DEFAULT_RUSTFS_RDMA_STREAM_SLOTS);
-
-/// Whether a failed RDMA setup falls back to `tcp-http` for that transfer.
-pub const ENV_RUSTFS_RDMA_FALLBACK_TCP: &str = "RUSTFS_RDMA_FALLBACK_TCP";
-pub const DEFAULT_RUSTFS_RDMA_FALLBACK_TCP: bool = true;
-
-/// RDMA address and route resolution plus connection establishment timeout.
-pub const ENV_RUSTFS_RDMA_CONNECT_TIMEOUT_MS: &str = "RUSTFS_RDMA_CONNECT_TIMEOUT_MS";
-pub const DEFAULT_RUSTFS_RDMA_CONNECT_TIMEOUT_MS: u64 = 2000;
-
-/// Longest pause without progress tolerated on one RDMA stream before it fails.
-pub const ENV_RUSTFS_RDMA_STALL_TIMEOUT_SECS: &str = "RUSTFS_RDMA_STALL_TIMEOUT_SECS";
-pub const DEFAULT_RUSTFS_RDMA_STALL_TIMEOUT_SECS: u64 = 30;
 
 /// Whether S3 GETs and PUTs carrying the NIXL headers are served over NIXL/UCX
 /// S3-over-RDMA (requires a build with the `nixl` feature and libnixl). The
@@ -633,10 +577,6 @@ mod tests {
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
-        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "rdma", "nixl"]);
-        assert_eq!(INTERNODE_DATA_TRANSPORT_RDMA, "rdma");
-        assert_eq!(DEFAULT_RUSTFS_RDMA_PORT_OFFSET, 1000);
-        assert_eq!(DEFAULT_RUSTFS_RDMA_CHUNK_SIZE, 1024 * 1024);
-        assert_eq!(DEFAULT_RUSTFS_RDMA_STREAM_SLOTS, 4);
+        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "nixl"]);
     }
 }

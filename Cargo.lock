@@ -10052,7 +10052,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "bytesize",
- "cc",
  "chrono",
  "criterion",
  "faster-hex",

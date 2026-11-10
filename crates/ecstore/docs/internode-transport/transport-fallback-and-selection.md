@@ -10,9 +10,9 @@ does not change production behavior.
 The open-source RustFS path keeps `tcp-http` as the default internode data
 transport. This document defines adapter contracts only:
 
-- `tcp-http` stays the default backend;
-- the optional `rdma` backend is compiled only with the `rdma` feature and
-  selected only explicitly;
+- no additional production backend is introduced;
+- no dependency is added;
+- no new accepted production backend value is added;
 - RustFS core data-plane logic remains independent of the concrete transport
   implementation.
 
@@ -25,7 +25,6 @@ Static config is the first selection model. Existing accepted values remain:
 | unset | Use default TCP/HTTP backend. |
 | `tcp-http` | Use default TCP/HTTP backend. |
 | `tcp` | Alias for `tcp-http`. |
-| `rdma` | Use the RDMA backend for shard reads and writes (Linux builds with the `rdma` feature). Other builds fail closed naming the feature. See `docs/operations/internode-rdma-transport.md`. |
 | any unsupported value | Fail closed with a diagnostic naming `RUSTFS_INTERNODE_DATA_TRANSPORT` and the invalid value. |
 
 Unknown backend values must fail closed. Unsupported backend values must fail
@@ -51,11 +50,8 @@ payload.
 | Max transfer size exceeded | Fail before payload transfer or split at a higher layer. | Use TCP/HTTP if policy allows and TCP has no RustFS-level cap. | Record rejected size and selected backend. |
 | Auth or encryption mismatch | Fail closed. | No fallback unless the fallback path satisfies the same or stronger security requirements. | Security failure metric and audit log entry. |
 
-The `rdma` backend implements this contract: `RUSTFS_RDMA_FALLBACK_TCP`
-allows a TCP retry only for setup failures before any payload byte moved,
-the decision is counted under the `rdma` backend label with the
-`tcp_fallback` classification, and post-payload failures map to the same
-disk error classes as HTTP stream failures.
+Fallback settings should not be added until there is an implementation that
+uses them. A backend must define failure behavior before production use.
 
 ## Dynamic Negotiation Boundary
 

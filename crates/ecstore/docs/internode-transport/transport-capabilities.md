@@ -11,11 +11,13 @@ The OSS scope is:
 - keep `tcp-http` as the default backend;
 - keep existing TCP/HTTP behavior unchanged;
 - document the capability fields needed for maintainable transport code;
-- keep every optional backend explicit and feature-gated.
+- avoid adding dependencies or backend implementations.
 
 The OSS scope is not:
 
+- adding another transport backend;
 - replacing the current TCP/HTTP path;
+- adding benchmark plans for another transport;
 - changing object correctness semantics.
 
 ## Purpose
@@ -50,19 +52,6 @@ The default TCP/HTTP backend reports only capabilities it actually provides:
 | `ordered_delivery` | `true` | Each HTTP request body or response body is consumed as an ordered byte stream. |
 | `max_transfer_size` | `None` | RustFS does not impose an extra per-transfer cap at the capability layer. |
 | `fallback_supported` | `true` | TCP/HTTP is the behavior-preserving default and fallback path. |
-
-## RDMA Backend
-
-The optional `rdma` backend (Linux, `rdma` feature) reports:
-
-| Field | RDMA value | Reason |
-| --- | --- | --- |
-| `streaming_read` | `true` | Shard reads arrive as owned chunks RDMA-written into a registered window. |
-| `streaming_write` | `true` | Shard writes are pushed into the peer's registered window. |
-| `streaming_walk_dir` | `false` | Directory walks and scanner streams are delegated to `tcp-http`. |
-| `ordered_delivery` | `true` | Chunks are delivered in order over one reliable connection per stream. |
-| `max_transfer_size` | `None` | Streams are windowed; no RustFS-level cap. |
-| `fallback_supported` | `true` | Setup failures fall back to `tcp-http` when `RUSTFS_RDMA_FALLBACK_TCP` allows it. |
 
 ## Capability Compatibility
 

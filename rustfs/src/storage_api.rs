@@ -381,11 +381,6 @@ pub(crate) mod site_replication {
 }
 
 pub(crate) mod startup {
-    pub(crate) mod rdma_internode {
-        #[cfg(all(feature = "rdma", target_os = "linux"))]
-        pub(crate) use crate::storage::storage_api::rdma_internode_startup_consumer::init_rdma_internode_service;
-    }
-
     pub(crate) mod heal_control {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::heal_control_startup_consumer::heal_topology_fingerprint;

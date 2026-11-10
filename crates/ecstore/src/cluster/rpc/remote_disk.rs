@@ -1372,10 +1372,6 @@ impl RemoteDisk {
         if internode_prewarm_enabled() {
             spawn_control_channel_prewarm(disk.addr.clone());
         }
-        // Data transports that pool connections dial their idle minimum now
-        // instead of inside the first shard read.
-        disk.data_transport.warm_peer(&ep.grid_host()).await;
-
         Ok(disk)
     }
 

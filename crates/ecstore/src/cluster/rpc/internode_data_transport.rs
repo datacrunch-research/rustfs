@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
     DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_NIXL,
-    INTERNODE_DATA_TRANSPORT_RDMA, INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+    INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{
     ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
@@ -293,9 +293,6 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
     }
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter>;
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader>;
-    /// Prepares the transport for streams to `endpoint`, such as dialing idle
-    /// connections ahead of the first shard read; a no-op by default.
-    async fn warm_peer(&self, _endpoint: &str) {}
     async fn open_ns_scanner(&self, _request: NsScannerStreamRequest) -> Result<FileReader> {
         Err(Error::MethodNotAllowed)
     }
@@ -936,26 +933,11 @@ fn build_internode_data_transport_result(
         {
             Ok(Arc::new(TcpHttpInternodeDataTransport))
         }
-        Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_RDMA) => build_rdma_transport(transport),
         Some(transport) if transport.eq_ignore_ascii_case(INTERNODE_DATA_TRANSPORT_NIXL) => {
             Ok(Arc::new(super::nixl_internode::NixlInternodeDataTransport::from_env()))
         }
         Some(transport) => Err(unsupported_transport_message(transport)),
     }
-}
-
-#[cfg(all(feature = "rdma", target_os = "linux"))]
-fn build_rdma_transport(_transport: &str) -> std::result::Result<Arc<dyn InternodeDataTransport>, String> {
-    super::rdma::build_transport()
-}
-
-/// The `rdma` value is known to the parser everywhere, but only a Linux build
-/// with the `rdma` feature can serve it; every other build fails closed.
-#[cfg(not(all(feature = "rdma", target_os = "linux")))]
-fn build_rdma_transport(transport: &str) -> std::result::Result<Arc<dyn InternodeDataTransport>, String> {
-    Err(format!(
-        "{ENV_RUSTFS_INTERNODE_DATA_TRANSPORT}={transport:?} requires a Linux RustFS build with the `rdma` Cargo feature"
-    ))
 }
 
 #[allow(
@@ -986,21 +968,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    #[cfg(not(all(feature = "rdma", target_os = "linux")))]
+    /// The verbs-based `rdma` backend was removed; NIXL carries internode RDMA.
+    /// A node still configured with it must fail at startup, not fall back silently.
     #[test]
-    fn rdma_backend_fails_closed_without_the_feature() {
-        let err = build_internode_data_transport_result(Some("rdma")).expect_err("rdma needs the feature");
-        assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
-        assert!(err.contains("`rdma` Cargo feature"), "{err}");
-    }
-
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
-    #[test]
-    fn rdma_backend_is_selected_with_the_feature() {
-        let transport = build_internode_data_transport_result(Some(" RDMA ")).expect("rdma backend builds");
-        assert_eq!(transport.name(), INTERNODE_DATA_TRANSPORT_RDMA);
-        assert!(transport.capabilities().fallback_supported);
-        assert!(!transport.capabilities().streaming_walk_dir);
+    fn removed_rdma_backend_fails_closed() {
+        let err = build_internode_data_transport_result(Some("rdma")).expect_err("rdma is no longer a backend");
+        assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT), "{err}");
+        assert!(err.contains("supported values: tcp-http, tcp, nixl"), "{err}");
     }
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
@@ -2279,7 +2253,6 @@ mod tests {
             &[
                 DEFAULT_INTERNODE_DATA_TRANSPORT,
                 INTERNODE_DATA_TRANSPORT_TCP,
-                INTERNODE_DATA_TRANSPORT_RDMA,
                 INTERNODE_DATA_TRANSPORT_NIXL
             ]
         );
@@ -2290,7 +2263,7 @@ mod tests {
             assert_eq!(transport.name(), DEFAULT_INTERNODE_DATA_TRANSPORT);
         }
         // NIXL builds everywhere and serves reads over TCP/HTTP until a node
-        // installs its receive pool; RDMA depends on the build.
+        // installs its receive pool.
         let transport = build_internode_data_transport(Some(INTERNODE_DATA_TRANSPORT_NIXL)).unwrap();
         assert_eq!(transport.name(), INTERNODE_DATA_TRANSPORT_NIXL);
     }

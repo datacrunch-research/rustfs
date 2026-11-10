@@ -32,8 +32,6 @@ workspace = true
 [features]
 default = []
 fips = ["rustfs-s3-client/fips", "rustfs-utils/fips", "rustfs-tls-runtime/fips"]
-# Linux-only internode RDMA data transport over libibverbs/librdmacm (opt-in at build and run time).
-rdma = ["tokio/net", "tokio/macros"]
 diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]
 # Sampled wall/CPU diagnostics only; does not change the read backend.
 diagnostic-local-batch = ["rustix/time"]
@@ -274,7 +272,6 @@ rustfs-crypto = { workspace = true }
 tonic-prost = { workspace = true }
 
 [build-dependencies]
-cc = { workspace = true }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 
 [[bench]]

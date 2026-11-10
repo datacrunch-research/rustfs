@@ -16,8 +16,6 @@ pub mod http_service;
 #[cfg(feature = "nixl")]
 pub mod nixl_read;
 pub mod node_service;
-#[cfg(all(feature = "rdma", target_os = "linux"))]
-pub mod rdma_service;
 
 pub use http_service::InternodeRpcService;
 pub use node_service::{
@@ -38,7 +36,7 @@ use serde::Serialize;
 /// passed the string-level containment check, but a symlink inside the volume
 /// could still point elsewhere. The check reads the opened descriptor's real
 /// path, so nothing can change between the check and the use.
-#[cfg(any(feature = "nixl", all(feature = "rdma", target_os = "linux")))]
+#[cfg(feature = "nixl")]
 pub(crate) fn open_shard_contained(path: &std::path::Path, key: &str) -> std::io::Result<std::fs::File> {
     let file = std::fs::File::open(path)?;
     #[cfg(target_os = "linux")]
@@ -68,7 +66,7 @@ pub(crate) fn encode_msgpack_map<T: Serialize>(value: &T) -> Result<Vec<u8>, rmp
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(target_os = "linux", any(feature = "nixl", feature = "rdma")))]
+    #[cfg(all(target_os = "linux", feature = "nixl"))]
     #[test]
     fn shard_opens_stay_inside_their_volume() {
         let base = std::env::temp_dir().join(format!("rustfs-shard-open-{}", std::process::id()));

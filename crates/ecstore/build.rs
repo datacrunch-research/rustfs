@@ -14,25 +14,5 @@
 
 fn main() -> shadow_rs::SdResult<()> {
     shadow_rs::ShadowBuilder::builder().build()?;
-    build_rdma_shim();
     Ok(())
-}
-
-/// Compiles the libibverbs/librdmacm shim only for `--features rdma` builds, so default
-/// builds never require the RDMA headers or libraries.
-fn build_rdma_shim() {
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RDMA");
-    if std::env::var_os("CARGO_FEATURE_RDMA").is_none() {
-        return;
-    }
-    println!("cargo:rerun-if-changed=csrc/rdma_shim.c");
-    println!("cargo:rerun-if-changed=csrc/rdma_shim.h");
-    cc::Build::new()
-        .file("csrc/rdma_shim.c")
-        .include("csrc")
-        .warnings(true)
-        .flag_if_supported("-Wextra")
-        .compile("rustfs_rdma_shim");
-    println!("cargo:rustc-link-lib=ibverbs");
-    println!("cargo:rustc-link-lib=rdmacm");
 }

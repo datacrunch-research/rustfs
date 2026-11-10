@@ -269,11 +269,6 @@ pub(crate) mod request_context_consumer {
 }
 
 /// Startup sidecar entry point for the internode RDMA listener (Linux, `rdma` feature).
-#[cfg(all(feature = "rdma", target_os = "linux"))]
-pub(crate) mod rdma_internode_startup_consumer {
-    pub(crate) use super::super::rpc::rdma_service::init_rdma_internode_service;
-}
-
 pub(crate) mod rpc_consumer {
     pub(crate) use super::super::rpc::InternodeRpcService;
 
@@ -314,22 +309,6 @@ pub(crate) mod rpc_consumer {
         pub(crate) use rustfs_ecstore::api::disk::Disk;
         pub(crate) use rustfs_ecstore::api::rpc::nixl::{
             NIXL_BYTES_HEADER, NIXL_METADATA_HEADER, READ_FILE_NIXL_PATH, WRITE_FILE_NIXL_PATH,
-        };
-    }
-
-    /// Server side of the internode RDMA data plane (Linux, `rdma` feature).
-    #[cfg(all(feature = "rdma", target_os = "linux"))]
-    pub(crate) mod rdma_service {
-        pub(crate) use super::super::{DiskStore, FileReader, get_global_endpoints_opt, global_rustfs_port};
-        pub(crate) use rustfs_ecstore::api::disk::Disk;
-        #[cfg(test)]
-        pub(crate) use rustfs_ecstore::api::rpc::rdma::{
-            InternodeDataTransport, RdmaInternodeDataTransport, RdmaSettings, RdmaStreamOp, RdmaWriteRequestWire,
-            ReadStreamRequest, RegisteredPool,
-        };
-        pub(crate) use rustfs_ecstore::api::rpc::rdma::{
-            PositionalRead, RdmaBodyStream, RdmaErrorCode, RdmaReadRequest, RdmaReject, RdmaRequestHandler, RdmaServer,
-            RdmaWriteRequest, default_listen_addrs, server_enabled, settings, shared_pool,
         };
     }
 
