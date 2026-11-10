@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 base64-simd = { workspace = true }
 bytes = { workspace = true }
+memmap2 = { workspace = true }
 nixl-sys = { git = "https://github.com/ai-dynamo/nixl", tag = "v1.5.2" }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

@@ -10594,6 +10594,7 @@ version = "1.0.5"
 dependencies = [
  "base64-simd",
  "bytes",
+ "memmap2",
  "nixl-sys",
  "parking_lot 0.13.0",
  "thiserror 2.0.21",
