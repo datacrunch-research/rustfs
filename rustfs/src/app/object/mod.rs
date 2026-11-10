@@ -86,7 +86,9 @@ use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_mess
 use super::storage_api::object_usecase::helper::{
     OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
 };
-use super::storage_api::object_usecase::io::{EtagAlgorithm, DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::object_usecase::io::{
+    DynReader, EtagAlgorithm, HashReader, WritePlan, compression_metadata_value, wrap_reader,
+};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]

@@ -48,7 +48,9 @@ use super::storage_api::multipart_usecase::error::{
 use super::storage_api::multipart_usecase::helper::{OperationHelper, run_owned_mutation};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::multipart_usecase::io::{EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::io::{
+    EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
+};
 use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
