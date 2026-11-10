@@ -29,6 +29,7 @@ mod descriptor;
 mod engine;
 mod environment;
 mod error;
+mod listing;
 mod name;
 mod placement;
 
@@ -37,16 +38,17 @@ pub use descriptor::{
     BucketFeature, CustomOperationSpec, EngineCapabilities, EngineDescriptor, EngineObjectOperation, OperationAction,
 };
 pub use engine::{
-    BucketContext, BucketEngine, ByteRange, CustomRequest, CustomResponse, EngineObject, EngineObjectInfo, ListPage,
-    ObjectWriteMeta, RdmaTransfer,
+    BucketContext, BucketEngine, ByteRange, CustomRequest, CustomResponse, EngineObject, EngineObjectInfo, ObjectWriteMeta,
+    RdmaTransfer,
 };
 pub use environment::{ENGINES_DIR, NodeEnvironment, SYSTEM_DIR, engine_dir};
 pub use error::{EngineError, EngineResult};
+pub use listing::{ListName, ListPage, ListPageBuilder, ListQuery};
 pub use name::{EngineName, NameError, OperationName};
 pub use placement::{NodeTargets, PlacementView, TargetId};
 
 /// Version of this contract; bumped on breaking changes to the engine trait or the binding format.
-pub const BUCKET_ENGINE_CONTRACT_VERSION: &str = "rustfs.bucket-engine.v1";
+pub const BUCKET_ENGINE_CONTRACT_VERSION: &str = "rustfs.bucket-engine.v2";
 
 /// CreateBucket request header that binds the new bucket to an engine.
 pub const CREATE_BUCKET_ENGINE_HEADER: &str = "x-rustfs-bucket-engine";

@@ -15,6 +15,7 @@
 use crate::binding::BucketEngineBinding;
 use crate::descriptor::EngineDescriptor;
 use crate::error::{EngineError, EngineResult};
+use crate::listing::{ListPage, ListQuery};
 use crate::name::OperationName;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -71,12 +72,6 @@ pub struct EngineObject {
 pub struct ObjectWriteMeta {
     pub content_length: u64,
     pub rdma: Option<RdmaTransfer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ListPage {
-    pub objects: Vec<EngineObjectInfo>,
-    pub next_start_after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,13 +153,9 @@ pub trait BucketEngine: Send + Sync + 'static {
         Err(self.unsupported("DeleteObject"))
     }
 
-    async fn list_objects(
-        &self,
-        _bucket: &BucketContext,
-        _prefix: &str,
-        _start_after: Option<&str>,
-        _max_keys: usize,
-    ) -> EngineResult<ListPage> {
+    /// One page of keys in key order; with a delimiter, keys that contain it
+    /// after the prefix are listed once as their common prefix.
+    async fn list_objects(&self, _bucket: &BucketContext, _query: &ListQuery<'_>) -> EngineResult<ListPage> {
         Err(self.unsupported("ListObjects"))
     }
 
@@ -262,7 +253,15 @@ mod tests {
         ));
         assert!(matches!(engine.delete_object(&bucket, "k").await, Err(EngineError::Unsupported { .. })));
         assert!(matches!(
-            engine.list_objects(&bucket, "", None, 10).await,
+            engine
+                .list_objects(
+                    &bucket,
+                    &ListQuery {
+                        max_keys: 10,
+                        ..ListQuery::default()
+                    }
+                )
+                .await,
             Err(EngineError::Unsupported { .. })
         ));
         let op = OperationName::new("prefix-query").expect("valid operation name");

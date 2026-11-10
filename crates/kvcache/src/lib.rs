@@ -37,4 +37,4 @@ pub use capacity::{CapacityPolicy, DiskUsage, FsStats, StatvfsFs, Watermarks};
 pub use error::{KvError, KvResult};
 pub use format::{EntryMeta, MAX_KEY_LEN, entry_footprint};
 pub use segment::{ScannedSegment, SegmentFile, SegmentId, SegmentWriter, WriterOptions, scan_segment, segment_file_name};
-pub use store::{EntryInfo, EvictionReport, KvStore, PutOutcome, RecoveryReport, SegmentStat, StoreOptions, Value};
+pub use store::{EntryInfo, EvictionReport, KvStore, ListItem, PutOutcome, RecoveryReport, SegmentStat, StoreOptions, Value};

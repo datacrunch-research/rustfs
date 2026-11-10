@@ -26,7 +26,8 @@ use parking_lot::RwLock;
 use rustfs_bucket_engine::{
     BucketContext, BucketEngine, BucketEngineBinding, BucketFeature, ByteRange, CustomOperationSpec, CustomRequest,
     CustomResponse, EngineCapabilities, EngineDescriptor, EngineError, EngineName, EngineObject, EngineObjectInfo,
-    EngineObjectOperation, EngineResult, ListPage, ObjectWriteMeta, OperationAction, OperationName, RdmaTransfer,
+    EngineObjectOperation, EngineResult, ListName, ListPage, ListPageBuilder, ListQuery, ObjectWriteMeta, OperationAction,
+    OperationName, RdmaTransfer,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -249,34 +250,23 @@ impl BucketEngine for MemoryEngine {
         })
     }
 
-    async fn list_objects(
-        &self,
-        bucket: &BucketContext,
-        prefix: &str,
-        start_after: Option<&str>,
-        max_keys: usize,
-    ) -> EngineResult<ListPage> {
+    async fn list_objects(&self, bucket: &BucketContext, query: &ListQuery<'_>) -> EngineResult<ListPage> {
         let buckets = self.buckets.read();
         let Some(objects) = buckets.get(&bucket.incarnation) else {
             return Ok(ListPage::default());
         };
-        let lower = match start_after {
-            Some(after) if after >= prefix => std::ops::Bound::Excluded(after.to_owned()),
-            _ => std::ops::Bound::Included(prefix.to_owned()),
-        };
-        let mut matching = objects
-            .range((lower, std::ops::Bound::Unbounded))
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(_, object)| object.info.clone());
-        let objects: Vec<_> = matching.by_ref().take(max_keys).collect();
-        let next_start_after = if matching.next().is_some() {
-            objects.last().map(|info| info.key.clone())
-        } else {
-            None
-        };
-        Ok(ListPage {
-            objects,
-            next_start_after,
-        })
+        let mut page = ListPageBuilder::new(query.max_keys);
+        let in_prefix = objects
+            .range::<str, _>((std::ops::Bound::Included(query.prefix), std::ops::Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(query.prefix));
+        for (key, object) in in_prefix {
+            match query.name_of(key) {
+                Some(name) if !query.is_after_start(name.as_str()) => {}
+                Some(ListName::Prefix(prefix)) => page.push_prefix(prefix.to_owned()),
+                Some(ListName::Key(_)) => page.push_object(object.info.clone()),
+                None => {}
+            }
+        }
+        Ok(page.finish())
     }
 }

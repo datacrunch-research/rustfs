@@ -25,11 +25,13 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use rustfs_bucket_engine::{BucketFeature, EngineError, EngineObjectInfo, EngineObjectOperation, ListPage, ObjectWriteMeta};
+use rustfs_bucket_engine::{
+    BucketFeature, EngineError, EngineObjectInfo, EngineObjectOperation, ListPage, ListQuery, ObjectWriteMeta,
+};
 use s3s::dto::{
-    DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, Range,
-    StreamingBlob, Timestamp,
+    CommonPrefix, DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadObjectInput,
+    HeadObjectOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput,
+    PutObjectOutput, Range, StreamingBlob, Timestamp,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use time::OffsetDateTime;
@@ -364,23 +366,24 @@ fn max_keys(requested: Option<i32>) -> usize {
     requested.map_or(DEFAULT_MAX_KEYS, |keys| usize::try_from(keys).unwrap_or(0).min(DEFAULT_MAX_KEYS))
 }
 
-fn refuse_delimiter(bound: &BoundBucket, delimiter: Option<&str>) -> S3Result<()> {
-    match delimiter {
-        None | Some("") => Ok(()),
-        Some(_) => Err(not_served(bound, "ListObjects with a delimiter")),
-    }
-}
-
-async fn list_page(bound: &BoundBucket, prefix: &str, start_after: Option<&str>, max_keys: usize) -> S3Result<ListPage> {
+async fn list_page(bound: &BoundBucket, query: &ListQuery<'_>) -> S3Result<ListPage> {
     require(bound, EngineObjectOperation::ListObjects, "ListObjects")?;
-    if max_keys == 0 {
+    if query.max_keys == 0 {
         return Ok(ListPage::default());
     }
-    bound
-        .engine
-        .list_objects(&bound.context, prefix, start_after, max_keys)
-        .await
-        .map_err(object_error)
+    bound.engine.list_objects(&bound.context, query).await.map_err(object_error)
+}
+
+/// S3 returns `CommonPrefixes` only for a request with a delimiter.
+fn list_common_prefixes(delimiter: Option<&str>, page: &ListPage) -> Option<Vec<CommonPrefix>> {
+    delimiter.filter(|delimiter| !delimiter.is_empty()).map(|_| {
+        page.common_prefixes
+            .iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(prefix.clone()),
+            })
+            .collect()
+    })
 }
 
 fn list_contents(page: &ListPage) -> Vec<Object> {
@@ -401,18 +404,25 @@ pub(crate) async fn list_objects_v2(
     req: S3Request<ListObjectsV2Input>,
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
     let input = req.input;
-    refuse_delimiter(bound, input.delimiter.as_deref())?;
-    let prefix = input.prefix.clone().unwrap_or_default();
-    // The continuation token is the last key of the previous page.
-    let start_after = input.continuation_token.as_deref().or(input.start_after.as_deref());
     let max_keys = max_keys(input.max_keys);
-    let page = list_page(bound, &prefix, start_after, max_keys).await?;
+    let query = ListQuery {
+        prefix: input.prefix.as_deref().unwrap_or_default(),
+        delimiter: input.delimiter.as_deref(),
+        // The continuation token is the last name (key or common prefix) of the previous page.
+        start_after: input.continuation_token.as_deref().or(input.start_after.as_deref()),
+        max_keys,
+    };
+    let page = list_page(bound, &query).await?;
     let contents = list_contents(&page);
+    let common_prefixes = list_common_prefixes(input.delimiter.as_deref(), &page);
+    let key_count = contents.len() + page.common_prefixes.len();
     Ok(S3Response::new(ListObjectsV2Output {
         name: Some(input.bucket),
         prefix: input.prefix,
+        delimiter: input.delimiter,
+        common_prefixes,
         max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
-        key_count: Some(i32::try_from(contents.len()).unwrap_or(i32::MAX)),
+        key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
         continuation_token: input.continuation_token,
         start_after: input.start_after,
         is_truncated: Some(page.next_start_after.is_some()),
@@ -427,14 +437,21 @@ pub(crate) async fn list_objects(
     req: S3Request<ListObjectsInput>,
 ) -> S3Result<S3Response<ListObjectsOutput>> {
     let input = req.input;
-    refuse_delimiter(bound, input.delimiter.as_deref())?;
-    let prefix = input.prefix.clone().unwrap_or_default();
     let max_keys = max_keys(input.max_keys);
-    let page = list_page(bound, &prefix, input.marker.as_deref(), max_keys).await?;
+    let query = ListQuery {
+        prefix: input.prefix.as_deref().unwrap_or_default(),
+        delimiter: input.delimiter.as_deref(),
+        start_after: input.marker.as_deref(),
+        max_keys,
+    };
+    let page = list_page(bound, &query).await?;
     let contents = list_contents(&page);
+    let common_prefixes = list_common_prefixes(input.delimiter.as_deref(), &page);
     Ok(S3Response::new(ListObjectsOutput {
         name: Some(input.bucket),
         prefix: input.prefix,
+        delimiter: input.delimiter,
+        common_prefixes,
         marker: input.marker,
         max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
         is_truncated: Some(page.next_start_after.is_some()),
@@ -608,15 +625,55 @@ mod tests {
         assert_eq!(keys, ["a/3"]);
         assert_eq!(second.is_truncated, Some(false));
 
-        let delimited = ListObjectsV2Input::builder()
+        // `ls s3://kv/`: folders are listed as common prefixes, and the
+        // continuation token can be a common prefix.
+        let delimited = |token: Option<String>| {
+            ListObjectsV2Input::builder()
+                .bucket("kv".to_owned())
+                .delimiter(Some("/".to_owned()))
+                .max_keys(Some(1))
+                .continuation_token(token)
+                .build()
+                .expect("list input")
+        };
+        let first = list_objects_v2(&bound, request(delimited(None), Method::GET))
+            .await
+            .expect("list")
+            .output;
+        let prefixes: Vec<_> = first
+            .common_prefixes
+            .iter()
+            .flatten()
+            .filter_map(|p| p.prefix.clone())
+            .collect();
+        assert_eq!(prefixes, ["a/"]);
+        assert_eq!(first.contents.iter().flatten().count(), 0);
+        assert_eq!((first.key_count, first.is_truncated), (Some(1), Some(true)));
+        assert_eq!(first.delimiter.as_deref(), Some("/"));
+        let second = list_objects_v2(&bound, request(delimited(first.next_continuation_token), Method::GET))
+            .await
+            .expect("list")
+            .output;
+        let prefixes: Vec<_> = second
+            .common_prefixes
+            .iter()
+            .flatten()
+            .filter_map(|p| p.prefix.clone())
+            .collect();
+        assert_eq!(prefixes, ["b/"]);
+        assert_eq!(second.is_truncated, Some(false));
+
+        // ListObjects (v1) with a delimiter.
+        let v1 = ListObjectsInput::builder()
             .bucket("kv".to_owned())
+            .prefix(Some("a/".to_owned()))
             .delimiter(Some("/".to_owned()))
             .build()
             .expect("list input");
-        assert_eq!(
-            code(list_objects_v2(&bound, request(delimited, Method::GET)).await),
-            S3ErrorCode::NotImplemented
-        );
+        let listed = list_objects(&bound, request(v1, Method::GET)).await.expect("list v1").output;
+        let keys: Vec<_> = listed.contents.iter().flatten().filter_map(|o| o.key.clone()).collect();
+        assert_eq!(keys, ["a/1", "a/2", "a/3"]);
+        assert_eq!(listed.common_prefixes.map(|prefixes| prefixes.len()), Some(0));
     }
 
     #[tokio::test]
