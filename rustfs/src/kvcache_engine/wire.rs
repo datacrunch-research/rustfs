@@ -30,9 +30,6 @@ pub(crate) const PEER_GET_RDMA: &str = "peer-get-rdma";
 #[cfg(all(feature = "nixl", target_os = "linux"))]
 pub(crate) const PEER_PUT_RDMA: &str = "peer-put-rdma";
 
-/// Largest JSON header accepted from a peer.
-const MAX_HEADER_BYTES: usize = 64 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeyRequest {
@@ -100,14 +97,18 @@ pub(crate) fn encode<T: Serialize>(header: &T, payload: &[u8]) -> EngineResult<B
     Ok(out.freeze())
 }
 
-/// Splits a message into its header and payload (zero copy).
+/// Splits a message into its header and payload (zero copy). The header
+/// length is only checked against the message itself: nothing is allocated
+/// from it, and message sizes are bounded where they enter (the custom-route
+/// body limit, the internode call). Headers legitimately reach about a
+/// megabyte: a list reply of 1000 entries, a batch-write of many small items.
 pub(crate) fn decode<T: DeserializeOwned>(message: Bytes) -> EngineResult<(T, Bytes)> {
     let invalid = |what: &str| EngineError::InvalidRequest(format!("malformed engine message: {what}"));
     if message.len() < 4 {
         return Err(invalid("no header length"));
     }
     let len = u32::from_le_bytes(message[..4].try_into().expect("four bytes")) as usize;
-    if len > MAX_HEADER_BYTES || message.len() < 4 + len {
+    if message.len() - 4 < len {
         return Err(invalid("header length"));
     }
     let header = serde_json::from_slice(&message[4..4 + len]).map_err(|err| invalid(&err.to_string()))?;
@@ -138,5 +139,29 @@ mod tests {
         assert!(decode::<KeyRequest>(wrong_shape).is_err());
         let huge = [0xff, 0xff, 0xff, 0x7f];
         assert!(decode::<KeyRequest>(Bytes::copy_from_slice(&huge)).is_err());
+        let short = [5, 0, 0, 0, b'{', b'}'];
+        assert!(decode::<KeyRequest>(Bytes::copy_from_slice(&short)).is_err());
+    }
+
+    /// A full S3 list page from one peer: 1000 entries with maximum-length
+    /// (1024-byte) keys, a header of over a megabyte.
+    #[test]
+    fn full_list_pages_round_trip() {
+        let reply = ListReply {
+            entries: (0..1000)
+                .map(|i| EntryHeader {
+                    key: format!("{i:04}{}", "k".repeat(1020)),
+                    size: 29 << 20,
+                    etag: "0123456789abcdef0123456789abcdef".to_owned(),
+                    last_modified_unix_secs: 1_762_700_000,
+                })
+                .collect(),
+            truncated: true,
+        };
+        let message = encode(&reply, b"").expect("encode");
+        assert!(message.len() > 1 << 20, "{} bytes", message.len());
+        let (decoded, payload): (ListReply, Bytes) = decode(message).expect("decode");
+        assert_eq!(decoded, reply);
+        assert!(payload.is_empty());
     }
 }
