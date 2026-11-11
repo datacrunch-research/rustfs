@@ -2813,6 +2813,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuobject"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486fec9045f8057131bf4bba71fbb87bf9dd3e44f853622cf7fa42713f3a108c"
+dependencies = [
+ "cuobject-sys",
+ "memmap2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cuobject-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc615b2a037eb0d80180d202f809629155742db9c9e94b9f7696b1100a7d52f"
+dependencies = [
+ "bindgen 0.73.2",
+ "cc",
+]
+
+[[package]]
 name = "curve25519-dalek"
 version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10018,11 +10039,10 @@ name = "rustfs-cuobject"
 version = "1.0.5"
 dependencies = [
  "bytes",
- "cc",
+ "cuobject",
  "parking_lot 0.13.0",
  "thiserror 2.0.21",
  "tokio",
- "tracing",
 ]
 
 [[package]]

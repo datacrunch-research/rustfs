@@ -6,7 +6,7 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 homepage.workspace = true
-description = "Server side of NVIDIA cuObject S3-over-RDMA (GPUDirect object loading) for RustFS"
+description = "RustFS staging pool and transfers for NVIDIA cuObject S3-over-RDMA (GPUDirect object loading)"
 keywords = ["rdma", "cuobject", "gpudirect", "s3"]
 categories = ["network-programming"]
 documentation = "https://docs.rs/rustfs-cuobject/latest/rustfs_cuobject/"
@@ -16,10 +16,7 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+cuobject = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
-tracing = { workspace = true }
-
-[build-dependencies]
-cc = { workspace = true }

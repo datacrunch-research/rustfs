@@ -23,7 +23,7 @@ members = [
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
-    "crates/cuobject", # NVIDIA cuObject S3-over-RDMA server side (optional)
+    "crates/cuobject", # NVIDIA cuObject S3-over-RDMA staging and transfers (optional)
     "crates/nixl", # NIXL/UCX S3-over-RDMA server side (optional)
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
@@ -299,7 +299,7 @@ hostname = "0.4.2"
 ipnetwork = { version = "0.21.1" }
 lazy_static = "1.5.1"
 libc = "0.2.191"
-cc = "1.2"
+cuobject = "0.1.0"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"

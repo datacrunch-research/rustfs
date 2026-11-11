@@ -14,8 +14,11 @@ either can be enabled on its own.
 ## Build
 
 The feature links NVIDIA's cuObject *server* library (`libcuobjserver`, part
-of the CUDA apt repository as `libcuobjserver` / `libcuobjserver-dev`). It is
-off by default and Linux-only:
+of the CUDA apt repository as `libcuobjserver` / `libcuobjserver-dev`) through
+the [`cuobject`](https://crates.io/crates/cuobject) bindings; their
+`cuobject-sys` build script generates the FFI with bindgen (needs libclang)
+and compiles a C++ wrapper over the library. It is off by default and
+Linux-only:
 
 ```bash
 # CUOBJSERVER_ROOT points at a prefix holding include/cuobjserver.h and lib/libcuobjserver.so
