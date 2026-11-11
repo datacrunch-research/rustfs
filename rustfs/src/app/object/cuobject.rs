@@ -72,7 +72,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use transport::{Error as CuObjectError, RdmaToken, RegisteredArena, Server as CuObjectServer, StagingChunk};
 pub(crate) use transport::{RDMA_BYTES_TRANSFERRED_HEADER, RDMA_REPLY_HEADER};
 
@@ -403,7 +403,7 @@ async fn checked_nixl_devices(candidates: Vec<String>, max_link_drops: u64, flap
         .collect::<Vec<_>>()
         .join(", ");
     if check.kept.is_empty() {
-        error!(
+        tracing::error!(
             event = EVENT_CUOBJECT_SERVICE_STATE,
             component = LOG_COMPONENT_OBJECT,
             subsystem = LOG_SUBSYSTEM_CUOBJECT,
