@@ -5,13 +5,14 @@
 #![allow(unsafe_code)]
 
 use crate::NixlError;
-use memmap2::MmapMut;
+use memmap2::{MmapMut, MmapRaw};
 use nixl_sys::{MemType, MemoryRegion, NixlDescriptor};
 
 /// Page-aligned, zero-filled host memory registered with the agent. An
-/// anonymous mapping, so the pool stays outside the global allocator.
+/// anonymous mapping, so the pool stays outside the global allocator; held as
+/// `MmapRaw` because chunks write through `&self`.
 pub(crate) struct HostBuffer {
-    map: MmapMut,
+    map: MmapRaw,
 }
 
 impl std::fmt::Debug for HostBuffer {
@@ -26,7 +27,7 @@ impl HostBuffer {
             op: "staging allocation",
             source,
         })?;
-        Ok(Self { map })
+        Ok(Self { map: map.into() })
     }
 
     pub(crate) fn len(&self) -> usize {
