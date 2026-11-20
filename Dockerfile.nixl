@@ -1,0 +1,148 @@
+# syntax=docker/dockerfile:1.7
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# RustFS with the NIXL/UCX S3-over-RDMA transport (docs/operations/nixl-s3-over-rdma.md).
+#
+# Built natively per platform (linux/amd64 and linux/arm64); no cross-compilation,
+# because the NIXL libraries come prebuilt for the build machine's architecture.
+#
+#   docker buildx build -f Dockerfile.nixl --platform linux/amd64 -t rustfs-nixl:dev .
+#
+# NIXL comes from the nixl-cu13 wheel (libraries, UCX and its InfiniBand
+# transports, rdma-core) plus the C++ headers of the same tag. The wheel's
+# libraries find each other through relative RPATHs ($ORIGIN/../nixl_cu13.libs),
+# so the image keeps the wheel's two directories side by side under /opt/nixl.
+
+ARG NIXL_VERSION=1.5.2
+ARG RUNTIME_IMAGE=nvidia/cuda:13.4.3-runtime-ubuntu24.04
+
+# -----------------------------
+# Build stage
+# -----------------------------
+FROM ubuntu:24.04 AS builder
+
+ARG NIXL_VERSION
+ARG RUSTFS_BUILD_FEATURES="nixl,bucket-engines"
+ARG CARGO_BUILD_PROFILE=release
+ARG RUSTFS_BUILD_VERSION=""
+
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    flatbuffers-compiler \
+    git \
+    libclang-dev \
+    libssl-dev \
+    lld \
+    pkg-config \
+    protobuf-compiler \
+    python3 \
+    python3-pip \
+    unzip; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN set -eux; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+
+# NIXL: the wheel's libraries under /opt/nixl, its headers under /opt/nixl/include.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    mkdir -p /tmp/nixl-wheel /opt/nixl/include; \
+    python3 -m pip download --no-deps --only-binary=:all: \
+    --python-version 3.12 --platform "manylinux_2_28_${arch}" \
+    -d /tmp/nixl-wheel "nixl-cu13==${NIXL_VERSION}"; \
+    unzip -q /tmp/nixl-wheel/nixl_cu13-*.whl \
+    '.nixl_cu13.mesonpy.libs/*' 'nixl_cu13.libs/*' -d /tmp/nixl-wheel/x; \
+    mv /tmp/nixl-wheel/x/.nixl_cu13.mesonpy.libs /opt/nixl/lib; \
+    mv /tmp/nixl-wheel/x/nixl_cu13.libs /opt/nixl/nixl_cu13.libs; \
+    git clone --depth 1 --branch "v${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git /tmp/nixl-src; \
+    cp -r /tmp/nixl-src/src/api/cpp/. /opt/nixl/include/; \
+    rm -f /opt/nixl/include/meson.build; \
+    rm -rf /tmp/nixl-wheel /tmp/nixl-src; \
+    test -f /opt/nixl/lib/libnixl.so; \
+    test -f /opt/nixl/lib/plugins/libplugin_UCX.so; \
+    test -f /opt/nixl/include/nixl.h
+
+# nixl-sys: link against the real libraries, never its dlopen stubs.
+ENV NIXL_PREFIX=/opt/nixl \
+    NIXL_NO_STUBS_FALLBACK=1
+
+WORKDIR /usr/src/rustfs
+COPY . .
+
+# The binary finds the NIXL libraries through its own RUNPATH; the linker
+# resolves their bundled dependencies through rpath-link. On aarch64 the code
+# section exceeds GNU ld's direct-branch range, so link with lld there.
+RUN --mount=type=cache,id=rustfs-nixl-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=rustfs-nixl-cargo-git,target=/usr/local/cargo/git \
+    set -eux; \
+    rustup toolchain install; \
+    rustflags="-C link-arg=-Wl,-rpath,/opt/nixl/lib -C link-arg=-Wl,-rpath-link,/opt/nixl/lib:/opt/nixl/nixl_cu13.libs"; \
+    if [ "$(uname -m)" = "aarch64" ]; then rustflags="${rustflags} -C link-arg=-fuse-ld=lld"; fi; \
+    export RUSTFLAGS="${rustflags}" RUSTFS_BUILD_VERSION="${RUSTFS_BUILD_VERSION}"; \
+    cargo build --locked --profile "${CARGO_BUILD_PROFILE}" --bin rustfs \
+    --features "${RUSTFS_BUILD_FEATURES}" --target-dir /tmp/target -j "$(nproc)"; \
+    install -m 0755 "/tmp/target/${CARGO_BUILD_PROFILE}/rustfs" /usr/local/bin/rustfs; \
+    rm -rf /tmp/target; \
+    ldd /usr/local/bin/rustfs | grep -q '/opt/nixl/lib/libnixl.so'; \
+    if ldd /usr/local/bin/rustfs | grep 'not found'; then exit 1; fi
+
+# -----------------------------
+# Runtime stage
+# -----------------------------
+FROM ${RUNTIME_IMAGE}
+
+ARG NIXL_VERSION
+ARG VCS_REF=""
+LABEL org.opencontainers.image.title="rustfs-nixl" \
+    org.opencontainers.image.description="RustFS with the NIXL/UCX S3-over-RDMA transport" \
+    org.opencontainers.image.source="https://github.com/datacrunch-research/rustfs" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.licenses="Apache-2.0" \
+    io.rustfs.nixl.version="${NIXL_VERSION}"
+
+# rdma-core's providers and ibv_devinfo for diagnosing a pod's view of the NICs.
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates ibverbs-providers ibverbs-utils tzdata; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/nixl/lib /opt/nixl/lib
+COPY --from=builder /opt/nixl/nixl_cu13.libs /opt/nixl/nixl_cu13.libs
+COPY --from=builder /usr/local/bin/rustfs /usr/bin/rustfs
+
+ENV NIXL_PLUGIN_DIR=/opt/nixl/lib/plugins \
+    RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ENABLE="false"
+
+# Fail the image build, not the pod start, when a library does not resolve.
+RUN set -eux; \
+    for f in /usr/bin/rustfs /opt/nixl/lib/plugins/libplugin_UCX.so; do \
+    if ldd "$f" | grep 'not found'; then exit 1; fi; \
+    done; \
+    /usr/bin/rustfs --version
+
+EXPOSE 9000
+ENTRYPOINT ["/usr/bin/rustfs"]

@@ -1,0 +1,152 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds Dockerfile.nixl (RustFS with the NIXL/UCX transport) for linux/amd64
+# and linux/arm64 on native hosted runners and publishes one multi-arch tag,
+# ghcr.io/<owner>/rustfs-nixl:<version>-<short sha>, plus the branch name as a
+# moving tag. Only the datacrunch-research fork publishes.
+
+name: NIXL image
+
+on:
+  push:
+    branches:
+      - "rainj-me/kvcache-bucket-1.0.5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nixl-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rustfs-nixl
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    if: github.repository == 'datacrunch-research/rustfs'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.nixl
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            RUSTFS_BUILD_VERSION=nixl-${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          printf '%s\n' "${DIGEST}" > "${RUNNER_TEMP}/digests/${PLATFORM//\//-}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-arch tag
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and inspect the manifest list
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          short_sha="$(git rev-parse --short=9 HEAD)"
+          branch_tag="$(printf '%s' "${REF_NAME}" | tr '/' '-')"
+          sources=()
+          for f in "${RUNNER_TEMP}"/digests/*; do
+            sources+=("${IMAGE}@$(cat "$f")")
+          done
+          docker buildx imagetools create \
+            -t "${IMAGE}:${version}-${short_sha}" \
+            -t "${IMAGE}:${branch_tag}" \
+            "${sources[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${version}-${short_sha}"
+          {
+            echo "### ${IMAGE}:${version}-${short_sha}"
+            echo
+            echo "Platforms: linux/amd64, linux/arm64. Also tagged \`${branch_tag}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
